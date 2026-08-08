@@ -6,12 +6,15 @@
 #     python3 -m venv .venv && . .venv/bin/activate
 #     pip install -r requirements-dev.txt
 #
-# The `mcuhome` builder package is spawned as a subprocess (see
-# mcuhome_buildserver/builder.py) and imported only for its version
-# constants. It is not published yet, so it comes from the sibling
-# checkout in the west workspace:
+# The `mcuhome` builder is spawned as a subprocess (see
+# mcuhome_buildserver/builder.py); the library is imported only for its
+# version constants. The command itself ships in its own thin repo
+# (github.com/mcu-home/cli) since the CLI extraction. Neither package is
+# published yet, so both come from sibling checkouts in the west
+# workspace:
 #
-#     <workspace>/mcuhome/        the builder (this line)
+#     <workspace>/mcuhome/        the builder library
+#     <workspace>/cli/            the `mcuhome` command
 #     <workspace>/build-server/   this repository
 #
 # There is deliberately no `mcuhome-dashboard` here: the build server is
@@ -20,4 +23,5 @@
 # (`pip install -e ../dashboard/backend`) enables the frame-vocabulary
 # cross-check in tests/test_protocol.py, which otherwise skips.
 -e ../mcuhome
+-e ../cli
 -e .[dev]

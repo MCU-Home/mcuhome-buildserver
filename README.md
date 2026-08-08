@@ -57,7 +57,7 @@ repository, nothing here changes.
 
 ```sh
 python3 -m venv .venv && . .venv/bin/activate
-pip install -r requirements-dev.txt        # installs the builder from ../mcuhome
+pip install -r requirements-dev.txt        # builder lib from ../mcuhome, `mcuhome` command from ../cli
 mcuhome-build-server --workspace /root/MCUHome
 ```
 

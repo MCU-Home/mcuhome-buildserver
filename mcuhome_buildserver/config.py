@@ -34,6 +34,7 @@ from pathlib import Path
 
 from mcuhome_buildserver import builder
 from mcuhome_buildserver.security import DEFAULT_PAIR_FILE, read_token_file
+from mcuhome_buildserver.sessions import PATCH_LAYERS
 
 __all__ = [
     "DEFAULT_HOST",
@@ -115,6 +116,12 @@ class Config:
     builder_command: tuple[str, ...] = builder.BUILDER_COMMAND
     allowed_origins: tuple[str, ...] = ()
     log_level: str = "INFO"
+
+    #: Session protocol v2: the patch layers a build context may carry
+    #: patches for. **The config is the policy** — empty by default, and
+    #: unlisted layers are denied; there is no permissive mode to
+    #: forget to switch off.
+    allowed_patch_layers: tuple[str, ...] = ()
 
     #: True when :func:`load_config` had to invent the token, so that
     #: startup can print it exactly once.
@@ -263,6 +270,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="accepted browser origin for the WebSocket upgrade (repeatable)",
     )
     parser.add_argument(
+        "--allow-patch-layer",
+        action="append",
+        metavar="LAYER",
+        dest="allowed_patch_layers",
+        choices=sorted(PATCH_LAYERS),
+        help=(
+            "session protocol v2: allow build contexts to carry patches for this "
+            f"layer ({', '.join(PATCH_LAYERS)}; repeatable). Unlisted layers are "
+            "denied — the config is the policy"
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         metavar="LEVEL",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -330,6 +349,20 @@ def load_config(
             item.strip() for item in env[ENV_PREFIX + "ALLOWED_ORIGINS"].split(",") if item.strip()
         ]
 
+    patch_layers = list(args.allowed_patch_layers or ())
+    if env.get(ENV_PREFIX + "ALLOW_PATCH_LAYERS"):
+        patch_layers += [
+            item.strip()
+            for item in env[ENV_PREFIX + "ALLOW_PATCH_LAYERS"].split(",")
+            if item.strip()
+        ]
+    unknown_layers = sorted(set(patch_layers) - set(PATCH_LAYERS))
+    if unknown_layers:
+        raise SystemExit(
+            f"{', '.join(unknown_layers)}: not a patch layer this server knows "
+            f"(known: {', '.join(PATCH_LAYERS)})."
+        )
+
     command = args.builder_command or env.get(ENV_PREFIX + "BUILDER_COMMAND")
 
     def number(cli: float | None, name: str, fallback: float) -> float:
@@ -365,6 +398,7 @@ def load_config(
         builder_command=(command,) if command else builder.BUILDER_COMMAND,
         allowed_origins=tuple(dict.fromkeys(origins)),
         log_level=args.log_level or env.get(ENV_PREFIX + "LOG_LEVEL") or "INFO",
+        allowed_patch_layers=tuple(dict.fromkeys(patch_layers)),
     )
 
     token, generated = resolve_token(args.token, args.token_file, env)

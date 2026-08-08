@@ -32,7 +32,7 @@ from typing import Any
 
 from aiohttp import web
 
-from mcuhome_buildserver import __version__, builder, protocol, ws
+from mcuhome_buildserver import __version__, builder, protocol, sessions, ws
 from mcuhome_buildserver.config import Config
 from mcuhome_buildserver.jobs import EngineSettings, Job, JobEngine, JobStore
 from mcuhome_buildserver.security import STATE_KEY, auth_middleware
@@ -52,8 +52,10 @@ class ServerState:
     started_at: float = field(default_factory=time.monotonic)
     store: JobStore = field(init=False)
     engine: JobEngine = field(init=False)
+    sessions: sessions.SessionManager = field(init=False)
 
     def __post_init__(self) -> None:
+        self.sessions = sessions.SessionManager()
         self.store = JobStore(
             self.config.jobs_root,
             keep=self.config.keep_jobs,
@@ -137,6 +139,10 @@ def capabilities(state: ServerState) -> dict[str, Any]:
             "uptime_seconds": round(time.monotonic() - state.started_at, 3),
         },
         "protocol_version": protocol.PROTOCOL_VERSION,
+        # The session protocol (v2) shares the /ws endpoint; its own
+        # richer `capabilities` verb answers the details. Advertised
+        # here so a client can see it before opening the WebSocket.
+        "session_protocol_version": sessions.SESSION_PROTOCOL_VERSION,
         "commands": sorted(ws.COMMANDS),
         "mcuhome": {"version": builder.VERSION},
         "builder": features.to_dict(),

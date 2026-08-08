@@ -19,3 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   artifacts, bearer-token authentication and `GET /capabilities`. Its
   pre-extraction history lives in the dashboard repository's changelog
   and git history.
+- **Session protocol v2 skeleton**: the session verbs (`capabilities`,
+  `open-session`, `send-context`, `extend-context`, `verify`, `build`,
+  `get-artifact`, `attach-session`, `close-session`) on the existing
+  `/ws` endpoint, the fixed error envelope
+  `{code, layer, retryable, message, details}`, the append-only typed
+  error-code registry (`policy.*`, `session.*`, `context.*`,
+  `version.*`, `builder.*`), version negotiation and admission at
+  `open-session`, and a per-layer patch policy read from configuration
+  (`--allow-patch-layer`, deny by default). Context transport,
+  containers, scheduling and metering are stubbed with typed
+  `session.not-implemented` errors.

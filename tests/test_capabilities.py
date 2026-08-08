@@ -41,12 +41,24 @@ async def test_capabilities_answers_what_a_client_negotiates_on(client) -> None:
     assert body["jobs"]["slots"] == 1
     assert body["arch"]
     assert set(body["commands"]) == {
+        # The v1 job commands…
         "submit_job",
         "cancel_job",
         "follow_job",
         "download_artifacts",
         "queue_status",
+        # …and the session protocol v2 verbs on the same endpoint.
+        "capabilities",
+        "open-session",
+        "send-context",
+        "extend-context",
+        "verify",
+        "build",
+        "get-artifact",
+        "attach-session",
+        "close-session",
     }
+    assert body["session_protocol_version"] == 2
     # This server can never sign; a dashboard that trusted it to would
     # skip its own signing step and hand out unbootable firmware.
     assert body["signing"]["detached_only"] is True

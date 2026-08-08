@@ -17,6 +17,9 @@ Module map:
                                        ``/capabilities`` and ``/health``
 :mod:`mcuhome_buildserver.security`    the bearer token and where it comes from
 :mod:`mcuhome_buildserver.protocol`    the ADR 0006 frame vocabulary
+:mod:`mcuhome_buildserver.errors`      the session protocol's error envelope
+                                       and its append-only code registry
+:mod:`mcuhome_buildserver.sessions`    session protocol v2: sessions and verbs
 :mod:`mcuhome_buildserver.ws`          the ``/ws`` endpoint and its commands
 :mod:`mcuhome_buildserver.jobs`        the queue, the engine and job records
 :mod:`mcuhome_buildserver.builder`     how the ``mcuhome`` CLI is invoked

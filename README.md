@@ -78,6 +78,7 @@ the command line wins. `--help` lists them all.
 | `--image` | builder's default | builder container image tag |
 | `--job-timeout` | `3600` | seconds before a build is killed |
 | `--keep-jobs`, `--job-ttl-days` | `20`, `14` | retention (ADR 0008 decision 4) |
+| `--allow-patch-layer` | none | session protocol v2: allow build-context patches for a layer (`sdk`, `zephyr`, `chip`); repeatable; unlisted layers are denied |
 
 ## The API
 
@@ -100,10 +101,12 @@ envelopes in one product family:
 {"type": "event", "event": "job_state_changed", "payload": {"job": {/* … */}}}
 ```
 
-Error codes: `bad_request`, `unknown_command`, `not_found`,
-`unauthorized`, `unavailable`, `conflict`, `unsupported`,
-`internal_error`. `unsupported` is the negotiation failure of ADR 0006
-decision 4 — the frame is fine and this server cannot honour it.
+Error codes: `bad_request`, `not_found`, `unauthorized`, `unavailable`,
+`conflict`, `unsupported`, `internal_error`. `unsupported` is the
+negotiation failure of ADR 0006 decision 4 — the frame is fine and this
+server cannot honour it. An unknown command is answered with the typed
+envelope of the session protocol below (`version.verb-unknown`), which
+names the known verbs.
 
 ### Commands
 
@@ -174,6 +177,52 @@ defended against here — it is unreachable.
 |---|---|
 | `GET /health` | liveness, open, says nothing about what this server holds |
 | `GET /capabilities` | token-gated negotiation before a job exists (ADR 0006 decision 4): versions, `model_version` range, builder features, architecture, job slots, image tag, workspace |
+
+## Session protocol v2 (skeleton)
+
+The remote-build architecture replaces the one-shot job protocol with a
+**session model**: one session = one ephemeral builder container = one
+effective build context, the same verb set driven locally by the lib or
+remotely through this server. The protocol skeleton is in place on the
+same `/ws` endpoint, alongside the v1 commands; the container backend,
+context transport, scheduling and metering land behind it in later
+blocks.
+
+Verbs, in fast-path order:
+
+| Verb | Payload | Today |
+|---|---|---|
+| `capabilities` | `{}` | **answers**: protocol version, builder image inventory (placeholder), per-layer patch policy from configuration, quota summary (placeholder) |
+| `open-session` | `{"profile", "protocol_version", "context_format", "manifest"}` | **answers**: admission — session id, lease, negotiated versions. A version mismatch is a typed rejection at the door |
+| `send-context` | `{"session_id", …}` | typed `session.not-implemented` |
+| `extend-context` | `{"session_id", …}` | typed `session.not-implemented` |
+| `verify` | `{"session_id"}` | typed `session.not-implemented` |
+| `build` | `{"session_id", "mode"}` | typed `session.not-implemented` |
+| `get-artifact` | `{"session_id", "invocation_id", "path"}` | typed `session.not-implemented` |
+| `attach-session` | `{"session_id"}` | **answers**: the session record and lease (event replay is future work) |
+| `close-session` | `{"session_id"}` | **answers**: the closed session record |
+
+Session-protocol errors use a **fixed envelope** in the error frame:
+
+```jsonc
+{"id": "7", "type": "error", "error": {
+  "code": "version.protocol-mismatch",   // from the append-only registry
+  "layer": "version",                    // the dotted prefix of the code
+  "retryable": false,                    // authoritative — clients never infer it
+  "message": "…",                        // for a human
+  "details": {"server": 2, "client": 3}  // structured, code-specific
+}}
+```
+
+Codes come from the append-only registry in
+`mcuhome_buildserver/errors.py` (`policy.*`, `session.*`, `context.*`,
+`version.*`, `builder.*`; `x-*` is reserved for third parties). A code,
+once released, is never renamed, removed or re-classified; clients treat
+unknown codes as non-retryable-fatal and surface the message.
+
+Patch policy is configuration (`--allow-patch-layer`, deny by default):
+the server's builder config **is** the policy, and `capabilities`
+advertises it per layer so the lib fails fast instead of mid-session.
 
 ## What is on disk
 
@@ -313,6 +362,8 @@ otherwise.
 | `app.py` | shared state, the app factory, `/health` and `/capabilities` |
 | `security.py` | the bearer token, origin check, same-host pairing |
 | `protocol.py` | the ADR 0006 frame vocabulary and its validation |
+| `errors.py` | the session protocol's error envelope and its append-only code registry |
+| `sessions.py` | session protocol v2: the session registry and one handler per verb |
 | `ws.py` | the `/ws` endpoint and one function per command |
 | `jobs.py` | the queue, the engine, job records, retention |
 | `builder.py` | how the `mcuhome` CLI is invoked, and the feature probe |

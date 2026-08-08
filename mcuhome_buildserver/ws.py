@@ -35,7 +35,7 @@ from typing import Any
 from aiohttp import WSMsgType, web
 
 from mcuhome_buildserver import artifacts as artifact_module
-from mcuhome_buildserver import builder, protocol
+from mcuhome_buildserver import builder, errors, protocol, sessions
 from mcuhome_buildserver.jobs import Job, JobOptions, JobState
 from mcuhome_buildserver.logs import MAX_HISTORY_BYTES
 from mcuhome_buildserver.protocol import Command, ProtocolError
@@ -363,13 +363,16 @@ async def download_artifacts(
     return {"job_id": job.id, "path": path, **chunk}
 
 
-#: The command table. Adding a name here is the whole registration.
+#: The command table. Adding a name here is the whole registration. The
+#: v1 job commands and the session protocol v2 verbs share one table and
+#: one endpoint; the verbs carry their table in their own module.
 COMMANDS = {
     "submit_job": submit_job,
     "cancel_job": cancel_job,
     "follow_job": follow_job,
     "download_artifacts": download_artifacts,
     "queue_status": queue_status,
+    **sessions.SESSION_VERBS,
 }
 
 
@@ -381,19 +384,30 @@ COMMANDS = {
 async def _run_command(state: Any, connection: Connection, command: Command) -> None:
     handler = COMMANDS.get(command.type)
     if handler is None:
+        # The typed envelope rather than the legacy `unknown_command`
+        # code: an unknown verb is a vocabulary mismatch, and the
+        # session protocol's registry has the code that says so. The
+        # frame shape is unchanged — only the error object grew fields.
         await connection.send(
-            protocol.error_frame(
-                command.id,
-                protocol.ERROR_UNKNOWN_COMMAND,
-                f'This build server has no command called "{command.type}".',
-                known=sorted(COMMANDS),
-            )
+            {
+                "id": command.id,
+                "type": protocol.TYPE_ERROR,
+                "error": errors.envelope(
+                    "version.verb-unknown",
+                    f'This build server has no verb called "{command.type}".',
+                    known=sorted(COMMANDS),
+                ),
+            }
         )
         return
     try:
         payload = await handler(state, connection, command)
     except ProtocolError as exc:
         await connection.send(protocol.error_frame(command.id, exc.code, exc.message, **exc.detail))
+    except errors.SessionError as exc:
+        await connection.send(
+            {"id": command.id, "type": protocol.TYPE_ERROR, "error": exc.to_envelope()}
+        )
     except asyncio.CancelledError:
         raise
     except Exception:

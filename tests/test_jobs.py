@@ -188,10 +188,12 @@ class TestSubmissionRefusals:
         assert frame["error"]["code"] == "bad_request"
 
     async def test_an_unknown_command_lists_the_known_ones(self, client) -> None:
+        # Answered with the session protocol's typed envelope; the deep
+        # envelope assertions live in test_sessions.py.
         async with client.ws_connect("/ws", headers=auth()) as ws:
             frame = await call(ws, "compile_please", {})
-        assert frame["error"]["code"] == "unknown_command"
-        assert "submit_job" in frame["error"]["known"]
+        assert frame["error"]["code"] == "version.verb-unknown"
+        assert "submit_job" in frame["error"]["details"]["known"]
 
     async def test_an_unusable_builder_refuses_before_it_queues(
         self, aiohttp_client, config

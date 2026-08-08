@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# CI for the MCUHome build server. One gate:
+#
+#   lint — ruff (check + format) and REUSE, pinned to the same versions
+#          the other MCUHome repositories use; bump them together.
+#
+# The pytest suite is NOT run here yet, for the same reason the dashboard
+# repository has no test gate: the suite imports the `mcuhome` builder
+# package for its version constants, and that package is neither
+# published nor reachable from this repository's CI while the
+# repositories are private. The suite runs in the development install
+# (see README.md); a test gate is added the moment `mcuhome` is
+# installable in CI.
+#
+# All actions are pinned to commit SHAs, not tags (see dependabot.yml,
+# which keeps the pins current via its github-actions ecosystem entry).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (ruff + REUSE)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install lint tools
+        run: python -m pip install --disable-pip-version-check ruff==0.16.1 reuse==5.0.2
+
+      - name: ruff check
+        run: ruff check .
+
+      - name: ruff format --check
+        run: ruff format --check .
+
+      - name: REUSE lint
+        run: reuse lint

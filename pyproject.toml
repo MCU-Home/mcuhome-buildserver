@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcuhome-build-server"
+version = "0.1.0.dev0"
+description = "Headless MCUHome build service: compiles device models submitted over the ADR 0006 protocol."
+readme = "README.md"
+requires-python = ">=3.13"
+license = "Apache-2.0"
+authors = [{ name = "The MCUHome Contributors" }]
+keywords = ["mcuhome", "zephyr", "matter", "build-server", "home-assistant"]
+classifiers = [
+  "Development Status :: 1 - Planning",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Topic :: Home Automation",
+]
+
+dependencies = ["aiohttp>=3.10,<4"]
+
+# The `mcuhome` builder package is a runtime dependency of a different
+# kind than the dashboard's: this server *spawns* the CLI rather than
+# importing it (see mcuhome_buildserver/builder.py for why), and imports
+# `mcuhome.api` only to read the version it is going to spawn. It is not
+# declared here for the same reason as in the dashboard — the builder is
+# not published yet, so pip would resolve the name against PyPI and
+# fail. `requirements-dev.txt` installs it from the sibling checkout.
+#
+# There is deliberately **no dependency on `mcuhome-dashboard`**. The two
+# are separate products with separate version numbers (ADR 0003 decision
+# 1), joined by one protocol; a build server that could not be deployed
+# without the dashboard package would make that untrue in the packaging
+# even where it is true in the code.
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-aiohttp>=1.1", "ruff==0.16.1"]
+
+[project.scripts]
+mcuhome-build-server = "mcuhome_buildserver.server:main"
+
+[project.urls]
+Homepage = "https://github.com/mcu-home/build-server"
+Issues = "https://github.com/mcu-home/build-server/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mcuhome_buildserver"]
+
+# Byte-identical to the dashboard repository's ruff configuration, so
+# that `ruff` means the same thing in every MCUHome Python package.
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["mcuhome_buildserver", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.codespell]
+ignore-words-list = "requestor,pase,ot,rsource"

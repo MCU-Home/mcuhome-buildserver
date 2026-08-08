@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Development install:
+#
+#     python3 -m venv .venv && . .venv/bin/activate
+#     pip install -r requirements-dev.txt
+#
+# The `mcuhome` builder package is spawned as a subprocess (see
+# mcuhome_buildserver/builder.py) and imported only for its version
+# constants. It is not published yet, so it comes from the sibling
+# checkout in the west workspace:
+#
+#     <workspace>/mcuhome/        the builder (this line)
+#     <workspace>/build-server/   this repository
+#
+# There is deliberately no `mcuhome-dashboard` here: the build server is
+# a separate product and must be installable without it (dashboard ADR
+# 0003). Installing the sibling checkout's backend additionally
+# (`pip install -e ../dashboard/backend`) enables the frame-vocabulary
+# cross-check in tests/test_protocol.py, which otherwise skips.
+-e ../mcuhome
+-e .[dev]

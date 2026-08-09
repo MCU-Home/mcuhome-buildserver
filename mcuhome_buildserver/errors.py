@@ -198,12 +198,18 @@ REGISTRY: dict[str, ErrorCode] = _seed(
         retryable=False,
         summary="no build container on this server satisfies the context's container.digest pin",
     ),
-    # builder.* — the build-container contract. The *prefix* is a wire
-    # value clients match on, so ADR 0019's amendment explicitly does not
-    # rename it by terminology note: "its spelling is settled when the
-    # registry is — not here, by side effect". Whether it stays
-    # `builder.*` is therefore open, and must be decided before the first
-    # release, which is when append-only starts to bind.
+    # builder.* — the thing that builds, whatever shape it takes. The
+    # spelling was settled by the product owner on 2026-08-09, before the
+    # first release made the registry append-only: the prefix names the
+    # ROLE, not the deployment. The build container is the builder here,
+    # but the builder is not necessarily the build container — in the
+    # subprocess profile there is no container at all, and its build
+    # environment fails under exactly these codes. `builder.failed` says
+    # the one thing a client needs: the thing that was building had an
+    # error; which profile stood behind it is the session's business.
+    # This is deliberately not a leftover of the retired terminology —
+    # "builder" was retired as a name for the *container*, and these
+    # codes never meant the container specifically.
     #
     # Two entries are gone from this block: `builder.command-unsupported`
     # and `builder.parameter-unsupported` were defined by reserved exit

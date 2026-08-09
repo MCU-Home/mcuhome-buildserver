@@ -47,11 +47,14 @@ answers with a typed ``session.not-implemented`` instead of a guess, so
 a client sees a protocol that is honest about its state rather than one
 that almost works.
 
-Two of those stubs are **seams** rather than bare refusals, and they are
-named here because they are where the backend plugs in:
-:func:`_freeze_context` is the body of ``lock-context`` and
-:func:`_signal_cancellation` is the body of ``cancel``. Each says in its
-own docstring what replaces it and what it may not decide on its own.
+One stub is a **seam** rather than a bare refusal:
+:func:`_freeze_context` is the body of ``lock-context``, and its
+docstring says what replaces it and why it waits for the wiring onto
+``mcuhome-model``. ``cancel`` is real since the second amendment settled
+its wire shape (E38) — bookkeeping, acknowledgement, the
+``already_finished`` answer — and only the sentinel file the
+acknowledgement promises stays with the container backend
+(:func:`_signal_cancellation`).
 
 Admission and negotiation live at ``open-session``, not in ``verify``:
 a version mismatch is a typed rejection at the door, never a downstream
@@ -66,7 +69,7 @@ from __future__ import annotations
 
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from mcuhome_buildserver.errors import SessionError
@@ -155,6 +158,15 @@ CONTEXT_NONE = "none"
 CONTEXT_UNLOCKED = "unlocked"
 CONTEXT_LOCKED = "locked"
 
+#: One invocation's place in its life, as `cancel` and `close-session`
+#: see it. The container backend moves invocations to FINISHED when a
+#: result document lands; CANCELLING is "the stop signal is set" — the
+#: acknowledged state of ADR 0019's second amendment, never "it
+#: stopped", which only the result document says.
+INVOCATION_RUNNING = "running"
+INVOCATION_CANCELLING = "cancelling"
+INVOCATION_FINISHED = "finished"
+
 
 @dataclass
 class Session:
@@ -177,6 +189,15 @@ class Session:
     #: that order — the lock is a boundary, not a mode.
     context_state: str = CONTEXT_NONE
     last_command_at: float = 0.0
+    #: Poisoned means "can no longer do work": the second amendment's
+    #: terminal state after an interrupted patch application. One-way.
+    #: Deliberately NOT a session state — the session stays OPEN so
+    #: get-artifact and close-session keep working, which is the point.
+    poisoned: bool = False
+    #: Every invocation this session ever ran, id -> INVOCATION_* state.
+    #: The bookkeeping `cancel` addresses; the container backend is what
+    #: will populate it and flip entries to FINISHED.
+    invocations: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -217,6 +238,36 @@ class Session:
                 session_id=self.id,
                 context_state=self.context_state,
             )
+
+    def require_workable(self) -> None:
+        """Refuse every working command of a poisoned session.
+
+        The second amendment's terminal state: an interrupted patch
+        application "fails typed, and every further working command in
+        that session is refused". The session is deliberately NOT reaped
+        on the spot — ``get-artifact`` and ``close-session`` stay
+        permitted, because the moment a session poisons is exactly the
+        moment its owner most wants the logs and partial artifacts that
+        explain what happened, and destroying them to simplify the state
+        machine would trade diagnosis for tidiness. Cleanup happens where
+        it always happens: ``close-session`` or lease expiry.
+
+        ``cancel`` deliberately does not pass through here: it stops
+        work rather than doing any, and a poisoned session may still
+        have an invocation worth stopping.
+        """
+        if self.poisoned:
+            raise SessionError(
+                "session.poisoned",
+                f'Session "{self.id}" can no longer do work: a patch application was '
+                "interrupted and the trees cannot be trusted. Collect what get-artifact "
+                "still offers, close the session, and start a new one with pristine trees.",
+                session_id=self.id,
+            )
+
+    def poison(self) -> None:
+        """One-way. The caller is the future container backend (§6.3)."""
+        self.poisoned = True
 
     def require_context(self) -> None:
         """Refuse a command that has no context to work on.
@@ -365,7 +416,19 @@ class SessionManager:
 
     def close(self, session_id: str) -> Session:
         """Close a session. Closing a closed one is not an error: the
-        client asked for a state and that state holds."""
+        client asked for a state and that state holds.
+
+        **A busy session is cancelled implicitly** (E39): every running
+        invocation gets the stop signal first, its result document is
+        still written by the backend, then the session is reaped.
+        Refusing to close while an invocation runs was rejected because
+        connection loss is never abandonment — that is
+        ``attach-session``'s reason to exist — so closing must never
+        require a live client to first cancel, reattach, or wait; a
+        crashed client's session would otherwise hold its resources
+        until lease expiry as the *normal* path rather than the
+        fallback.
+        """
         session = self._sessions.get(session_id)
         if session is None:
             raise SessionError(
@@ -373,6 +436,10 @@ class SessionManager:
                 f'This server has no session called "{session_id}".',
                 session_id=session_id,
             )
+        for invocation_id, found in session.invocations.items():
+            if found == INVOCATION_RUNNING:
+                session.invocations[invocation_id] = INVOCATION_CANCELLING
+                _signal_cancellation(session, invocation_id)
         session.state = STATE_CLOSED
         return session
 
@@ -547,13 +614,18 @@ def _freeze_context(session: Session) -> SessionError:
     ID. A recomputed value that disagrees with the received bytes is
     ``context.integrity-mismatch``.
 
-    **Two things it may not settle by side effect**, because no document
-    describes them: the wire shape — whether the request carries a
-    client-computed ID for the comparison ADR 0019 requires, and whether
-    the response carries only the ID or the whole manifest — and which
-    side raises on a client/server ID disagreement, with which code.
-    Both are product-owner questions, and a stub that answered them by
-    existing would have decided them.
+    **The wire shape is settled** (E37, ADR 0019's second amendment),
+    minimal by explicit product-owner choice against the richer
+    alternative: the request carries ``session_id`` and nothing else,
+    the response carries the context ID and nothing else. The comparison
+    ADR 0019 requires happens **on the client** — the workbench computes
+    the ID from the bytes it sent, compares against the answer, and
+    closes the session on a disagreement. This server never sees the
+    client's value and therefore never raises that mismatch;
+    ``context.integrity-mismatch`` remains what the recomputation
+    against *received bytes* raises, which is a different check and
+    entirely this side's. What the stub still waits for is only the
+    computation itself, above.
     """
     return SessionError(
         "session.not-implemented",
@@ -567,8 +639,8 @@ def _freeze_context(session: Session) -> SessionError:
     )
 
 
-def _signal_cancellation(session: Session, invocation_id: str) -> SessionError:
-    """Raise the stop signal for one invocation. **Seam. Stub.**
+def _signal_cancellation(session: Session, invocation_id: str) -> None:
+    """Raise the stop signal for one invocation. **Seam for the backend.**
 
     What this becomes is fixed by build-container contract §8 and is
     deliberately one small thing: the backend creates the **cancel
@@ -576,9 +648,8 @@ def _signal_cancellation(session: Session, invocation_id: str) -> SessionError:
     the *existence* of the file means "stop". The program polls it,
     stops within ``limits.cancel_grace_seconds`` and writes a result
     document with ``status: "cancelled"`` — which carries ``reason:
-    null`` and ``error: null``, because nothing was diagnosed, and is
-    therefore not an error-registry value at all. SIGTERM/SIGKILL stays
-    the backend's hard path behind the cooperative one.
+    null`` and ``error: null``, because nothing was diagnosed. SIGTERM/
+    SIGKILL stays the backend's hard path behind the cooperative one.
 
     A sentinel file rather than a signal, for the same reason the verb
     exists at all: killing a ``docker exec`` client does not kill the
@@ -587,38 +658,20 @@ def _signal_cancellation(session: Session, invocation_id: str) -> SessionError:
     directory and never inside the context, which is what keeps the
     context a genuinely read-only mount.
 
-    So the seam is that one file, plus the invocation bookkeeping that
-    gives ``invocation_id`` something to name — and there is no
-    invocation registry here yet, which is exactly why this refuses
-    rather than succeeding quietly. Answering "cancelled" for an
-    invocation that was never running is the one wrong answer this verb
-    can give.
-
-    **Two things it may not settle by side effect:** what ``cancel``
-    *answers* — an immediate acknowledgement, or a frame once the
-    invocation actually stopped inside the grace period — and the typed
-    error for an unknown, already-finished or already-cancelled
-    invocation id. Neither is described in any document, and the
-    registry has no entry that fits.
+    The bookkeeping the verb needs exists now (:attr:`Session.invocations`,
+    the E38 wire shape), so this is no longer a refusal: the caller has
+    already recorded :data:`INVOCATION_CANCELLING`, and what is missing
+    is only the file — which needs a per-invocation directory, which
+    needs the container backend. Until then the mark IS the signal, and
+    the backend's arrival changes this function's body, not its callers.
 
     One consequence is already fixed and belongs to the backend rather
-    than here: a cancellation that lands **mid patch application** is
-    terminal for the session. A crash, a cancel or an out-of-memory kill
-    after some patches but before all fails typed, every further working
-    command in that session is refused, and the client's remedy is a new
-    session with pristine trees. No document names a code for that
-    either.
+    than here: a cancellation that lands **mid patch application**
+    poisons the session (:meth:`Session.poison`, ``session.poisoned``) —
+    a crash, a cancel or an out-of-memory kill after some patches but
+    before all leaves trees no future build may trust.
     """
-    return SessionError(
-        "session.not-implemented",
-        '"cancel" is real as a verb and has nothing to cancel: invocations arrive with '
-        "the container backend, and so does the cancel sentinel file whose existence is "
-        "the stop signal (build-container contract §8). This session and its lease are "
-        "untouched, which is what cancel promises even when it works.",
-        verb="cancel",
-        session_id=session.id,
-        invocation_id=invocation_id,
-    )
+    del session, invocation_id  # the sentinel file arrives with the backend
 
 
 async def send_context(state: Any, connection: Any, command: Command) -> dict[str, Any]:
@@ -639,6 +692,7 @@ async def send_context(state: Any, connection: Any, command: Command) -> dict[st
     and ``context.locked`` refuses it.
     """
     session = state.sessions.require(command.require_str("session_id"))
+    session.require_workable()
     session.require_writable_context()
     raise _not_implemented("send-context", session)
 
@@ -663,6 +717,7 @@ async def extend_context(state: Any, connection: Any, command: Command) -> dict[
     is closed to writes and the answer is ``context.locked``.
     """
     session = state.sessions.require(command.require_str("session_id"))
+    session.require_workable()
     session.require_writable_context()
     session.require_context()
     raise _not_implemented("extend-context", session)
@@ -699,6 +754,7 @@ async def lock_context(state: Any, connection: Any, command: Command) -> dict[st
     repository yet.
     """
     session = state.sessions.require(command.require_str("session_id"))
+    session.require_workable()
     session.require_writable_context()
     session.require_context()
     raise _freeze_context(session)
@@ -721,6 +777,7 @@ async def verify(state: Any, connection: Any, command: Command) -> dict[str, Any
     patches and touches no source tree (contract §7.3).
     """
     session = state.sessions.require(command.require_str("session_id"))
+    session.require_workable()
     session.require_locked_context()
     raise _not_implemented("verify", session)
 
@@ -739,6 +796,7 @@ async def build(state: Any, connection: Any, command: Command) -> dict[str, Any]
     That id is what ``get-artifact`` and ``cancel`` address.
     """
     session = state.sessions.require(command.require_str("session_id"))
+    session.require_workable()
     session.require_locked_context()
     raise _not_implemented("build", session)
 
@@ -766,15 +824,54 @@ async def cancel(state: Any, connection: Any, command: Command) -> dict[str, Any
     fixes the payload's field name; ``invocation_id`` is the spelling
     this package already uses for the same value at ``get-artifact``.
 
-    It is deliberately **not** gated on the lock. Only working commands
-    produce invocations, so a cancel before the lock names an invocation
-    that cannot exist — but the refusal for an invocation id that does
-    not exist is named nowhere, and putting a code on the wire that no
-    document backs is the one thing this skeleton must not do. The
-    signal itself is :func:`_signal_cancellation`.
+    The wire shape is the second amendment's (E38): the answer means
+    "the stop signal is set", never "the invocation has stopped" — the
+    actual end travels on the invocation's event stream, and its result
+    document carries ``status: "cancelled"``. Three answers, one each:
+
+    * an id the session does not know is ``invocation.unknown`` — the
+      one wrong answer this verb could give is "cancelled" for an
+      invocation that was never running;
+    * an invocation that already finished (or was already cancelled and
+      completed as such) is ``already_finished: true`` and is **not** an
+      error, because a cancel racing a natural completion is legitimate
+      and both parties behaved correctly;
+    * a running one is marked :data:`INVOCATION_CANCELLING` and
+      acknowledged — idempotently, so the second cancel of a race gets
+      the same answer as the first.
+
+    It is deliberately not gated on the lock and not gated on poison:
+    only working commands produce invocations, and a poisoned session
+    may still have an invocation worth stopping. The sentinel file the
+    acknowledgement promises is :func:`_signal_cancellation`'s, which
+    the container backend fills in.
     """
     session = state.sessions.require(command.require_str("session_id"))
-    raise _signal_cancellation(session, command.require_str("invocation_id"))
+    invocation_id = command.require_str("invocation_id")
+    found = session.invocations.get(invocation_id)
+    if found is None:
+        raise SessionError(
+            "invocation.unknown",
+            f'Session "{session.id}" has no invocation "{invocation_id}".',
+            session_id=session.id,
+            invocation_id=invocation_id,
+            known=sorted(session.invocations),
+        )
+    if found == INVOCATION_FINISHED:
+        return {
+            "session_id": session.id,
+            "invocation_id": invocation_id,
+            "cancelled": False,
+            "already_finished": True,
+        }
+    session.invocations[invocation_id] = INVOCATION_CANCELLING
+    _signal_cancellation(session, invocation_id)
+    return {
+        "session_id": session.id,
+        "invocation_id": invocation_id,
+        "cancelled": True,
+        "already_finished": False,
+    }
 
 
 async def get_artifact(state: Any, connection: Any, command: Command) -> dict[str, Any]:

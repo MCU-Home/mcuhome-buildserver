@@ -556,14 +556,13 @@ async def test_cancel_needs_the_invocation_it_addresses(client) -> None:
     assert frame["error"]["code"] == "bad_request"
 
 
-async def test_cancel_reaches_its_signal_seam(client) -> None:
-    """The verb is real; the signal it raises is the backend's.
+async def test_cancel_of_an_unknown_invocation_is_typed(client) -> None:
+    """`invocation.unknown` — the one wrong answer is "cancelled" (E38).
 
-    What the seam becomes is fixed by contract §8: the backend creates
-    the per-invocation cancel sentinel file, whose *existence* means
-    stop. A cooperative file rather than a signal, because killing a
-    ``docker exec`` client does not kill the process inside the
-    container — which is the same reason the verb exists at all.
+    Answering an acknowledgement for an invocation that was never
+    running would tell a client its build is stopping while nothing
+    stops; the refusal names the ids the session does have, so a client
+    holding a stale id can see what it raced against.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await _open(ws)
@@ -571,9 +570,135 @@ async def test_cancel_reaches_its_signal_seam(client) -> None:
             ws, "cancel", {"session_id": session_id, "invocation_id": "inv-7"}, frame_id="c"
         )
     error = frame["error"]
-    assert error["code"] == "session.not-implemented"
-    assert error["details"]["verb"] == "cancel"
+    assert error["code"] == "invocation.unknown"
     assert error["details"]["invocation_id"] == "inv-7"
+    assert error["details"]["known"] == []
+
+
+async def test_cancel_acknowledges_the_signal_not_the_stop(client, state) -> None:
+    """The E38 wire shape: the answer means "the stop signal is set".
+
+    Never "it stopped" — only the invocation's result document says
+    that, with ``status: "cancelled"``. And idempotently: the second
+    cancel of a race gets the same acknowledgement as the first, because
+    a client that retries into a signal already set did nothing wrong.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await _open(ws)
+        session = state.sessions.require(session_id)
+        session.invocations["inv-1"] = sessions.INVOCATION_RUNNING
+        first = await call(
+            ws, "cancel", {"session_id": session_id, "invocation_id": "inv-1"}, frame_id="c1"
+        )
+        second = await call(
+            ws, "cancel", {"session_id": session_id, "invocation_id": "inv-1"}, frame_id="c2"
+        )
+    assert first["payload"] == {
+        "session_id": session_id,
+        "invocation_id": "inv-1",
+        "cancelled": True,
+        "already_finished": False,
+    }
+    assert second["payload"]["cancelled"] is True
+    assert session.invocations["inv-1"] == sessions.INVOCATION_CANCELLING
+
+
+async def test_cancel_racing_a_natural_completion_is_not_an_error(client, state) -> None:
+    """`already_finished` is an answer, not a refusal (E38).
+
+    The race between a cancel and a completion is legitimate — both
+    parties behaved correctly — so the client gets a fact, not an error
+    envelope it would have to classify.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await _open(ws)
+        state.sessions.require(session_id).invocations["inv-1"] = sessions.INVOCATION_FINISHED
+        frame = await call(
+            ws, "cancel", {"session_id": session_id, "invocation_id": "inv-1"}, frame_id="c"
+        )
+    assert "error" not in frame or frame.get("error") is None
+    assert frame["payload"]["cancelled"] is False
+    assert frame["payload"]["already_finished"] is True
+
+
+async def test_a_poisoned_session_refuses_work_and_keeps_its_exits(client, state) -> None:
+    """`session.poisoned` for every working verb; the exits stay open (E39).
+
+    The session is deliberately not reaped: the moment it poisons is the
+    moment its owner most needs the logs and partial artifacts that
+    explain what happened. get-artifact still answers (its own
+    not-implemented refusal, not the poison), cancel still works on a
+    running invocation, and close-session cleans up as always.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await _open(ws)
+        session = state.sessions.require(session_id)
+        session.context_state = sessions.CONTEXT_LOCKED
+        session.invocations["inv-1"] = sessions.INVOCATION_RUNNING
+        session.poison()
+
+        for verb in ("send-context", "extend-context", "lock-context", "verify", "build"):
+            frame = await call(ws, verb, {"session_id": session_id}, frame_id=f"p-{verb}")
+            assert frame["error"]["code"] == "session.poisoned", verb
+
+        artifact = await call(
+            ws,
+            "get-artifact",
+            {"session_id": session_id, "invocation_id": "inv-1", "path": "firmware.hex"},
+            frame_id="g",
+        )
+        assert artifact["error"]["code"] == "session.not-implemented"
+
+        cancelled = await call(
+            ws, "cancel", {"session_id": session_id, "invocation_id": "inv-1"}, frame_id="c"
+        )
+        assert cancelled["payload"]["cancelled"] is True
+
+        closed = await call(ws, "close-session", {"session_id": session_id}, frame_id="x")
+        assert closed["payload"]["session"]["state"] == "closed"
+
+
+async def test_close_session_cancels_a_running_invocation_implicitly(client, state) -> None:
+    """close-session on a busy session sets the stop signal first (E39).
+
+    Refusing to close while an invocation runs was rejected: connection
+    loss is never abandonment (that is attach-session's reason to
+    exist), so closing must never require cancel-reattach-wait from a
+    client that may no longer be alive.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await _open(ws)
+        session = state.sessions.require(session_id)
+        session.invocations["inv-1"] = sessions.INVOCATION_RUNNING
+        session.invocations["inv-2"] = sessions.INVOCATION_FINISHED
+        frame = await call(ws, "close-session", {"session_id": session_id}, frame_id="x")
+    assert frame["payload"]["session"]["state"] == "closed"
+    assert session.invocations["inv-1"] == sessions.INVOCATION_CANCELLING
+    assert session.invocations["inv-2"] == sessions.INVOCATION_FINISHED
+
+
+async def test_every_authenticated_verb_refreshes_the_idle_timer(client, state) -> None:
+    """One rule, no per-verb list: a command is a command.
+
+    The idle timeout "counts absent *commands*" (ADR 0019), and the
+    second amendment settles which verbs qualify: all of them —
+    lock-context and cancel included. The refresh lives in
+    SessionManager.require(), the one door every session verb walks
+    through, which is what makes the rule structural rather than a list
+    to maintain.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await _open(ws)
+        session = state.sessions.require(session_id)
+        session.invocations["inv-1"] = sessions.INVOCATION_RUNNING
+        session.last_command_at = 0.0
+        await call(ws, "cancel", {"session_id": session_id, "invocation_id": "inv-1"}, frame_id="c")
+        after_cancel = session.last_command_at
+        session.last_command_at = 0.0
+        await call(ws, "lock-context", {"session_id": session_id}, frame_id="l")
+        after_lock = session.last_command_at
+    assert after_cancel > 0.0
+    assert after_lock > 0.0
 
 
 async def test_cancel_leaves_the_session_standing(client, state) -> None:

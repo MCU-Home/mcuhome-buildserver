@@ -51,7 +51,7 @@ __all__ = [
 
 #: The namespaces (envelope ``layer`` values) the registry may use.
 #: Fixed by the protocol concept; ``x-`` is reserved for third parties.
-LAYERS = ("policy", "session", "context", "version", "builder")
+LAYERS = ("policy", "session", "context", "version", "builder", "invocation")
 
 
 @dataclass(frozen=True)
@@ -132,6 +132,17 @@ REGISTRY: dict[str, ErrorCode] = _seed(
         summary="the command is outside the session's declared profile",
     ),
     ErrorCode(
+        # ADR 0019's second amendment: the interrupted patch application
+        # is "terminal for the session" — every further working command
+        # is refused, while get-artifact and close-session stay
+        # permitted, because the moment a session poisons is the moment
+        # its owner most needs the logs that explain what happened.
+        "session.poisoned",
+        retryable=False,
+        summary="the session can no longer do work (an interrupted patch application "
+        "poisoned it); artifacts stay collectable, close-session cleans up",
+    ),
+    ErrorCode(
         "session.not-implemented",
         retryable=False,
         summary="the verb is part of the protocol and its server logic is not built yet",
@@ -197,6 +208,16 @@ REGISTRY: dict[str, ErrorCode] = _seed(
         "version.builder-unavailable",
         retryable=False,
         summary="no build container on this server satisfies the context's container.digest pin",
+    ),
+    # invocation.* — one invocation of the build container's program,
+    # addressed by the server-assigned invocation id (ADR 0019 decision
+    # 2). One entry, on purpose: a cancel that races a natural
+    # completion is answered `already_finished` and is NOT an error —
+    # both parties behaved correctly (second amendment).
+    ErrorCode(
+        "invocation.unknown",
+        retryable=False,
+        summary="the session has no invocation with this id; details carry the ids it does have",
     ),
     # builder.* — the thing that builds, whatever shape it takes. The
     # spelling was settled by the product owner on 2026-08-09, before the

@@ -26,3 +26,6 @@ dist/
 # Claude Code local files
 .claude/settings.local.json
 CLAUDE.local.md
+
+# CI-only sibling checkout (see .github/workflows/ci.yml)
+.deps/

@@ -5,22 +5,15 @@
 #
 #   lint — ruff (check + format) and REUSE, pinned to the same versions
 #          the other MCUHome repositories use; bump them together.
-#   test — pytest over the protocol, session, and builder tests.
+#   test — pytest over the transport, the token and the session protocol.
 #
-# The test gate needs both private sibling repositories: the `mcuhome`
-# builder library and the `mcuhome` command line (the builder tests run
-# the real `mcuhome build --help`). Each is checked out with its own
-# read-only deploy key ("ci-build-server-read" on the respective
-# repository), stored as Actions secrets here: MCUHOME_DEPLOY_KEY for
-# mcu-home/mcuhome, CLI_DEPLOY_KEY for mcu-home/cli. GitHub routes SSH
-# access by key, so one key cannot serve two repositories; each checkout
-# step uses exactly its own key, which keeps the routing unambiguous.
-# Install order follows requirements-dev.txt: mcuhome, then cli, then
-# this repository. The dashboard frame-vocabulary cross-check in
-# tests/test_protocol.py skips here by design — the build server must
-# stay installable without the dashboard package (dashboard ADR 0003).
-# Once the packages are published, the checkouts collapse to a plain
-# pip install and the keys go away.
+# The test gate needs no sibling repository. It used to check out
+# `mcu-home/mcuhome` and `mcu-home/cli` with their own read-only deploy
+# keys, because the build server spawned the `mcuhome` command as its
+# builder and one test ran the real `mcuhome build --help`; both went
+# with the job protocol, so the checkouts, the installs and the
+# MCUHOME_DEPLOY_KEY / CLI_DEPLOY_KEY secrets are no longer used here.
+# The secrets can be revoked on the respective repositories.
 #
 # All actions are pinned to commit SHAs, not tags (see dependabot.yml,
 # which keeps the pins current via its github-actions ecosystem entry).
@@ -67,30 +60,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Checkout the mcuhome builder library
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: mcu-home/mcuhome
-          ssh-key: ${{ secrets.MCUHOME_DEPLOY_KEY }}
-          path: .deps/mcuhome
-
-      - name: Checkout the mcuhome command line
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: mcu-home/cli
-          ssh-key: ${{ secrets.CLI_DEPLOY_KEY }}
-          path: .deps/cli
-
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
 
       - name: Install
-        run: |
-          python -m pip install --disable-pip-version-check ./.deps/mcuhome
-          python -m pip install --disable-pip-version-check ./.deps/cli
-          python -m pip install --disable-pip-version-check -e '.[dev]'
+        run: python -m pip install --disable-pip-version-check -e '.[dev]'
 
       - name: pytest
         run: pytest

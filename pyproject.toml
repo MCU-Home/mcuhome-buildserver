@@ -8,7 +8,7 @@ build-backend = "hatchling.build"
 [project]
 name = "mcuhome-build-server"
 version = "0.1.0.dev0"
-description = "Headless MCUHome build service: compiles device models submitted over the ADR 0006 protocol."
+description = "Headless MCUHome build service: drives build environments over the session build protocol."
 readme = "README.md"
 requires-python = ">=3.13"
 license = "Apache-2.0"
@@ -23,13 +23,21 @@ classifiers = [
 
 dependencies = ["aiohttp>=3.10,<4"]
 
-# The `mcuhome` builder package is a runtime dependency of a different
-# kind than the dashboard's: this server *spawns* the CLI rather than
-# importing it (see mcuhome_buildserver/builder.py for why), and imports
-# `mcuhome.api` only to read the version it is going to spawn. It is not
-# declared here for the same reason as in the dashboard — the builder is
-# not published yet, so pip would resolve the name against PyPI and
-# fail. `requirements-dev.txt` installs it from the sibling checkout.
+# This package has no MCUHome dependency at all today, and that is a
+# state to leave rather than a state to keep. The old one was a
+# non-dependency by design — the `mcuhome` CLI was *spawned*, not
+# imported, and only its version constants were read — and it went with
+# the job protocol and the builder subprocess.
+#
+# What replaces it is a real, declarable dependency that does not exist
+# yet: ADR 0020 decision 1 splits the lib into `mcuhome-model`,
+# `mcuhome-workbench` and `mcuhome-compiler`, and this server consumes
+# **`mcuhome-model`** — for the context format and the frozen context-ID
+# rule of ADR 0018 §6, which ADR 0019 §8 obliges this side to recompute
+# from the received bytes. That rule is frozen precisely so that both
+# sides of the contract compute the same value, so it must be one
+# implementation shared, never two that agree by inspection. Declare it
+# here when the distribution exists and the context path needs it.
 #
 # There is deliberately **no dependency on `mcuhome-dashboard`**. The two
 # are separate products with separate version numbers (ADR 0003 decision

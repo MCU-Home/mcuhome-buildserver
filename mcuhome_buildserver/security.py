@@ -65,8 +65,11 @@ STATE_KEY: web.AppKey[Any] = web.AppKey("mcuhome_buildserver_state")
 
 #: Paths served without a token. ``/health`` says what is running and
 #: nothing about what it holds, which is what an orchestrator's liveness
-#: probe needs and all it may have. Everything else — ``/capabilities``
-#: included, because it names versions and an image tag — is gated.
+#: probe needs and all it may have. Everything else is gated — which
+#: today means ``/ws``, and with it every answer about what this server
+#: can build: the ``capabilities`` verb names builder images and patch
+#: policy, an inventory of the machine and not something to hand to an
+#: unauthenticated caller.
 OPEN_PATHS = frozenset({"/health"})
 
 

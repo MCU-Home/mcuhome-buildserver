@@ -1,17 +1,26 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""``/capabilities``, ``/health`` and the bearer token (ADR 0006 decisions 1 and 4)."""
+"""``/health`` and the bearer token.
+
+The transport half of dashboard ADR 0006 — WebSocket plus a bearer
+token, TLS at the deployment, the leaked-token threat model, same-host
+pairing — is carried forward unchanged by dashboard ADR 0012 decision 3.
+Its ``GET /capabilities`` endpoint is not: the session protocol's
+``capabilities`` verb replaced it, so the assertions that used that
+endpoint merely as *a gated path* now use ``/ws``, which is the only
+one left.
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
 
+import aiohttp
 import pytest
 
-from mcuhome_buildserver import builder
-from mcuhome_buildserver.config import Config, load_config, resolve_token
+from mcuhome_buildserver.config import load_config, resolve_token
 from mcuhome_buildserver.security import publish_pairing_token, read_token_file
-from tests.conftest import TOKEN, auth
+from tests.conftest import TOKEN
 
 
 async def test_health_is_open_and_says_nothing_secret(client) -> None:
@@ -22,82 +31,27 @@ async def test_health_is_open_and_says_nothing_secret(client) -> None:
     assert "token" not in str(body).lower()
 
 
-async def test_capabilities_needs_the_token(client) -> None:
-    assert (await client.get("/capabilities")).status == 401
-    assert (await client.get("/capabilities", headers={"Authorization": "Bearer no"})).status == 401
-    assert (await client.get("/capabilities", headers={"Authorization": TOKEN})).status == 401
-
-
-async def test_capabilities_answers_what_a_client_negotiates_on(client) -> None:
-    response = await client.get("/capabilities", headers=auth())
-    assert response.status == 200
-    body = await response.json()
-
-    assert body["mcuhome"]["version"] == builder.VERSION
-    assert body["model_version"] == {
-        "min": builder.MODEL_VERSION_MIN,
-        "max": builder.MODEL_VERSION_MAX,
-    }
-    assert body["jobs"]["slots"] == 1
-    assert body["arch"]
-    assert set(body["commands"]) == {
-        # The v1 job commands…
-        "submit_job",
-        "cancel_job",
-        "follow_job",
-        "download_artifacts",
-        "queue_status",
-        # …and the session protocol v2 verbs on the same endpoint.
-        "capabilities",
-        "open-session",
-        "send-context",
-        "extend-context",
-        "verify",
-        "build",
-        "get-artifact",
-        "attach-session",
-        "close-session",
-    }
-    assert body["session_protocol_version"] == 2
-    # This server can never sign; a dashboard that trusted it to would
-    # skip its own signing step and hand out unbootable firmware.
-    assert body["signing"]["detached_only"] is True
-    assert body["builder"]["usable"] is True
+async def test_a_missing_or_malformed_token_is_refused(client) -> None:
+    assert (await client.get("/ws")).status == 401
+    assert (await client.get("/ws", headers={"Authorization": "Bearer no"})).status == 401
+    # A bare token with no `Bearer` scheme is not a credential.
+    assert (await client.get("/ws", headers={"Authorization": TOKEN})).status == 401
 
 
 async def test_the_token_may_come_in_the_query_for_a_browser(client) -> None:
     # A browser's WebSocket constructor cannot set a header. Everything
     # else should use the header, and the README says why.
-    assert (await client.get("/capabilities", params={"token": TOKEN})).status == 200
-    assert (await client.get("/capabilities", params={"token": "wrong"})).status == 401
+    async with client.ws_connect("/ws", params={"token": TOKEN}) as ws:
+        assert not ws.closed
+
+    with pytest.raises(aiohttp.WSServerHandshakeError) as excinfo:
+        await client.ws_connect("/ws", params={"token": "wrong"})
+    assert excinfo.value.status == 401
 
 
 async def test_the_websocket_upgrade_is_gated_too(client) -> None:
     response = await client.get("/ws")
     assert response.status == 401
-
-
-async def test_an_unusable_builder_is_advertised_rather_than_hidden(
-    aiohttp_client, config: Config
-) -> None:
-    from mcuhome_buildserver.app import ServerState, create_app
-
-    broken = builder.BuilderFeatures(
-        present=True,
-        model_input=False,
-        detached_signing=True,
-        json_output=True,
-        problem=None,
-    )
-    state = ServerState(config, features=broken)
-    await state.start(probe=False)
-    try:
-        client = await aiohttp_client(create_app(state))
-        body = await (await client.get("/capabilities", headers=auth())).json()
-        assert body["builder"]["usable"] is False
-        assert body["builder"]["model_input"] is False
-    finally:
-        await state.stop()
 
 
 class TestTokenResolution:
@@ -146,39 +100,34 @@ class TestConfig:
         assert config.host == "0.0.0.0"  # noqa: S104 - the point of the assertion
         assert config.token
         assert config.token_generated is True
-        assert config.slots == 1
 
-    def test_the_environment_configures_everything(self, tmp_path: Path) -> None:
+    def test_the_environment_configures_everything(self) -> None:
         config = load_config(
             [],
             env={
                 "MCUHOME_BUILDSERVER_HOST": "127.0.0.1",
                 "MCUHOME_BUILDSERVER_PORT": "9000",
                 "MCUHOME_BUILDSERVER_TOKEN": "shhh",
-                "MCUHOME_BUILDSERVER_JOBS_ROOT": str(tmp_path / "jobs"),
-                "MCUHOME_BUILDSERVER_WORKSPACE": str(tmp_path),
-                "MCUHOME_BUILDSERVER_SLOTS": "2",
-                "MCUHOME_BUILDSERVER_BUILD_JOBS": "24",
-                "MCUHOME_BUILDSERVER_KEEP_JOBS": "3",
+                "MCUHOME_BUILDSERVER_ALLOWED_ORIGINS": "https://ha.local, https://nas.local",
+                "MCUHOME_BUILDSERVER_LOG_LEVEL": "DEBUG",
             },
         )
         assert (config.host, config.port, config.token) == ("127.0.0.1", 9000, "shhh")
-        assert config.jobs_root == tmp_path / "jobs"
-        assert config.workspace == tmp_path.resolve()
-        assert (config.slots, config.build_jobs, config.keep_jobs) == (2, 24, 3)
+        assert config.allowed_origins == ("https://ha.local", "https://nas.local")
+        assert config.log_level == "DEBUG"
         assert config.token_generated is False
 
     def test_the_command_line_beats_the_environment(self) -> None:
         config = load_config(
-            ["--port", "1234", "--slots", "1"],
-            env={"MCUHOME_BUILDSERVER_PORT": "9000", "MCUHOME_BUILDSERVER_TOKEN": "t"},
+            ["--port", "1234", "--log-level", "DEBUG"],
+            env={
+                "MCUHOME_BUILDSERVER_PORT": "9000",
+                "MCUHOME_BUILDSERVER_TOKEN": "t",
+                "MCUHOME_BUILDSERVER_LOG_LEVEL": "ERROR",
+            },
         )
-        assert config.port == 1234
+        assert (config.port, config.log_level) == (1234, "DEBUG")
 
     def test_no_pair_file_means_no_pair_file(self) -> None:
         assert load_config(["--no-pair-file"], env={}).pair_file is None
         assert load_config([], env={}).pair_file is not None
-
-    def test_a_zero_lane_server_is_refused(self) -> None:
-        with pytest.raises(SystemExit):
-            load_config(["--slots", "0"], env={})

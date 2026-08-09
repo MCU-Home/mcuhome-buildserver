@@ -1,16 +1,22 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""The build-service frame vocabulary (ADR 0006 decision 3).
+"""The frame envelope: the codec every verb is carried in.
 
-One WebSocket endpoint, two kinds of frame — the same envelope the
-dashboard's own API uses, because ADR 0006 decision 2 makes the frame
-vocabulary the contract and there is no reason for two shapes of
+One WebSocket endpoint and three kinds of frame — the same envelope the
+dashboard's own API uses, because there is no reason for two shapes of
 envelope in one product family::
 
-    → {"id": "7", "type": "submit_job",  "payload": {...}}
-    ← {"id": "7", "type": "result",      "payload": {"job_id": "…"}}
-    ← {"id": "7", "type": "error",       "error": {"code": "…", …}}
-    ← {"type": "event", "event": "job_state_changed", "payload": {...}}
+    → {"id": "7", "type": "open-session", "payload": {...}}
+    ← {"id": "7", "type": "result",       "payload": {"session": {...}}}
+    ← {"id": "7", "type": "error",        "error": {"code": "…", …}}
+    ← {"type": "event", "event": "…",     "payload": {...}}
+
+**The envelope outlived the vocabulary it was built for.** It carried
+the one-shot job protocol of dashboard ADR 0006; that protocol was
+dismantled rather than migrated, and dashboard ADR 0012 decision 3
+keeps exactly this — the frame envelope, the transport under it and the
+bearer token in front of it — while the verbs inside became the session
+protocol of :mod:`mcuhome_buildserver.sessions`.
 
 **Why this module is a sibling of** ``mcuhome_dashboard.protocol``
 **rather than an import of it.** The dashboard and the build server are
@@ -21,31 +27,18 @@ dashboard's package here would make the fat half undeployable without
 the thin half, which is exactly the coupling ADR 0003 spent its length
 avoiding.
 
-What must not drift is the *vocabulary*, and that is guarded rather than
-assumed: ``tests/test_protocol.py`` compares this module's envelope
-constants against ``mcuhome_dashboard.protocol`` whenever both packages
-are importable, which in this repository's development install is
-always. A rename on one side fails a test on the other instead of
+What must not drift is the *envelope*, and that is guarded rather than
+assumed: ``tests/test_protocol.py`` compares this module's constants
+against ``mcuhome_dashboard.protocol`` whenever both packages are
+importable. A rename on one side fails a test on the other instead of
 producing two servers that almost agree.
 
-**Commands** (client → server), ADR 0006 decision 3 plus the ``follow``
-operation its decision 6 describes:
-
-``submit_job``
-    Queue one build. Payload: the resolved ``device-model.json``, the
-    ``model_version`` it claims, the signing **public** key, and the
-    build options.
-``cancel_job``
-    Stop one job — queued or running.
-``follow_job``
-    History-then-live log output from a byte offset the client states.
-``download_artifacts``
-    The artifact index, and then the artifacts themselves in chunks.
-``queue_status``
-    What the queue is doing, and the job records it remembers.
-
-**Events** (server → client, unprompted): ``job_state_changed`` and
-``job_output``.
+**Errors come in two vocabularies, and the difference is which layer
+failed.** A frame that parsed and named a verb is answered from the
+typed registry in :mod:`mcuhome_buildserver.errors` — dotted code,
+authoritative ``retryable``, structured details. The two constants
+below are for the frames that never got that far, and they are the
+whole reason this module still defines any error code at all.
 """
 
 from __future__ import annotations
@@ -55,18 +48,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 __all__ = [
-    "COMMAND_TYPES",
     "ERROR_BAD_REQUEST",
-    "ERROR_CONFLICT",
     "ERROR_INTERNAL",
-    "ERROR_NOT_FOUND",
-    "ERROR_UNAUTHORIZED",
-    "ERROR_UNAVAILABLE",
-    "ERROR_UNKNOWN_COMMAND",
-    "ERROR_UNSUPPORTED",
-    "EVENT_JOB_OUTPUT",
-    "EVENT_JOB_STATE_CHANGED",
-    "PROTOCOL_VERSION",
     "TYPE_ERROR",
     "TYPE_EVENT",
     "TYPE_RESULT",
@@ -76,55 +59,26 @@ __all__ = [
     "encode",
     "error_frame",
     "event_frame",
-    "job_output_event",
-    "job_state_event",
     "result_frame",
 ]
-
-#: Bumped when a frame changes shape in a way an old client cannot read.
-#: Advertised by ``GET /capabilities`` so that the negotiation of ADR
-#: 0006 decision 4 covers the protocol as well as the model.
-PROTOCOL_VERSION = 1
 
 TYPE_RESULT = "result"
 TYPE_ERROR = "error"
 TYPE_EVENT = "event"
 
-EVENT_JOB_STATE_CHANGED = "job_state_changed"
-EVENT_JOB_OUTPUT = "job_output"
-
-#: Every command this server answers. Named as data so that an unknown
-#: command can list the known ones instead of just refusing.
-COMMAND_TYPES = (
-    "submit_job",
-    "cancel_job",
-    "follow_job",
-    "download_artifacts",
-    "queue_status",
-)
-
 #: The frame was not understood: malformed JSON, missing fields, wrong
-#: types. Always the client's fault.
+#: types, a binary message on a text endpoint. Always the client's
+#: fault, and necessarily *pre*-registry: the typed codes of
+#: :mod:`mcuhome_buildserver.errors` describe a session's refusals, and
+#: a frame that did not parse has no session and no verb to attribute
+#: the refusal to. Adding a registry code for it is a protocol decision
+#: — the layer set is fixed by the concept — so this constant stays
+#: until that decision is taken, rather than being replaced by a guess.
 ERROR_BAD_REQUEST = "bad_request"
-#: A well-formed frame naming a command this server does not have.
-ERROR_UNKNOWN_COMMAND = "unknown_command"
-#: The command is fine, the job or artifact it names does not exist.
-ERROR_NOT_FOUND = "not_found"
-#: The token was missing or wrong.
-ERROR_UNAUTHORIZED = "unauthorized"
-#: A precondition outside the client's control is missing — no west
-#: workspace, no builder, no disk.
-ERROR_UNAVAILABLE = "unavailable"
-#: The job is not in a state where this makes sense: cancelling a job
-#: that already finished, downloading artifacts of one that failed.
-ERROR_CONFLICT = "conflict"
-#: The request is well-formed and this server cannot honour it — a
-#: ``model_version`` outside the advertised range, or a builder that is
-#: missing a feature the job needs. Distinct from ``bad_request``
-#: because nothing about the frame is wrong, and the negotiation of ADR
-#: 0006 decision 4 exists precisely so a client can see this coming.
-ERROR_UNSUPPORTED = "unsupported"
-#: A bug on this side. Carries no traceback; the log has it.
+#: A bug on this side, from the command loop's catch-all. Carries no
+#: traceback; the log has it. Pre-registry for the same reason: an
+#: unexpected exception is not a verdict any layer of the protocol
+#: claims to render.
 ERROR_INTERNAL = "internal_error"
 
 
@@ -166,15 +120,6 @@ class Command:
             raise ProtocolError(f'"{self.type}" wants "{key}" as a string.', frame_id=self.id)
         return value
 
-    def require_dict(self, key: str) -> dict[str, Any]:
-        value = self.payload.get(key)
-        if not isinstance(value, dict):
-            raise ProtocolError(
-                f'"{self.type}" needs "{key}" as a JSON object in its payload.',
-                frame_id=self.id,
-            )
-        return value
-
     def optional_dict(self, key: str) -> dict[str, Any]:
         value = self.payload.get(key)
         if value is None:
@@ -187,28 +132,10 @@ class Command:
         value = self.payload.get(key)
         if value is None:
             return default
-        # bool is an int in Python and never a byte offset or a job count.
+        # bool is an int in Python and never a version or a byte offset.
         if isinstance(value, bool) or not isinstance(value, int):
             raise ProtocolError(f'"{self.type}" wants "{key}" as a whole number.', frame_id=self.id)
         return value
-
-    def optional_bool(self, key: str, default: bool) -> bool:
-        value = self.payload.get(key)
-        if value is None:
-            return default
-        if not isinstance(value, bool):
-            raise ProtocolError(f'"{self.type}" wants "{key}" as true or false.', frame_id=self.id)
-        return value
-
-    def optional_str_list(self, key: str) -> list[str]:
-        value = self.payload.get(key, [])
-        if isinstance(value, str):
-            value = [value]
-        if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
-            raise ProtocolError(
-                f'"{self.type}" wants "{key}" as a list of strings.', frame_id=self.id
-            )
-        return list(value)
 
 
 def decode(raw: str) -> Command:
@@ -255,26 +182,6 @@ def error_frame(frame_id: Any, code: str, message: str, **detail: Any) -> dict[s
 
 def event_frame(name: str, payload: dict[str, Any]) -> dict[str, Any]:
     return {"type": TYPE_EVENT, "event": name, "payload": payload}
-
-
-def job_state_event(job: dict[str, Any]) -> dict[str, Any]:
-    """``job_state_changed`` — the whole job record, not just the state.
-
-    A client that missed an earlier transition should not have to
-    reconstruct one from a sequence of deltas, and the record is small.
-    """
-    return event_frame(EVENT_JOB_STATE_CHANGED, {"job": job})
-
-
-def job_output_event(job_id: str, offset: int, text: str) -> dict[str, Any]:
-    """``job_output`` — one piece of build log, with the offset it starts at.
-
-    The offset is what makes a gap detectable: a client whose events were
-    dropped because it fell behind sees the next ``offset`` skip past its
-    own end and repairs itself with ``follow_job`` instead of showing a
-    log with a silent hole in it (ADR 0006 decision 6).
-    """
-    return event_frame(EVENT_JOB_OUTPUT, {"job_id": job_id, "offset": offset, "text": text})
 
 
 def encode(frame: dict[str, Any]) -> str:

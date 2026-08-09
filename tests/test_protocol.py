@@ -1,6 +1,12 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""The frame vocabulary of ADR 0006, and its agreement with the dashboard's."""
+"""The frame envelope, and its agreement with the dashboard's.
+
+The envelope is the half of dashboard ADR 0006 that dashboard ADR 0012
+decision 3 carries forward; only the vocabulary inside it was replaced.
+So this file still tests the codec — with session verbs as its literals
+instead of job commands.
+"""
 
 from __future__ import annotations
 
@@ -13,13 +19,13 @@ from mcuhome_buildserver.protocol import Command, ProtocolError
 
 
 def test_a_command_round_trips() -> None:
-    command = protocol.decode('{"id":"7","type":"submit_job","payload":{"a":1}}')
-    assert command == Command(id="7", type="submit_job", payload={"a": 1})
+    command = protocol.decode('{"id":"7","type":"open-session","payload":{"a":1}}')
+    assert command == Command(id="7", type="open-session", payload={"a": 1})
 
 
 def test_a_missing_payload_is_an_empty_one() -> None:
-    assert protocol.decode('{"id":1,"type":"queue_status"}').payload == {}
-    assert protocol.decode('{"id":1,"type":"queue_status","payload":null}').payload == {}
+    assert protocol.decode('{"id":1,"type":"capabilities"}').payload == {}
+    assert protocol.decode('{"id":1,"type":"capabilities","payload":null}').payload == {}
 
 
 @pytest.mark.parametrize(
@@ -30,8 +36,8 @@ def test_a_missing_payload_is_an_empty_one() -> None:
         '"a string"',
         '{"id":"1"}',
         '{"id":"1","type":""}',
-        '{"id":{"nested":true},"type":"queue_status"}',
-        '{"id":"1","type":"queue_status","payload":[]}',
+        '{"id":{"nested":true},"type":"capabilities"}',
+        '{"id":"1","type":"capabilities","payload":[]}',
     ],
 )
 def test_a_malformed_frame_is_refused(raw: str) -> None:
@@ -45,23 +51,16 @@ def test_the_three_frame_shapes() -> None:
         "type": "result",
         "payload": {"ok": True},
     }
-    assert protocol.error_frame("7", "not_found", "no such job", job_id="x") == {
+    assert protocol.error_frame("7", "bad_request", "not a frame", detail="x") == {
         "id": "7",
         "type": "error",
-        "error": {"code": "not_found", "message": "no such job", "job_id": "x"},
+        "error": {"code": "bad_request", "message": "not a frame", "detail": "x"},
     }
-    assert protocol.event_frame("job_output", {"a": 1}) == {
+    assert protocol.event_frame("progress", {"a": 1}) == {
         "type": "event",
-        "event": "job_output",
+        "event": "progress",
         "payload": {"a": 1},
     }
-
-
-def test_the_job_events_carry_what_a_client_needs_to_reorder() -> None:
-    event = protocol.job_output_event("j1", 4096, "text")
-    assert event["payload"] == {"job_id": "j1", "offset": 4096, "text": "text"}
-    state = protocol.job_state_event({"id": "j1", "state": "running"})
-    assert state["payload"]["job"]["state"] == "running"
 
 
 def test_encoding_is_deterministic_and_keeps_unicode() -> None:
@@ -72,54 +71,25 @@ def test_encoding_is_deterministic_and_keeps_unicode() -> None:
 
 class TestFieldAccessors:
     def command(self, **payload: object) -> Command:
-        return Command(id="1", type="submit_job", payload=payload)
+        return Command(id="1", type="open-session", payload=payload)
 
     def test_required_fields(self) -> None:
-        assert self.command(job_id="x").require_str("job_id") == "x"
+        assert self.command(session_id="x").require_str("session_id") == "x"
         with pytest.raises(ProtocolError):
-            self.command(job_id="").require_str("job_id")
+            self.command(session_id="").require_str("session_id")
         with pytest.raises(ProtocolError):
-            self.command().require_dict("model")
+            self.command().require_str("session_id")
 
     def test_a_bool_is_not_a_number(self) -> None:
-        # True == 1 in Python, and a byte offset of True is a bug that
-        # would otherwise arrive as a successful follow.
+        # True == 1 in Python, and a protocol version of True is a bug
+        # that would otherwise arrive as a successful negotiation.
         with pytest.raises(ProtocolError):
-            self.command(offset=True).optional_int("offset")
+            self.command(protocol_version=True).optional_int("protocol_version")
 
     def test_optional_fields_fall_back(self) -> None:
-        assert self.command().optional_int("offset", 0) == 0
-        assert self.command().optional_bool("no_sign", True) is True
-        assert self.command().optional_str_list("snippets") == []
-        assert self.command(snippets="debug-rtt").optional_str_list("snippets") == ["debug-rtt"]
-
-
-def test_the_envelope_matches_the_dashboard_s() -> None:
-    """The two products must not drift apart on the frame envelope.
-
-    ADR 0006 decision 2 makes the frame vocabulary the contract, and the
-    build server keeps its own copy of the codec so it can be deployed
-    without the dashboard package. This is what stops "its own copy"
-    from becoming "its own dialect": in this repository's development
-    install both are importable, and a rename on one side fails here.
-    """
-    dashboard = pytest.importorskip(
-        "mcuhome_dashboard.protocol", reason="the dashboard package is not installed"
-    )
-    for name in (
-        "TYPE_RESULT",
-        "TYPE_ERROR",
-        "TYPE_EVENT",
-        "ERROR_BAD_REQUEST",
-        "ERROR_UNKNOWN_COMMAND",
-        "ERROR_NOT_FOUND",
-        "ERROR_UNAUTHORIZED",
-        "ERROR_UNAVAILABLE",
-        "ERROR_CONFLICT",
-        "ERROR_INTERNAL",
-    ):
-        assert getattr(protocol, name) == getattr(dashboard, name), name
-
-    frame = {"id": "7", "type": "result", "payload": {"x": 1}}
-    assert protocol.encode(frame) == dashboard.encode(frame)
-    assert protocol.decode(dashboard.encode(frame)).payload == {"x": 1}
+        assert self.command().optional_int("context_format", 1) == 1
+        assert self.command().optional_str("profile", "oneshot") == "oneshot"
+        assert self.command().optional_dict("manifest") == {}
+        assert self.command(manifest={"context": 1}).optional_dict("manifest") == {"context": 1}
+        with pytest.raises(ProtocolError):
+            self.command(manifest=[]).optional_dict("manifest")

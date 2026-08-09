@@ -2,11 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Session protocol v2 — the session registry and one handler per verb.
 
-The remote-build architecture replaces the one-shot job protocol with a
+The remote-build architecture replaced the one-shot job protocol with a
 **session model**: one session = one ephemeral builder container = one
-effective build context. The same verb set has a local backend (the lib
-drives the container runtime directly) and this remote one, which adds
-auth, policy and scheduling on top of the identical verbs.
+effective build context. The same verb set has a local backend (the
+workbench drives the container runtime directly) and this remote one,
+which adds auth, policy and scheduling on top of the identical verbs.
+
+These verbs are the whole vocabulary of the ``/ws`` endpoint. The job
+protocol they replaced was dismantled rather than migrated; what
+survived it is the transport underneath — the frame envelope, the
+connection handling and the bearer token.
 
 **This is the protocol skeleton.** What is real here is the protocol
 surface itself: the verb set, admission with version negotiation at
@@ -52,8 +57,10 @@ __all__ = [
 ]
 
 #: Bumped when the *session* protocol changes shape. Version 2 because
-#: the one-shot job protocol of ADR 0006 is version 1; the two share the
-#: frame envelope and one ``/ws`` endpoint during the transition.
+#: the one-shot job protocol of dashboard ADR 0006 was version 1. That
+#: protocol no longer exists here, but the number is not reclaimed: a
+#: client that speaks 1 must be told it is behind, not handed a 2 that
+#: means something else.
 SESSION_PROTOCOL_VERSION = 2
 
 #: The context manifest format range this server accepts (`context: N`
@@ -434,8 +441,17 @@ async def close_session(state: Any, connection: Any, command: Command) -> dict[s
     return {"session": session.to_dict()}
 
 
-#: The verb table, merged into the ``/ws`` command table. Hyphenated
-#: names as in the concept; the v1 job commands keep their underscores.
+#: The verb table; the ``/ws`` command table is a copy of it.
+#: Hyphenated names as in the concept.
+#:
+#: **Two verbs of the amended concept are missing.** Dashboard ADR 0012
+#: decision 3 (amended 2026-08-09, from ADR 0019) lists eleven:
+#: ``lock-context`` freezes the context, writes ``manifest.yaml`` and
+#: returns the context id, and ``cancel(invocation-id)`` aborts a
+#: running invocation while the session survives. Neither is
+#: implemented, and without ``lock-context`` a client can never reach
+#: ``build`` — so this table is not yet a protocol anyone can complete
+#: a build over, quite apart from the stubs behind it.
 SESSION_VERBS = {
     "capabilities": capabilities,
     "open-session": open_session,

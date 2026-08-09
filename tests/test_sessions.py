@@ -99,24 +99,18 @@ async def test_capabilities_answers_the_negotiation_surface(client) -> None:
     assert "work" in body["quota"]
 
 
-async def test_the_patch_policy_comes_from_the_configuration(
-    aiohttp_client, config, features
-) -> None:
+async def test_the_patch_policy_comes_from_the_configuration(aiohttp_client, config) -> None:
     from dataclasses import replace
 
     from mcuhome_buildserver.app import ServerState, create_app
 
-    state = ServerState(replace(config, allowed_patch_layers=("sdk",)), features=features)
-    await state.start(probe=False)
-    try:
-        client = await aiohttp_client(create_app(state))
-        async with client.ws_connect("/ws", headers=auth()) as ws:
-            frame = await call(ws, "capabilities")
-        policy = frame["payload"]["patch_policy"]
-        assert policy["sdk"] == {"allow": True}
-        assert policy["zephyr"] == {"allow": False}
-    finally:
-        await state.stop()
+    state = ServerState(replace(config, allowed_patch_layers=("sdk",)))
+    client = await aiohttp_client(create_app(state))
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        frame = await call(ws, "capabilities")
+    policy = frame["payload"]["patch_policy"]
+    assert policy["sdk"] == {"allow": True}
+    assert policy["zephyr"] == {"allow": False}
 
 
 def test_the_allow_patch_layer_option_and_its_environment_form() -> None:
@@ -145,7 +139,32 @@ async def test_an_unknown_verb_is_a_typed_rejection(client) -> None:
     assert error["layer"] == "version"
     assert error["retryable"] is False
     assert "open-session" in error["details"]["known"]
-    assert "submit_job" in error["details"]["known"]
+
+
+def test_the_verb_set_is_the_whole_vocabulary() -> None:
+    """The session verbs are all this server answers.
+
+    Re-homed from the deleted ``/capabilities`` test, which asserted the
+    merged v1+v2 command set. The job commands are gone, so this table
+    *is* the surface — which is also where the gap is visible: dashboard
+    ADR 0012 decision 3 (amended 2026-08-09) lists eleven verbs, adding
+    ``lock-context`` and ``cancel``. Neither exists yet, and without
+    ``lock-context`` a client can never reach ``build``.
+    """
+    from mcuhome_buildserver import ws as ws_module
+
+    assert set(ws_module.COMMANDS) == {
+        "capabilities",
+        "open-session",
+        "send-context",
+        "extend-context",
+        "verify",
+        "build",
+        "get-artifact",
+        "attach-session",
+        "close-session",
+    }
+    assert set(ws_module.COMMANDS) == set(sessions.SESSION_VERBS)
 
 
 # --------------------------------------------------------------------------

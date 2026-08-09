@@ -12,7 +12,7 @@ sit behind TLS, because a bearer token on a plaintext connection is a
 token that has been given away.
 
 The threat model is ESPHome's, verbatim and unchanged: **a compromised
-authenticated session is equivalent to shell access.** A job runs a
+authenticated session is equivalent to shell access.** A build runs a
 compiler over data the session supplied, on this machine. There is no
 sandbox here that would make a leaked token less than that, which is why
 the token is always required and never optional.
@@ -67,9 +67,9 @@ STATE_KEY: web.AppKey[Any] = web.AppKey("mcuhome_buildserver_state")
 #: nothing about what it holds, which is what an orchestrator's liveness
 #: probe needs and all it may have. Everything else is gated — which
 #: today means ``/ws``, and with it every answer about what this server
-#: can build: the ``capabilities`` verb names builder images and patch
-#: policy, an inventory of the machine and not something to hand to an
-#: unauthenticated caller.
+#: can build: the ``capabilities`` verb names build-container images and
+#: patch policy, an inventory of the machine and not something to hand
+#: to an unauthenticated caller.
 OPEN_PATHS = frozenset({"/health"})
 
 

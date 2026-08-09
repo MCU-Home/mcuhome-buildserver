@@ -115,10 +115,11 @@ class Connection:
                 await task
 
 
-#: The command table. Adding a name here is the whole registration.
-#: Every entry is a session protocol v2 verb, and the verbs carry their
-#: table in their own module: this endpoint's vocabulary *is* the
-#: session protocol now that the one-shot job commands are gone.
+#: The command table, **derived** from the verb table rather than
+#: written out again: this endpoint's vocabulary *is* the session
+#: protocol now that the one-shot job commands are gone, so a verb
+#: registered in :data:`sessions.SESSION_VERBS` is registered here by
+#: construction and the two can never disagree.
 COMMANDS = dict(sessions.SESSION_VERBS)
 
 

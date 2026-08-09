@@ -89,7 +89,10 @@ class TestFieldAccessors:
     def test_optional_fields_fall_back(self) -> None:
         assert self.command().optional_int("context_format", 1) == 1
         assert self.command().optional_str("profile", "oneshot") == "oneshot"
-        assert self.command().optional_dict("manifest") == {}
-        assert self.command(manifest={"context": 1}).optional_dict("manifest") == {"context": 1}
+        # Not "manifest": open-session lost that operand with ADR 0019's
+        # amendment. The accessor stays — the codec is general, and the
+        # verbs that carry objects are the ones still stubbed.
+        assert self.command().optional_dict("params") == {}
+        assert self.command(params={"mode": "clean"}).optional_dict("params") == {"mode": "clean"}
         with pytest.raises(ProtocolError):
-            self.command(manifest=[]).optional_dict("manifest")
+            self.command(params=[]).optional_dict("params")

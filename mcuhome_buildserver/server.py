@@ -2,16 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Process entry point: bind the socket and serve.
 
-There is nothing to probe before binding any more. The builder used to
-be a subprocess on this machine, examined at startup so that the log's
-first line said what this server could do; a build server is now an
-orchestrator that never is the build environment itself
+There is nothing to probe before binding any more. The build tool used
+to be a subprocess on this machine, examined at startup so that the
+log's first line said what this server could do; a build server is now
+an orchestrator that never is the build environment itself
 (build-container-contract.md §1.2), and what it can build is a
 per-session question answered by the ``capabilities`` verb against a
-builder-image inventory. That inventory lands with the container
+build-container inventory. That inventory lands with the container
 backend, and until it does this server admits sessions and builds
 nothing — which the ``capabilities`` verb says in as many words by
-answering an empty ``builders`` list.
+answering an empty ``containers`` list.
 """
 
 from __future__ import annotations

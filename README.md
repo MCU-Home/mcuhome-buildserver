@@ -36,26 +36,39 @@ nothing else.
 
 What is real is the **protocol surface**: the transport, the bearer
 token, the frame envelope, session admission with version negotiation,
-the lease bookkeeping, the per-layer patch policy and the typed error
-registry. A client can connect, negotiate, open a session, attach to it
-and close it.
+the lease bookkeeping, the context state machine with its typed
+refusals, the per-layer patch policy and the typed error registry. A
+client can connect, negotiate, open a session, attach to it and close
+it, and every verb it sends is answered in the order the protocol
+defines.
 
 What is not here is **the container backend** — context upload and
 extraction, the overlay patch views, invoking the build program,
-progress streaming, artifact retrieval, scheduling and metering. Every
-verb that needs it answers a typed `session.not-implemented` instead of
-a guess, so a client sees a protocol that is honest about its state
-rather than one that almost works.
+progress streaming, artifact retrieval and scheduling. Every verb that
+needs it answers a typed `session.not-implemented` instead of a guess,
+so a client sees a protocol that is honest about its state rather than
+one that almost works.
 
-Two verbs of the amended concept are also still missing:
-`lock-context`, which freezes the context and returns its id, and
-`cancel`, which aborts a running invocation while the session survives
-(dashboard ADR 0012 decision 3, amended 2026-08-09, from ADR 0019).
-Without `lock-context` a client cannot reach `build` at all.
+Two of those stubs are **seams** rather than bare refusals, and both are
+named in `sessions.py`:
+
+- **the freeze** behind `lock-context`. Writing `manifest.yaml` and
+  computing the context ID are `mcuhome-model`'s (ADR 0020 decision 4),
+  and that distribution does not exist yet. The ID rule is frozen
+  precisely so that both sides of the contract compute the same value,
+  so this repository will not re-implement it to ship the verb sooner —
+  a second implementation with no conformance vectors between them is
+  two chances to disagree about a value whose only job is to be
+  identical on both sides.
+- **the cancellation signal** behind `cancel`. What it becomes is fixed
+  by the container contract §8: the backend creates the per-invocation
+  cancel sentinel file, whose *existence* means "stop". There are no
+  invocations to address yet, so the verb refuses rather than answering
+  "cancelled" for something that was never running.
 
 The one-shot job protocol that used to live here — `submit_job`,
 `cancel_job`, `follow_job`, `download_artifacts`, `queue_status`, the
-job directory on disk, the `mcuhome` builder subprocess and
+job directory on disk, the `mcuhome` build-tool subprocess and
 `GET /capabilities` — has been **removed rather than migrated**. Its
 transport, threat model and frame envelope are what survived, and they
 are what the session protocol runs on.
@@ -119,28 +132,85 @@ vocabulary until a protocol decision says otherwise.
 
 ### Verbs
 
-The session protocol is the whole vocabulary of this endpoint.
+The session protocol is the whole vocabulary of this endpoint. Eleven
+verbs, the complete set of dashboard ADR 0012 decision 3.
 
 | Verb | Payload | Today |
 |---|---|---|
-| `capabilities` | `{}` | **answers**: protocol version, builder image inventory (empty until the backend exists), per-layer patch policy from configuration, quota summary |
-| `open-session` | `{"profile", "protocol_version", "context_format", "manifest"}` | **answers**: admission — session id, lease, negotiated versions. A version mismatch is a typed rejection at the door |
-| `send-context` | `{"session_id", …}` | typed `session.not-implemented` |
-| `extend-context` | `{"session_id", …}` | typed `session.not-implemented` |
-| `verify` | `{"session_id"}` | typed `session.not-implemented` |
-| `build` | `{"session_id", "mode"}` | typed `session.not-implemented` |
+| `capabilities` | `{}` | **answers**: protocol version, build-container inventory (empty until the backend exists), per-layer patch policy from configuration, session quota |
+| `open-session` | `{"profile", "protocol_version", "context_format"}` | **answers**: admission — session id, lease, negotiated versions, backend profile. A version mismatch is a typed rejection at the door |
+| `send-context` | `{"session_id", …}` | typed `session.not-implemented`; `context.locked` after the lock |
+| `extend-context` | `{"session_id", …}` | typed `session.not-implemented`; `context.missing` with no base context, `context.locked` after the lock |
+| `lock-context` | `{"session_id"}` | **the state machine is real**: `context.missing` with no base context, `context.locked` on a second lock. The freeze behind it answers typed `session.not-implemented` |
+| `verify` | `{"session_id"}` | `context.not-locked` before the lock; typed `session.not-implemented` after it |
+| `build` | `{"session_id", "mode"}` | `context.not-locked` before the lock; typed `session.not-implemented` after it |
+| `cancel` | `{"session_id", "invocation_id"}` | typed `session.not-implemented`; the session and its lease are untouched |
 | `get-artifact` | `{"session_id", "invocation_id", "path"}` | typed `session.not-implemented` |
-| `attach-session` | `{"session_id"}` | **answers**: the session record and lease (event replay is future work) |
+| `attach-session` | `{"session_id"}` | **answers**: the session record with its context state, and the lease (event replay is future work) |
 | `close-session` | `{"session_id"}` | **answers**: the closed session record |
 
 An unknown verb is answered with `version.verb-unknown`, whose details
 name the verbs this server does have.
 
-`capabilities` is the pre-session query: it lets a client choose a
+`capabilities` is the pre-session query: it lets a client choose a build
 container during pin resolution rather than discover the mismatch from
 inside one. It is token-gated like everything else on `/ws`, because
-what it names — builder images, patch policy, quota — is an inventory of
-the machine.
+what it names — build-container images, patch policy, quota — is an
+inventory of the machine.
+
+### The context has its own lifetime, and `lock-context` ends it
+
+A session and the context it builds do not begin and end together, and
+the verb set says where the boundary is (ADR 0019 §2):
+
+```
+open-session       session id, lease, version negotiation (no context yet)
+send-context       base context incl. the pins; the container can be created
+extend-context     repeatable; MUST NOT touch the pin file
+[read-only commands permitted]
+lock-context       freezes the context, writes manifest.yaml, computes and
+                   returns the context id; unlocks the writing commands
+verify / build     only from here
+get-artifact
+close-session
+```
+
+The freeze is an explicit verb rather than an implicit one on "the first
+writing command", because an implicit freeze needs an enumerated list of
+writing commands kept in sync with a verb set that is append-only by
+decision — and a third-party command could not know which side of the
+line it falls on. Making it a verb buys three things: the context ID
+gets an **observable moment**, at which both sides compare values they
+computed independently; `verify` gets a stable `files` list to check
+against, without which it returned "not in the integrity list" for every
+extension; and the two states get clean typed errors instead of a
+command that quietly means something different depending on what ran
+before it.
+
+- **`context.not-locked`** — a working command (`verify`, `build`)
+  before the lock. Nothing else in the flow carries the "only from here"
+  qualification, so `get-artifact` and `cancel` are not gated on it:
+  both address an invocation a build produced, and the refusal for an
+  invocation id that does not exist is not specified anywhere.
+- **`context.locked`** — a writing command (`send-context`,
+  `extend-context`, a second `lock-context`) after it. The lock is
+  one-way: adding a patch after a `verify` is a new session, not an
+  extension.
+
+The session record carries `context_state` (`none` | `unlocked` |
+`locked`) so that a client returning through `attach-session` learns
+whether it still has to lock. What is immutable for the session is
+`context.yaml`, which carries the pins; `manifest.yaml` is written by
+this server at the lock and never arrives from a client.
+
+`cancel(invocation_id)` aborts one invocation and **the session and its
+warm container survive it**. It exists because a closed socket is not a
+stop signal: killing a `docker exec` client does not stop the process
+inside the container, so a backend that merely drops the connection
+leaves the compile running and the resources held. It is the deliberate
+counterpart to `attach-session` — connection loss is never abandonment,
+and the idle timeout counts absent *commands* rather than absent
+connections, so cancellation has to be something a client says.
 
 ### The error envelope
 
@@ -161,9 +231,15 @@ Codes come from the append-only registry in
 `version.*`, `builder.*`; `x-*` is reserved for third parties). A code,
 once released, is never renamed, removed or re-classified; clients treat
 unknown codes as non-retryable-fatal and surface the message.
+Append-only starts at the first *published* entry, and nothing here is
+published yet — which is the only reason two stale codes could be taken
+out rather than left to age (see the changelog). The `builder.*` prefix
+is a wire value and is deliberately not renamed by the terminology
+change; its spelling is settled when the registry is, before the first
+release.
 
 Patch policy is configuration (`--allow-patch-layer`, deny by default):
-the server's builder config **is** the policy, and `capabilities`
+the server's patch configuration **is** the policy, and `capabilities`
 advertises it per layer so a client fails fast instead of mid-session.
 
 ### Backpressure
@@ -183,7 +259,7 @@ already here.
 | `GET /health` | liveness, open, says nothing about what this server holds |
 
 `/health` names this service's own version and nothing else. It used to
-also report the version of the `mcuhome` builder this server spawned;
+also report the version of the `mcuhome` build tool this server spawned;
 there is no such subprocess any more, and the build environments it
 drives are per-session, so no single version could be named here
 truthfully. What this server can build is a question for the

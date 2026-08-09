@@ -4,7 +4,7 @@
 
 **Nothing here fakes a build environment, and that is the point.** The
 build server is an orchestrator and is never itself the build
-environment (build-container-contract.md §1.2), so there is no builder
+environment (build-container-contract.md §1.2), so there is no build
 subprocess to stand in for: what this suite exercises is the transport,
 the bearer token and the session protocol, all of which run without a
 toolchain anywhere near them.

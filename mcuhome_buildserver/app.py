@@ -16,8 +16,8 @@ REST is one endpoint:
 ADR 0006's pre-submission handshake; dashboard ADR 0012 decision 3
 replaces it with the session protocol's ``capabilities`` verb, which
 answers the same question with the vocabulary that can actually
-describe the answer — builder images, patch policy, quota — over the
-same authenticated socket a client is about to use anyway.
+describe the answer — build-container images, patch policy, quota —
+over the same authenticated socket a client is about to use anyway.
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ async def health(request: web.Request) -> web.Response:
     """Liveness, unauthenticated.
 
     It names this service's own version and nothing else. It used to
-    also report the version of the ``mcuhome`` builder this server
+    also report the version of the ``mcuhome`` build tool this server
     spawned; there is no such subprocess any more — a build server is an
     orchestrator and never itself the build environment
     (build-container-contract.md §1.2) — and the build environments it

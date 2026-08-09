@@ -21,23 +21,18 @@ classifiers = [
   "Topic :: Home Automation",
 ]
 
-dependencies = ["aiohttp>=3.10,<4"]
-
-# This package has no MCUHome dependency at all today, and that is a
-# state to leave rather than a state to keep. The old one was a
-# non-dependency by design — the `mcuhome` CLI was *spawned*, not
-# imported, and only its version constants were read — and it went with
-# the job protocol and the builder subprocess.
-#
-# What replaces it is a real, declarable dependency that does not exist
-# yet: ADR 0020 decision 1 splits the lib into `mcuhome-model`,
-# `mcuhome-workbench` and `mcuhome-compiler`, and this server consumes
-# **`mcuhome-model`** — for the context format and the frozen context-ID
-# rule of ADR 0018 §6, which ADR 0019 §8 obliges this side to recompute
-# from the received bytes. That rule is frozen precisely so that both
-# sides of the contract compute the same value, so it must be one
-# implementation shared, never two that agree by inspection. Declare it
-# here when the distribution exists and the context path needs it.
+# `mcuhome-model` is the one MCUHome dependency this server has, and the
+# only one it may ever have (ADR 0020 decision 4): the shared vocabulary
+# — the context format and the frozen context-ID rule of ADR 0018 §6,
+# which ADR 0019 §8 obliges this side to recompute from received bytes.
+# That rule is frozen precisely so both sides of the contract compute
+# the same value, so it must be one implementation shared, never two
+# that agree by inspection. The distribution exists since the E35
+# migration; it is dependency-free by construction (a property its own
+# packaging tests pin), so this line pulls in exactly the vocabulary and
+# nothing behind it. Not on PyPI while the repositories are private —
+# requirements-dev.txt installs it from the sibling checkout.
+dependencies = ["aiohttp>=3.10,<4", "mcuhome-model"]
 #
 # There is deliberately **no dependency on `mcuhome-dashboard`**. The two
 # are separate products with separate version numbers (ADR 0003 decision

@@ -13,14 +13,18 @@
 # protocol. The build server is an orchestrator and is never itself the
 # build environment, so there is no builder to install alongside it.
 #
-# The dependency that will come back is `mcuhome-model` (ADR 0020
-# decision 1), for the frozen context-ID rule of ADR 0018 §6. It arrives
-# with the context path, and when it does it belongs in pyproject.toml
-# as a real dependency rather than here.
+# `mcuhome-model` is back since the E35 migration — pyproject.toml
+# declares it (ADR 0020 decision 4) and says why it is the only MCUHome
+# dependency this server may ever have. It is not on PyPI while the
+# repositories are private, so the editable line below satisfies the
+# declaration from the sibling checkout; the vocabulary distribution is
+# dependency-free by construction, so this pulls in exactly the model
+# package and nothing behind it.
 #
 # There is deliberately no `mcuhome-dashboard` here, and no sibling
 # checkout of it either: the build server depends on the build-container
 # contract and on nothing else (ADR 0017 decision 3, dashboard ADR 0012).
 # The frame envelope the two products share is pinned by the contract,
 # not by importing one product into the other's test run.
+-e ../mcuhome/packaging/model
 -e .[dev]

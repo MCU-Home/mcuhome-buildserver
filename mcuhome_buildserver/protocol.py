@@ -52,6 +52,7 @@ __all__ = [
     "ERROR_INTERNAL",
     "TYPE_ERROR",
     "TYPE_EVENT",
+    "TYPE_LOG",
     "TYPE_RESULT",
     "Command",
     "ProtocolError",
@@ -59,12 +60,23 @@ __all__ = [
     "encode",
     "error_frame",
     "event_frame",
+    "log_frame",
     "result_frame",
 ]
 
 TYPE_RESULT = "result"
 TYPE_ERROR = "error"
 TYPE_EVENT = "event"
+
+#: The raw build log, as its **own** frame type (E46). It is a separate
+#: kind rather than an event with a name because contract §8 makes the
+#: two different things: events are a typed, registered, append-only
+#: vocabulary that a consumer matches on, while "standard output and
+#: standard error together are one raw, opaque log stream" that
+#: consumers "MUST NOT parse for machine decisions". Carrying the log as
+#: an event would have put an unparseable stream into the one channel
+#: that exists to be parsed.
+TYPE_LOG = "log"
 
 #: The frame was not understood: malformed JSON, missing fields, wrong
 #: types, a binary message on a text endpoint. Always the client's
@@ -182,6 +194,20 @@ def error_frame(frame_id: Any, code: str, message: str, **detail: Any) -> dict[s
 
 def event_frame(name: str, payload: dict[str, Any]) -> dict[str, Any]:
     return {"type": TYPE_EVENT, "event": name, "payload": payload}
+
+
+def log_frame(payload: dict[str, Any]) -> dict[str, Any]:
+    """One line of an invocation's raw log, with its own counter.
+
+    The counter is server-assigned and monotonic per invocation, and it
+    is what makes the outbox's drop-the-oldest policy safe for this
+    stream: a client that sees the numbers jump knows it lost lines
+    rather than believing it read a complete log with a silent hole in
+    it. There is deliberately no replay behind it — the events file is
+    the replay buffer (E46) and the log is not written to disk by this
+    server at all.
+    """
+    return {"type": TYPE_LOG, "payload": payload}
 
 
 def encode(frame: dict[str, Any]) -> str:

@@ -43,15 +43,26 @@ from typing import Any
 
 __all__ = [
     "LAYERS",
+    "REASON_CODES",
     "REGISTRY",
     "ErrorCode",
     "SessionError",
     "envelope",
+    "from_reason",
 ]
 
 #: The namespaces (envelope ``layer`` values) the registry may use.
 #: Fixed by the protocol concept; ``x-`` is reserved for third parties.
-LAYERS = ("policy", "session", "context", "version", "builder", "invocation")
+#:
+#: **Two joined on 2026-08-10, with the container backend**, and both
+#: name a thing the six could not. ``sdk`` is the one external input the
+#: backend fetches and hash-verifies on a client's behalf (ADR 0019 §8,
+#: contract §9.1) — not a policy, not a version negotiation and not the
+#: builder, which is the thing that consumes it. ``artifact`` is what
+#: ``get-artifact`` addresses beside an invocation id: a path that is
+#: not a declared artifact is a statement about the artifact and not
+#: about the invocation, which exists and answered.
+LAYERS = ("policy", "session", "context", "version", "builder", "invocation", "sdk", "artifact")
 
 
 @dataclass(frozen=True)
@@ -148,15 +159,28 @@ REGISTRY: dict[str, ErrorCode] = _seed(
         summary="the verb is part of the protocol and its server logic is not built yet",
     ),
     # context.* — the build context, its lifetime and its integrity.
+    # Three summaries below were widened on 2026-08-10, when the
+    # container backend gave the `reason` values of contract §5.4 an
+    # envelope to land in (:data:`REASON_CODES`). Each widening states
+    # the same meaning about one more source: a context that is
+    # incomplete rather than absent, a manifest the serving container
+    # cannot read, a context format version the *container* does not
+    # implement. No code was added and none changed its `retryable`,
+    # which is what makes the amendment legitimate at all under the
+    # pre-release window this module's docstring describes — and the
+    # alternative, a second code per reason, would have split one
+    # meaning across two entries a client has to learn.
     ErrorCode(
         "context.missing",
         retryable=False,
-        summary="the command needs a context and send-context has not happened",
+        summary="the command needs a context, or a file inside one, that this session does "
+        "not have: send-context has not happened, or the context carries no keys/signing.pub",
     ),
     ErrorCode(
         "context.integrity-mismatch",
         retryable=False,
-        summary="a recomputed file hash or the context id disagrees with the received bytes",
+        summary="a recomputed file hash or the context id disagrees with the received bytes, "
+        "or the serving build container could not read the manifest this server wrote",
     ),
     # The summary was widened on 2026-08-10 to name the type collision —
     # one path that has to be a file and a directory at once, in one
@@ -226,8 +250,8 @@ REGISTRY: dict[str, ErrorCode] = _seed(
     ErrorCode(
         "version.context-format-unsupported",
         retryable=False,
-        summary="the context format version (declared in context.yaml) is outside this "
-        "server's supported range",
+        summary="the context format version (declared in context.yaml) is outside the range "
+        "this server, or the build container serving the session, implements",
     ),
     ErrorCode(
         "version.verb-unknown",
@@ -289,7 +313,147 @@ REGISTRY: dict[str, ErrorCode] = _seed(
         summary="the build container died without a result document — an infrastructure "
         "failure, not a verdict on the context",
     ),
+    # The third pre-start refusal of the container backend, and the one
+    # that is genuinely retryable: no docker binary, or a daemon that
+    # cannot be reached. Nothing about the context is wrong, the session
+    # is untouched, and the same command works once the runtime is up —
+    # which is exactly the promise `retryable: true` makes. A missing
+    # *image* is deliberately not this code: it is
+    # `version.builder-unavailable`, because contract v1 of this server
+    # pulls nothing and "not on this host" is therefore a final answer.
+    ErrorCode(
+        "builder.runtime-unavailable",
+        retryable=True,
+        summary="this server cannot reach its container runtime at all — no docker binary, "
+        "or a daemon that is down",
+    ),
+    # sdk.* — the one external input the backend fetches (ADR 0019 §8).
+    ErrorCode(
+        "sdk.unavailable",
+        retryable=False,
+        summary="no operator-configured source holds the SDK package this context pins, or "
+        "the file found under that name does not hash to the pinned value",
+    ),
+    # artifact.* — what `get-artifact` addresses beside an invocation id.
+    ErrorCode(
+        "artifact.unknown",
+        retryable=False,
+        summary="the path is not a declared artifact of that invocation; details carry the "
+        "paths it did declare",
+    ),
+    # The one genuinely new situation of the delivery re-verification:
+    # §9.3's egress check ran when the invocation ended, and the bytes
+    # behind a verified artifact are not those bytes any more when the
+    # client asks for them. Not `artifact.unknown` — the artifact was
+    # declared and was verified — and not `context.integrity-mismatch`,
+    # which is about the context rather than about `out`. Not retryable:
+    # a second download reads the same changed file, and what changed it
+    # is inside the session's own tree.
+    ErrorCode(
+        "artifact.integrity-mismatch",
+        retryable=False,
+        summary="a declared artifact no longer is the file this server verified at egress — "
+        "it was replaced, relinked or rewritten between the invocation's end and this "
+        "download, and the archive is refused rather than built from it",
+    ),
 )
+
+
+#: How a result document's ``reason`` becomes an envelope code.
+#:
+#: **The mapping is the backend's business and is deliberately not
+#: frozen by the contract** (§5.4.1): "the envelope's fields are derived
+#: from ``reason``, and *how* is deliberately not frozen here — that
+#: envelope belongs to the session protocol and classifies *protocol
+#: operations*, most of which have no invocation behind them at all,
+#: while ``reason`` classifies *invocations*." So this table is this
+#: server's answer and no document's, which is why it is one explicit
+#: table rather than a rule to re-derive.
+#:
+#: Three properties hold across every row and are worth stating once.
+#:
+#: **``retryable`` is never taken from the program.** ``error.retryable``
+#: is "the program's promise about its own failure, and about nothing
+#: else", and a backend "MUST NOT relay it as the session protocol's
+#: ``retryable`` — that value is the server's, derived from the server's
+#: own registry precisely so the promise cannot be forged". Every row
+#: below therefore lands on a registered code whose ``retryable`` this
+#: file owns, and the program's promise is carried in the details as
+#: information rather than as authority.
+#:
+#: **The reason itself always travels verbatim.** Unknown values are
+#: "handled as their status class and passed through verbatim" (§5.4),
+#: so ``details.reason`` carries what the program said even where this
+#: table folded several reasons onto one code — a client that wants the
+#: finer distinction has it, without this server having to mint a code
+#: per row.
+#:
+#: **An unmapped reason is ``builder.failed``.** That is the whole
+#: handling of an ``x-`` reason from a third-party image and of a value
+#: added to the registry after this table was written: the class is
+#: failure, and a failure of the thing that builds is what
+#: ``builder.failed`` says.
+REASON_CODES: dict[str, str] = {
+    # The four `unsupported.*` values are all one thing from the
+    # session's side: this image cannot do what this server asked of it.
+    # `builder.failed` rather than a version code, because nothing was
+    # negotiated wrongly — the backend checked `describe` first, so
+    # reaching one of these means the image contradicted its own
+    # self-description, which is a failure of the builder.
+    "unsupported.request": "builder.failed",
+    "unsupported.required": "builder.failed",
+    "unsupported.action": "builder.failed",
+    # …except this one, which is a version statement and has a version
+    # code: the program does not implement the context format version
+    # this context declares. "Nothing about this context is broken"
+    # (§7.3), and the client's move is a different container.
+    "unsupported.context": "version.context-format-unsupported",
+    # A file the action needs is not in the context — `keys/signing.pub`
+    # for a `build` above all, which the program MUST NOT build without
+    # and MUST NOT default. The client's move is the same one
+    # `context.missing` always asks for: send a complete context.
+    "error.context.incomplete": "context.missing",
+    # The manifest this server wrote at `lock-context` cannot be read as
+    # one by the program, or the materialized context is not the context
+    # it describes. Both are the integrity code, and both are
+    # non-retryable: the bytes will not read differently next time.
+    "error.context.unreadable": "context.integrity-mismatch",
+    "error.context.mismatch": "context.integrity-mismatch",
+    # `patches/<layer>/` for a layer the image has no tree for. The
+    # server writes the `/trees/<layer>` pointer into `required` for
+    # exactly this case, so a conforming program refuses legibly; either
+    # way the build did not happen and the image is why.
+    "error.layer.unknown": "builder.failed",
+    # The two terminal states of §6.2 and §6.3. Both are "this session
+    # can no longer do work" — an interrupted patch application leaves
+    # trees no future build may trust, and a foreign `work` marker is a
+    # defect on this server's own side that MUST NOT be retried against
+    # the same `work`. `session.poisoned` is the code that says exactly
+    # that on the wire, and the remedy for both is a new session.
+    "error.patch.incomplete": "session.poisoned",
+    "error.work.foreign": "session.poisoned",
+    # The ordinary one: the build ran and did not produce what it was
+    # asked for. The compiler's answer is text and text is in the log.
+    "error.build.failed": "builder.failed",
+    # The program stopped itself at `limits.deadline_seconds`. Not
+    # retryable: re-running this invocation unchanged runs into the same
+    # deadline, and what would change the answer is a larger one, which
+    # is the operator's to set and not a retry.
+    "error.deadline.exceeded": "builder.failed",
+}
+
+
+def from_reason(reason: str | None) -> str:
+    """The envelope code for one result document's ``reason``.
+
+    ``None`` — a program that failed without classifying itself, which
+    §5.4 makes a breach for `failure` and `unsupported` — is read as
+    the ordinary failure, for the same reason an unknown value is: the
+    status class is what is left when the classification is missing.
+    """
+    if reason is None:
+        return "builder.failed"
+    return REASON_CODES.get(reason, "builder.failed")
 
 
 def envelope(code: str, message: str, **details: Any) -> dict[str, Any]:

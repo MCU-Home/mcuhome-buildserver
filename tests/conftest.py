@@ -4,25 +4,47 @@
 
 **Nothing here fakes a build environment, and that is the point.** The
 build server is an orchestrator and is never itself the build
-environment (build-container-contract.md §1.2), so there is no build
-subprocess to stand in for: what this suite exercises is the transport,
-the bearer token and the session protocol, all of which run without a
-toolchain anywhere near them.
+environment (build-container-contract.md §1.2), so there is no build to
+stand in for: what this suite exercises is the transport, the bearer
+token, the session protocol and the *backend* — the argv it composes,
+the documents it writes, and what it makes of the documents that come
+back.
 
-The fixtures are correspondingly small — a config with a known token, a
-server state, and an aiohttp client over the application it produces.
+**Docker is stubbed at the seam and never runs**, which is a hard rule
+of this suite rather than a convenience. :class:`FakeDocker` replaces
+:func:`mcuhome_buildserver.container.run_docker` and
+:func:`~mcuhome_buildserver.container.spawn_docker`, the two impure
+functions everything else in that module goes through, and it is
+installed by an **autouse** fixture: a test that forgot to ask for it
+would otherwise start a real container on the machine running the
+suite, which is exactly the failure mode the reference implementation
+warns about ("a test that thinks it stubbed docker out but did not is a
+test that starts a real build").
+
+The fake is a *conforming program* by default — it answers ``describe``
+with a complete ``program`` block, writes real files into ``out``,
+declares them with the hashes they actually have and emits the events
+contract §8 seeds its registry with. Tests that want a non-conforming
+one say so by replacing one attribute, which keeps every test that does
+not care about the container from having to know what one looks like.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
+import json
 import tarfile
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import pytest
 import zstandard
+from ruamel.yaml import YAML
 
+from mcuhome_buildserver import container
 from mcuhome_buildserver.app import ServerState, create_app
 from mcuhome_buildserver.config import Config
 
@@ -57,6 +79,11 @@ def config(tmp_path: Path) -> Config:
     and a suite that quietly ran under different limits would be testing
     a server nobody deploys. Tests that want to see a cap fire build
     their own :class:`Config` with that one number lowered.
+
+    ``sdk_sources`` names a directory that starts out empty, which is
+    the honest default: a server with no SDK package configured refuses
+    a working action with ``sdk.unavailable``, and a test that wants a
+    build puts a package there with :func:`write_sdk_package`.
     """
     return Config(
         host="127.0.0.1",
@@ -64,7 +91,399 @@ def config(tmp_path: Path) -> Config:
         token=TOKEN,
         pair_file=None,
         context_root=tmp_path / "sessions",
+        sdk_sources=(tmp_path / "packages",),
     )
+
+
+#: The image the shared ``context.yaml`` pins, and the labels contract
+#: §2.1 requires of it. Spelled here so that a test that changes one can
+#: see what a conforming image looks like beside it.
+IMAGE = "ghcr.io/mcu-home/build-container"
+IMAGE_DIGEST = "sha256:" + "b" * 64
+IMAGE_REFERENCE = f"{IMAGE}@{IMAGE_DIGEST}"
+IMAGE_LABELS = {
+    "org.mcuhome.contract": "1",
+    "org.mcuhome.zephyr": "4.4.0",
+    "org.mcuhome.toolchain": "zephyr-sdk-1.0.1",
+}
+
+#: A conforming ``describe`` ``program`` block: every field §7.1.1 makes
+#: mandatory, ``trees`` included. ``sdk`` reports ``path: null`` — "this
+#: tree is not in my image; put it wherever you like and name it in
+#: ``trees``" — while the three the image carries report where they are,
+#: which is what E47's writable views are asserted at.
+PROGRAM = {
+    "id": "org.mcuhome.build-container",
+    "version": "2.4.0",
+    "contract": 1,
+    "request": [1],
+    "result": [1],
+    "actions": ["describe", "verify", "build"],
+    "trees": {
+        "zephyr": {"path": "/opt/zephyr", "version": "4.4.0"},
+        "chip": {"path": "/opt/connectedhomeip", "version": "v1.5.1.0"},
+        "mcuboot": {"path": "/opt/bootloader/mcuboot"},
+        "sdk": {"path": None},
+    },
+}
+
+
+@dataclass
+class Invocation:
+    """One ``docker exec`` the backend made, as the fake saw it."""
+
+    action: str
+    argv: list[str]
+    request: dict[str, Any]
+
+
+class FakeProcess:
+    """A ``docker exec`` that has already finished, or refuses to.
+
+    ``ignores_terminate`` is the rung above SIGTERM: a client that does
+    not go away is the only reason SIGKILL exists, and a process that
+    always died of SIGTERM could never reach it.
+    """
+
+    def __init__(self, code: int, *, hang: bool = False, ignores_terminate: bool = False) -> None:
+        self._code = code
+        self._hang = hang
+        self._ignores_terminate = ignores_terminate
+        self.terminated = False
+        self.killed = False
+
+    async def wait(self) -> int:
+        while self._hang:
+            await asyncio.sleep(0.01)
+        return self._code
+
+    def terminate(self) -> None:
+        self.terminated = True
+        if not self._ignores_terminate:
+            self._hang = False
+            self._code = -15
+
+    def kill(self) -> None:
+        self.killed = True
+        self._hang = False
+        self._code = -9
+
+
+@dataclass
+class FakeDocker:
+    """Docker as this suite has it: argv in, scripted answers out.
+
+    Every command the backend composes lands in :attr:`calls` verbatim,
+    which is what makes the composed argv assertable — it is the
+    interface between the contract and the runtime, and the only way to
+    check it without running anything.
+    """
+
+    calls: list[list[str]] = field(default_factory=list)
+    invocations: list[Invocation] = field(default_factory=list)
+    #: Reference -> the ``docker image inspect`` object for it.
+    images: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: What ``docker image ls`` lists, for ``capabilities``.
+    listed: list[str] = field(default_factory=list)
+    #: ``None`` means "no docker binary at all"; a non-zero status means
+    #: "found it, cannot reach the daemon". The two refusals the backend
+    #: has to tell apart.
+    version_status: int | None = 0
+    #: The ``program`` block ``describe`` answers with, or ``None`` for a
+    #: describe that writes no result document at all.
+    program: dict[str, Any] | None = None
+    describe_exit: int = 0
+    #: What one invocation does. Replaced by tests that want a failure,
+    #: a crash, a hang or a non-conforming answer.
+    run_program: Any = None
+    containers: list[str] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        inspected = {
+            "Id": "sha256:" + "c" * 64,
+            # Both names docker itself reports for one image, because
+            # both are what `Docker._inspect` matches its answer back to:
+            # the tag `image ls` lists and the repo digest a context pins.
+            "RepoTags": [f"{IMAGE}:zephyr-4.4.0-r4"],
+            "RepoDigests": [f"{IMAGE}@{IMAGE_DIGEST}"],
+            "Config": {"Labels": dict(IMAGE_LABELS)},
+        }
+        # The same image under both names docker resolves it by: the
+        # digest a context pins it with, and the tag `image ls` lists.
+        self.images.setdefault(IMAGE_REFERENCE, inspected)
+        self.images.setdefault(f"{IMAGE}:zephyr-4.4.0-r4", inspected)
+        self.listed = self.listed or [f"{IMAGE}:zephyr-4.4.0-r4"]
+        if self.program is None:
+            self.program = json.loads(json.dumps(PROGRAM))
+        if self.run_program is None:
+            self.run_program = conforming_program
+
+    # -- the two seam functions ------------------------------------
+
+    async def run(self, argv):
+        self.calls.append(list(argv))
+        rest = list(argv[1:])
+        # A runtime that is not there is not there for every command, not
+        # only for `docker version`. Faking it per command would let a
+        # test pass against a server that probed once and then assumed.
+        if self.version_status is None:
+            return container.Completed(status=None, output="")
+        if self.version_status != 0:
+            return container.Completed(status=1, output="Cannot connect to the Docker daemon\n")
+        if rest[:1] == ["version"]:
+            return container.Completed(status=self.version_status, output="27.0.0\n")
+        if rest[:2] == ["image", "ls"]:
+            return container.Completed(status=0, output="\n".join(self.listed) + "\n")
+        if rest[:2] == ["image", "inspect"]:
+            references = [item for item in rest[4:]]
+            lines = [
+                json.dumps(self.images[reference])
+                for reference in references
+                if reference in self.images
+            ]
+            status = 0 if len(lines) == len(references) else 1
+            return container.Completed(status=status, output="\n".join(lines))
+        if rest[:1] == ["run"] and "--rm" in rest:
+            return self._describe(rest)
+        if rest[:1] == ["run"]:
+            identity = f"{len(self.containers):064x}"
+            self.containers.append(identity)
+            return container.Completed(status=0, output=identity + "\n")
+        if rest[:1] == ["rm"]:
+            self.removed.append(rest[-1])
+            return container.Completed(status=0, output="")
+        raise AssertionError(f"the fake docker was asked something unexpected: {argv}")
+
+    async def spawn(self, argv, *, on_line):
+        self.calls.append(list(argv))
+        action, request_path = argv[-2], Path(argv[-1])
+        request = json.loads(request_path.read_text())
+        self.invocations.append(Invocation(action=action, argv=list(argv), request=request))
+        return self.run_program(action, request, on_line)
+
+    # -- the throwaway describe container --------------------------
+
+    def _describe(self, rest: list[str]) -> container.Completed:
+        """``docker run --rm … /mcuhome/run describe <request>``.
+
+        **The request document is read the way a container would have to
+        read it**: only if a ``--volume`` in the composed argv actually
+        makes its path reachable inside the container. The fake used to
+        read it straight off the host filesystem, which made the probe
+        mount invisible to the suite — it could be deleted with every
+        test still green, and a real describe would then find no request
+        document at all.
+        """
+        request = Path(rest[-1])
+        volumes = [rest[index + 1] for index, item in enumerate(rest) if item == "--volume"]
+        targets = [Path(volume.split(":")[1]) for volume in volumes]
+        if not any(target == request or target in request.parents for target in targets):
+            raise AssertionError(
+                f"describe was given {request}, which no --volume of {volumes} mounts: "
+                "inside a real container that path does not exist"
+            )
+        document = json.loads(request.read_text())
+        if self.program is None:
+            return container.Completed(status=self.describe_exit, output="")
+        Path(document["result"]).write_text(
+            json.dumps(
+                {
+                    "result": 1,
+                    "status": "success",
+                    "action": "describe",
+                    "reason": None,
+                    "error": None,
+                    "program": self.program,
+                }
+            )
+        )
+        return container.Completed(status=self.describe_exit, output="")
+
+
+def emit(request: dict[str, Any], name: str, seq: int, **fields: Any) -> None:
+    """Append one contract §8 event to the invocation's events file."""
+    with Path(request["events"]).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"event": name, "seq": seq, **fields}) + "\n")
+
+
+def write_result(request: dict[str, Any], document: dict[str, Any]) -> None:
+    Path(request["result"]).write_text(json.dumps(document))
+
+
+def manifest_id(request: dict[str, Any]) -> str:
+    """The context id, as a conforming program would compute it.
+
+    Read out of ``manifest.yaml`` rather than recomputed: the fake is
+    standing in for a program that measures the materialized context and
+    arrives at the value the manifest declares, and re-deriving the
+    normative rule in a test fixture is exactly the second
+    implementation ADR 0020 decision 4 exists to prevent.
+    """
+    yaml = YAML(typ="safe", pure=True)
+    data = yaml.load((Path(request["context"]) / "manifest.yaml").read_text())
+    return str(data["id"])
+
+
+def conforming_program(action: str, request: dict[str, Any], on_line) -> FakeProcess:
+    """A build container that does everything contract v1 asks of it."""
+    on_line(f"-- MCUHome {action} starting")
+    emit(request, "invocation.started", 1, action=action)
+    identity = manifest_id(request)
+    emit(request, "context.checked", 2, context=identity)
+    if action == "verify":
+        write_result(
+            request,
+            {
+                "result": 1,
+                "status": "success",
+                "action": "verify",
+                "session": request["session"],
+                "reason": None,
+                "error": None,
+                "context": identity,
+            },
+        )
+        emit(request, "invocation.finished", 3, status="success")
+        return FakeProcess(0)
+
+    out = Path(request["out"])
+    declared = []
+    for name, payload in (
+        ("firmware.hex", b":020000040000FA\n"),
+        ("firmware.bin", b"\x00\x01\x02\x03"),
+        ("build-report.json", json.dumps(BUILD_REPORT).encode()),
+    ):
+        (out / name).write_bytes(payload)
+        declared.append(
+            {
+                "root": "out",
+                "path": name,
+                "role": "report" if name.endswith(".json") else "firmware",
+                "hashes": {"sha256": hashlib.sha256(payload).hexdigest()},
+            }
+        )
+    for index, entry in enumerate(declared, start=3):
+        emit(
+            request,
+            "artifact.collected",
+            index,
+            role=entry["role"],
+            path=entry["path"],
+            size=len(entry["path"]),
+        )
+    on_line("-- build finished")
+    write_result(
+        request,
+        {
+            "result": 1,
+            "status": "success",
+            "action": "build",
+            "session": request["session"],
+            "reason": None,
+            "error": None,
+            "context": identity,
+            # §5.4: an entry "for every patched layer", and no others.
+            # A conforming program reports what it applied, and what it
+            # applied is exactly the set of trees it was handed
+            # writable — §4.1's `writable` is the backend saying "this
+            # is your view to patch in".
+            "layers": {
+                layer: {"patchset": "sha256:" + "e" * 64}
+                for layer, entry in request.get("trees", {}).items()
+                if entry.get("writable")
+            },
+            "artifacts": declared,
+        },
+    )
+    emit(request, "invocation.finished", 6, status="success")
+    return FakeProcess(0)
+
+
+#: The one artifact whose content the contract fixes (§7.2.1), for the
+#: one consumer that needs it: the client that signs detached.
+BUILD_REPORT = {
+    "report": 1,
+    "signing": {
+        "signature_type": "ecdsa-p256",
+        "arguments": {
+            "version": "1.4.0+0",
+            "header-size": 512,
+            "align": 4,
+            "slot-size": 983040,
+        },
+    },
+}
+
+
+@pytest.fixture(autouse=True)
+def docker(monkeypatch) -> FakeDocker:
+    """Docker, stubbed at the seam, for **every** test in this suite."""
+    fake = FakeDocker()
+    monkeypatch.setattr(container, "run_docker", fake.run)
+    monkeypatch.setattr(container, "spawn_docker", fake.spawn)
+    return fake
+
+
+def write_sdk_package(directory: Path, version: str, *, entries: dict[str, bytes] | None = None):
+    """Put one SDK package where the source list will find it.
+
+    Returns its SHA-256, which is what a context has to pin: the name
+    only makes a candidate findable, and the bytes are what make it the
+    package (:mod:`mcuhome_buildserver.sdkstore`).
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    archive = make_archive(entries or {"mcuhome/__init__.py": b"# the SDK\n"})
+    path = directory / f"mcuhome-sdk-{version}.tar.zst"
+    path.write_bytes(archive)
+    return hashlib.sha256(archive).hexdigest()
+
+
+def context_yaml(*, sdk_sha256: str, version: str = "2.4.0") -> bytes:
+    """A ``context.yaml`` whose SDK pin names a package that exists."""
+    return (
+        CONTEXT_YAML.replace("sha256: " + "a" * 64, f"sha256: {sdk_sha256}")
+        .replace("version: 2.4.0", f"version: {version}")
+        .encode()
+    )
+
+
+def buildable_context(sdk_sha256: str, **files: bytes) -> bytes:
+    """A context this server can actually run a working action against.
+
+    The difference from :func:`base_context` is one field: the SDK pin
+    names a package the configured source directory holds. Everything
+    else about a context is the same whether it is ever built or not,
+    which is why only the tests that build need this one.
+    """
+    return make_archive({"context.yaml": context_yaml(sdk_sha256=sdk_sha256), **files})
+
+
+async def collect(ws, *, until: str, timeout: float = 15) -> list[dict]:
+    """Read frames until the server's own *until* event, and return all of them.
+
+    Event frames carry no frame id — they belong to an invocation rather
+    than to a command — so a test that waits for one waits on its name.
+
+    ``seq`` is what tells the two producers apart, and it is the rule the
+    server states rather than this helper's trick: **a frame carrying
+    ``seq`` is the program's, relayed verbatim; one without it is this
+    server speaking.** It matters for exactly one name —
+    ``invocation.finished``, which contract §8's registry seeds and which
+    E46 also gives to the server's own completion frame — and it is
+    structural, because §8 makes every program event carry a monotonic
+    ``seq`` and this server never invents one.
+    """
+    frames: list[dict] = []
+    while True:
+        frame = await ws.receive_json(timeout=timeout)
+        frames.append(frame)
+        if (
+            frame.get("type") == "event"
+            and frame.get("event") == until
+            and "seq" not in frame.get("payload", {})
+        ):
+            return frames
 
 
 @pytest.fixture

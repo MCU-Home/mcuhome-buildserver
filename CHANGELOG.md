@@ -10,6 +10,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The container backend — this server builds.** `verify` and `build`
+  materialize one container per session, write the request document of
+  build-container contract §5.2 into a backend-owned per-invocation
+  directory, invoke `/mcuhome/run <action> <request>` over `docker
+  exec`, read the result document *if it exists regardless of the exit
+  code*, and judge it against all seven conditions of §5.3. Both verbs
+  answer `{"invocation_id"}` immediately and the outcome travels as a
+  typed `invocation.finished` event carrying the status and the artifact
+  list (E46) — a build is minutes to hours, and a command frame that
+  waited for it would make every client's socket a build timer.
+  `session.not-implemented` is now raised by nothing.
+- **Container discovery at `send-context`**, which is where ADR 0019's
+  amendment puts it: the digest arrives with the pins, so only then does
+  the backend know which container serves the session. The image is
+  resolved against this host's **local** docker inventory (nothing is
+  pulled — product-owner decision), `describe` is asked once per image
+  digest per server start and cached, the §2.1 labels are cross-checked
+  against it, and the answer carries the serving container's contract
+  version, program identity and command set. An image this host does not
+  have is `version.builder-unavailable`, at the moment the pins arrive
+  rather than minutes into a build.
+- **Events, logs and replay** (E46). The program's contract §8 events are
+  relayed verbatim — unknown names included, "never dropped, never
+  rewritten, never treated as an error" — with this server's
+  `session_id` and `invocation_id` added; lines over 8192 bytes and
+  non-objects are discarded and counted rather than treated as an abort.
+  The raw merged log is its own frame kind with its own counter, because
+  §8 makes it "one raw, opaque log stream" consumers must not parse. The
+  NDJSON file on disk **is** the replay buffer: `attach-session` takes an
+  `invocation_id` and a `from_seq` and reads it back, with no in-memory
+  ring to find already evicted.
+- **`get-artifact`, as a `tar.zst`** (E45): the mirror of E41's upload in
+  the other direction. The result frame announces the archive's size and
+  SHA-256 and the bytes follow as BINARY frames; with a `path` the
+  archive holds exactly that artifact, without one all of them under
+  their declared paths. The announced hash is the archive's, computed at
+  egress while reading from disk. `artifact.unknown` names the paths the
+  invocation did declare.
+- **Egress hardening of contract §9.3**, all five duties: `out` is
+  enumerated without following symlinks and refuses symlinks, hardlinks,
+  devices, FIFOs and sockets; declared paths are normalized and strictly
+  contained under a known root; every artifact is re-hashed from the
+  bytes on disk against the one legal spelling of §3.3.1; exactly the
+  intersection of declared and verified is served, with undeclared files
+  neither served nor deleted; and a size cap (`--max-artifact-bytes`) is
+  applied from those bytes, because an artifact entry declares no size.
+- **The SDK is acquired, verified and unpacked per session** (E48).
+  `--sdk-source` names one or more local directories holding
+  `mcuhome-sdk-<version>.tar.zst`, searched in order — ADR 0019's
+  amendment fixes a local directory as the first tier — and the pin from
+  the *locked* context decides: the bytes must hash to
+  `mcuhome.package.sha256` or the invocation does not happen. The url in
+  a context is a hint and is never fetched. A pin no source holds is the
+  new `sdk.unavailable`, naming the version, the hash and every
+  directory searched.
+- **The three pin cross-checks of §9.1 are discharged.**
+  `container.digest` against the image actually resolved,
+  `mcuhome.package.sha256` against the package bytes actually unpacked,
+  and `target.board` against the pins the session was admitted on — the
+  last as part of a full re-measurement of the locked context that runs
+  before **every** working invocation (product-owner decision: contexts
+  are small). A disagreement is `context.integrity-mismatch` naming
+  every offending path, and it does not poison the session.
+- **A liveness ladder, and a real cancel sentinel.** `cancel` and
+  `close-session` now create the per-invocation `cancel` file the
+  request document named — the seam left in place when E38 landed. The
+  server's own deadline (`--build-deadline-seconds`) enters the same
+  ladder at the top: sentinel first, because it is the only rung that
+  lets the program write a `cancelled` result; SIGTERM at
+  `--cancel-grace-seconds`; then SIGKILL. What actually reaps a program
+  that ignored both is the container going away at `close-session`.
+- **New configuration**: `--docker`, `--sdk-source`, `--build-jobs`
+  (default 2 — `limits.jobs` is authoritative and resolved host-side,
+  because the container sees the host CPU count but not the RAM budget),
+  `--build-deadline-seconds`, `--cancel-grace-seconds`,
+  `--max-artifact-bytes` and `--ccache-dir`. The shared cache is offered
+  **read-only** with no way to ask otherwise: §10 makes a writable
+  shared cache a deliberate operator invocation on trusted contexts, and
+  this server has no such verb.
+- **Four new error codes and two new layers.**
+  `builder.runtime-unavailable` (retryable — no docker binary or a
+  daemon that is down, and nothing about the context is wrong),
+  `sdk.unavailable`, `artifact.unknown`, and a `reason` → envelope table
+  (`errors.REASON_CODES`) covering every value contract §5.4 defines.
+  The mapping is the backend's business and deliberately not frozen by
+  the contract; `error.retryable` is never relayed as the envelope's
+  `retryable`, because that value is the server's "precisely so the
+  promise cannot be forged".
+- **`capabilities` lists a real inventory**: every local image carrying
+  the `org.mcuhome.contract` label, with its reference, repo digest and
+  the three §2.1 labels. No container is started to answer it.
 - **The context path, end to end**: `send-context` receives a `tar.zst`
   archive announced in its JSON payload and delivered as WebSocket
   BINARY frames, unpacks it into a per-session directory this server
@@ -95,11 +186,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writing command (`send-context`, `extend-context`, a second
   `lock-context`) after it.
 - `open-session` now declares the **backend profile** serving the
-  session (`negotiated.backend_profile`, `container` | `subprocess`,
-  `null` until this server has a backend).
+  session (`negotiated.backend_profile`, `container` | `subprocess`).
 
 ### Changed
 
+- **No host-side overlay, anywhere** (E47). Contract §6.2's writable view
+  of a patched layer costs nothing in the `container` profile: the
+  image's trees are writable inside the container by construction, one
+  session is one container, and the container is discarded at
+  `close-session`. This server asserts `writable: true` for an in-image
+  tree at the path `describe` reported and mounts nothing for it; the
+  program applies the patches with its own §6.2 machinery. No `docker
+  cp`, no volumes, no overlayfs.
+- `open-session` answers `backend_profile: "container"` instead of
+  `null`. It can never be `subprocess`: that profile "serves exactly one
+  build environment — the one it runs in", and this process is an
+  orchestrator that is never itself a build environment.
+- Three registry summaries were widened (`context.missing`,
+  `context.integrity-mismatch`, `version.context-format-unsupported`) so
+  that the `reason` table can land on them without a second code per
+  row. No code was added and none changed its `retryable`, which is what
+  makes the amendment legitimate under the pre-release window.
+- The safe-extraction rule of `ingress.py` is now shared by the context
+  and the SDK package: one implementation of "regular files and
+  directories only", with the context's layout whitelist as the only
+  varying part.
 - The freeze is no longer a seam: it is wired onto `mcuhome-model` and
   restates none of the rule. Every file hash is `hashes.sha256_file`,
   every integrity entry is a `ContextFile`, the ID is `context_id` and
@@ -132,6 +243,118 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   describes, and nothing here has been published.
 
 ### Fixed
+
+An adversarial review of the container backend, answered in full.
+
+- **`get-artifact` re-verifies §9.3 at delivery.** The egress check ran
+  when an invocation ended, and the archive was built whenever a client
+  asked — arbitrarily later, on a tree that stays writable inside a
+  container that outlives the invocation. A `firmware.hex` replaced by a
+  symlink in between was *followed* at download time and the target's
+  bytes streamed to the client under the declared name. Every member is
+  now re-resolved segment by segment, opened `O_NOFOLLOW`, re-checked on
+  the descriptor (regular file, one link) and **re-hashed while it is
+  packed**; a member that is no longer what was verified is the new
+  `artifact.integrity-mismatch` and the delivery is refused rather than
+  built around it.
+- **The session tree is mounted piece by piece and never wholesale.**
+  One bind mount of the session root exposed the SDK writable at
+  `<root>/sdk` while it was mounted read-only at the path `describe`
+  asked for — so `trees.sdk.writable: false`, which §4.1 makes an
+  assertion the program may never probe, was a claim this server made
+  falsely. The container now sees exactly what the request document
+  names, each at its own host path: `context` read-only, `work` and the
+  per-invocation directories writable, the SDK at its target, the shared
+  cache read-only. Nothing else of the session tree is visible — not the
+  upload spool, not `staging`, and not `downloads`, where `get-artifact`
+  builds the archive it is about to stream.
+- **The session container is given the resource limits its profile
+  promises.** §1.2's `container` row lists "per-session resource limits"
+  and nothing was set: no `--memory`, no `--pids-limit`, no `--cpus`.
+  All three are configurable now (`--container-memory`, default `8g`;
+  `--container-pids`, default `4096`; `--container-cpus`, unset), and
+  they are what makes the request document's silence about
+  `limits.memory_bytes` honest rather than convenient.
+- **A declared artifact this server cannot resolve now fails the build.**
+  An entry whose `sha256` was not in §3.3.1's one legal spelling, or
+  whose path left §9.2's charset, was silently dropped — so a build
+  reported `status: success` with that artifact absent from the delivery
+  and no error anywhere, which is the one outcome a client has no way to
+  notice. Unresolvable entries (unknown `root`, a missing mandatory key)
+  are still skipped as §5.4 requires; a resolvable entry that is wrong
+  about itself is a problem and fails §5.3's sixth condition.
+- **`layers` is compared against the patch set the backend derived.**
+  §5.4 makes the block mandatory "for every patched layer" and states
+  the backend's use of it; it was checked for being a dict, so a build
+  on a context full of patches that answered `layers: {}` was fully
+  successful. Both directions are checked now, including an entry for a
+  layer the context does not patch.
+- **The outbox's eviction policy asks what it is throwing away.** A log
+  line offered while the outbox was full evicted the head of the queue
+  whatever it was — including a BINARY chunk of a download in flight,
+  the exact corruption `send_bytes` refuses `offer` to avoid. Only log
+  and event frames are droppable now; a BINARY chunk, a command's answer
+  and `invocation.finished` never are, and an outbox holding nothing but
+  those closes the connection with a close code instead of delivering an
+  archive that will not hash.
+- **One download at a time per connection, and a spool name per
+  request.** Two `get-artifact` commands interleaved their BINARY
+  frames, which carry no id for a client to sort them by, and when they
+  addressed one invocation they wrote and unlinked the *same* spool
+  file — so the announced size and hash and the delivered bytes came
+  from different archives.
+- **`attach-session` replays before it joins the live stream.** It
+  attached first and read the events file afterwards, so live frames
+  landed inside the region the verb calls history and an event the relay
+  overtook was delivered twice. The replay now drains the file first and
+  the connection joins with a boundary `seq` the backend excludes from
+  its fan-out to that connection.
+- **`close-session` kills the container before it deletes the tree**, and
+  no longer promises a result document survives it. The old order set
+  the cancel sentinel and deleted the session tree in the same
+  synchronous call — the signal existed for the microseconds between two
+  statements — and pulled the mount source out from under a program that
+  was still running in it.
+- **`describe` gets a per-probe directory** instead of one keyed by the
+  image id. Nothing serialized two callers, so two sessions pinning one
+  image raced over `request.json` and `result.json`, and the loser's
+  `result.unlink` disqualified a perfectly good image with "no result
+  document was written".
+- **`docker image inspect` results are matched back to the reference
+  they name** (`RepoTags`, `RepoDigests`, `Id`) rather than to the one
+  at their position. A missing image is simply absent from stdout while
+  its error text is merged into the same stream, so positional matching
+  published one image's digest and labels under another image's name —
+  the tag→digest pair a workbench resolves a pin from.
+- **The SDK unpack, the egress re-hash and the download archive run off
+  the event loop.** All three are multi-hundred-megabyte filesystem
+  operations that sat in the path of commands promising to answer
+  immediately, and the endpoint's thirty-second heartbeat means a long
+  enough stall drops *unrelated* clients' connections.
+- **A relative `--context-root` is refused at startup.** Every path in
+  the request document descends from it and §5.2 rule 4 makes a
+  non-absolute path `unsupported.request`; the same value is a
+  `--volume` source, where docker reads a name without a slash as a
+  named volume rather than a bind mount.
+- **The program's own `error.retryable` is carried in the envelope
+  details** as `container_retryable`, under a name that says whose
+  promise it is — as `_envelope`'s docstring had claimed while dropping
+  it. It is never the envelope's own `retryable`, which stays this
+  server's (§5.4.1).
+- **`_POISONING` is derived from the reason table** rather than written
+  out beside it, so §6.3's `error.work.foreign` cannot fall out of one
+  without falling out of the other.
+
+Fifteen of the review's findings were about the *suite* rather than the
+server, and every one of them is closed: §7.1.1's four pre-invocation
+conformance gates, §7.2's delivery rules and the verified-versus-declared
+distinction they turn on, the seven untested rows of §5.4's mandatory
+table, the whole `ccache` path (§10), the `describe` argv — the fake now
+refuses a request path no `--volume` reaches, so the probe mount is
+exercised rather than assumed — `docker exec --user`, the container that
+fails to start, `sdkstore`'s decompression cap, the `invocation.finished`
+delivery guarantee, §9.1's per-invocation preparation duties, and three
+tests that stayed green with the behaviour they were named for removed.
 
 An adversarial review of the context path, answered in full.
 

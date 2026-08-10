@@ -16,32 +16,47 @@ interleave frames. One outbox makes that impossible by construction.
 **Two ways to put a frame in the outbox, and the difference matters
 here more than it does in the dashboard.** ``send`` awaits, which is
 right for a command's answer: a slow client should slow its own
-commands down. ``offer`` never awaits and drops the oldest frame when
-the outbox is full, which is right for build output: a client that
-stopped reading must not apply backpressure through the log reader and
-from there into the compiler. What makes the drop safe is that a
-progress stream carries resumable offsets, so a client that sees them
-jump asks for the gap instead of displaying a log with a silent hole in
-it. That property is the one thing ADR 0006's resumable log follow
-becomes in the session protocol, and the stream it applies to lands
-with the container backend.
+commands down. ``offer`` never awaits and drops the oldest *droppable*
+frame when the outbox is full, which is right for build output: a
+client that stopped reading must not apply backpressure through the log
+reader and from there into the compiler. What makes the drop safe is
+that a progress stream carries resumable offsets, so a client that sees
+them jump asks for the gap instead of displaying a log with a silent
+hole in it. That property is the one thing ADR 0006's resumable log
+follow becomes in the session protocol, and the stream it applies to
+lands with the container backend.
+
+**Droppable is a property of the frame, not of the queue.** One outbox
+carries three kinds of traffic — command answers, the two build streams
+and the BINARY chunks of a download — because a BINARY frame carries no
+id and belongs to the announcement that went out immediately before it,
+which only one ordering can express. A type-blind drop-the-oldest
+policy therefore evicts a chunk of somebody's firmware archive to make
+room for a log line, and the client finds out from a hash that does not
+match at the end of a download it already paid for. So eviction asks
+what it is about to throw away: log lines and program events go,
+everything else stays, and an outbox that is full of frames none of
+which may be dropped is a connection too slow to serve — closed with a
+close code rather than served a corrupted archive.
 """
 
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import logging
+from pathlib import Path
 from typing import Any
 
-from aiohttp import WSMsgType, web
+from aiohttp import WSCloseCode, WSMsgType, web
 
 from mcuhome_buildserver import errors, protocol, sessions
 from mcuhome_buildserver.ingress import Upload
 from mcuhome_buildserver.protocol import Command, ProtocolError
 from mcuhome_buildserver.security import STATE_KEY, check_origin
 
-__all__ = ["COMMANDS", "Connection", "websocket_handler"]
+__all__ = ["COMMANDS", "FINISHED_EVENT", "Connection", "websocket_handler"]
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +74,15 @@ OUTBOX_LIMIT = 1024
 #: fires after the bytes arrived is not a limit.
 MAX_FRAME_BYTES = 8 * 1024 * 1024
 
+#: How much of a download archive goes into one outbound BINARY frame.
+#: Well under :data:`MAX_FRAME_BYTES`, deliberately: that cap is this
+#: endpoint's own ``max_msg_size`` and says nothing about the client's,
+#: and a client with a smaller one would drop the connection rather than
+#: the frame. A quarter of a megabyte is small enough that no reasonable
+#: client refuses it and large enough that a firmware image is a handful
+#: of frames.
+DOWNLOAD_CHUNK_BYTES = 256 * 1024
+
 
 class Connection:
     """One client: its outbox, its in-flight commands, and its upload.
@@ -74,12 +98,34 @@ class Connection:
 
     def __init__(self, ws: web.WebSocketResponse) -> None:
         self._ws = ws
-        self._outbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=OUTBOX_LIMIT)
+        # Text frames as dictionaries, binary frames as bytes, on **one**
+        # queue. Two queues would be two orders, and the download's whole
+        # correlation rule is order: a BINARY frame carries no id, so the
+        # bytes belong to the announcement that went out immediately
+        # before them or to nothing at all.
+        #
+        # A deque rather than an `asyncio.Queue`, because eviction has to
+        # be able to skip: the policy is "drop the oldest frame that may
+        # be dropped", and a queue can only drop the oldest one there is.
+        self._outbox: collections.deque[dict[str, Any] | bytes] = collections.deque()
+        self._arrived = asyncio.Event()
+        self._room = asyncio.Event()
+        self._room.set()
         self._tasks: set[asyncio.Task[None]] = set()
         self._closing = False
         self.dropped = 0
+        #: True once the outbox filled with frames none of which may be
+        #: dropped and the connection was closed for it.
+        self.overloaded = False
+        self._overflow: asyncio.Task[None] | None = None
         self.upload: Upload | None = None
         self._announced = asyncio.Event()
+        # One download at a time per connection, held across the whole
+        # of `get-artifact`: the announcement and the bytes behind it are
+        # one indivisible sequence on the wire, and two of them
+        # interleaved leave a client unable to say which archive it is
+        # holding.
+        self._download = asyncio.Lock()
 
     def begin_upload(self, upload: Upload) -> None:
         """Announce an archive on this connection, or refuse a second one."""
@@ -123,35 +169,135 @@ class Connection:
         finally:
             announced.cancel()
 
+    @property
+    def download_lock(self) -> asyncio.Lock:
+        """The one-download-at-a-time guard, held for the whole of one.
+
+        ``send_archive``'s ordering rule — the bytes belong to the
+        announcement immediately before them — is a *property of the
+        wire* and not something the wire enforces. Two ``get-artifact``
+        commands run as two tasks, and nothing in the transport stops
+        their frames from interleaving: the client would then see two
+        announcements and one undifferentiated stream of chunks, with no
+        id anywhere to sort them by. The upload direction has had this
+        guard from the start (:meth:`begin_upload`); this is the same
+        statement about the other direction.
+        """
+        return self._download
+
     async def send(self, frame: dict[str, Any]) -> None:
         """Queue a frame, waiting for room. For answers to commands."""
-        if not self._closing:
-            await self._outbox.put(frame)
+        await self._put(frame)
+
+    async def send_bytes(self, chunk: bytes) -> None:
+        """Queue one BINARY frame, waiting for room.
+
+        Deliberately :meth:`send` and never :meth:`offer`: dropping a
+        chunk of an archive does not degrade it, it corrupts it, and the
+        client would find out only from a hash that does not match at
+        the end of a download it already paid for. A slow client
+        therefore slows its own download down, which is what
+        backpressure is for and why the drop-the-oldest policy is scoped
+        to the log stream, where a gap is visible in a counter.
+
+        That scoping is enforced in :meth:`offer` as well as here: how a
+        frame is *enqueued* says nothing about how it may be *evicted*,
+        and a chunk queued by this method used to be evictable by the
+        next log line that arrived.
+        """
+        await self._put(chunk)
+
+    async def _put(self, item: dict[str, Any] | bytes) -> None:
+        while not self._closing and len(self._outbox) >= OUTBOX_LIMIT:
+            await self._room.wait()
+        if self._closing:
+            return
+        self._enqueue(item)
+
+    def _enqueue(self, item: dict[str, Any] | bytes) -> None:
+        self._outbox.append(item)
+        self._arrived.set()
+        if len(self._outbox) >= OUTBOX_LIMIT:
+            self._room.clear()
 
     def offer(self, frame: dict[str, Any]) -> None:
-        """Queue a frame, dropping the oldest if there is no room.
+        """Queue a frame, dropping the oldest **droppable** one for room.
 
         Never awaits and never raises: it is called from the middle of
-        reading a build's pipe.
+        reading a build's pipe. What it may throw away is the log and
+        the program's event stream, both of which survive a gap — the
+        log carries a counter that makes one visible, and the events
+        file on disk is the replay buffer ``attach-session`` fetches it
+        from. What it may never throw away is a BINARY chunk of a
+        download, a command's answer, or the ``invocation.finished``
+        frame a client is waiting on.
+
+        An outbox holding nothing but those is a client that has stopped
+        reading in the middle of a download. There is no frame to drop
+        and no honest way to continue, so the connection is closed with
+        a close code that says to come back.
         """
         if self._closing:
             return
-        try:
-            self._outbox.put_nowait(frame)
+        if len(self._outbox) < OUTBOX_LIMIT:
+            self._enqueue(frame)
             return
-        except asyncio.QueueFull:
-            pass
-        with contextlib.suppress(asyncio.QueueEmpty):
-            self._outbox.get_nowait()
-        self.dropped += 1
-        with contextlib.suppress(asyncio.QueueFull):
-            self._outbox.put_nowait(frame)
+        for index, queued in enumerate(self._outbox):
+            if _droppable(queued):
+                del self._outbox[index]
+                self.dropped += 1
+                self._enqueue(frame)
+                return
+        self._overload()
+
+    def _overload(self) -> None:
+        """Give up on a connection that cannot be served without lying."""
+        logger.warning("closing a connection whose outbox filled with undroppable frames")
+        self.overloaded = True
+        self._closing = True
+        # Both waits are released, or every task blocked on room in the
+        # outbox stays blocked on a connection that is going away.
+        self._room.set()
+        self._arrived.set()
+        self._overflow = asyncio.ensure_future(self._close_overloaded())
+
+    async def _close_overloaded(self) -> None:
+        with contextlib.suppress(Exception):
+            await self._ws.close(
+                code=WSCloseCode.TRY_AGAIN_LATER,
+                message=b"this connection stopped reading during a download",
+            )
+
+    async def send_archive(self, path: Path) -> None:
+        """Stream a built download archive as BINARY frames.
+
+        Called **after** the result frame that announced its size and
+        its SHA-256, and the order is the whole correlation rule: a
+        BINARY frame carries no frame id and no session id, so the only
+        thing that can say which archive its bytes belong to is *when*
+        they arrive (E41, mirrored by E45). One download at a time per
+        connection is what makes that rule hold, and it is held by
+        :attr:`download_lock` rather than hoped for.
+        """
+        with path.open("rb") as handle:
+            while chunk := handle.read(DOWNLOAD_CHUNK_BYTES):
+                await self.send_bytes(chunk)
 
     async def write_loop(self) -> None:
         while True:
-            frame = await self._outbox.get()
+            if not self._outbox:
+                self._arrived.clear()
+                if not self._outbox:
+                    await self._arrived.wait()
+                continue
+            frame = self._outbox.popleft()
+            if len(self._outbox) < OUTBOX_LIMIT:
+                self._room.set()
             try:
-                await self._ws.send_str(protocol.encode(frame))
+                if isinstance(frame, bytes):
+                    await self._ws.send_bytes(frame)
+                else:
+                    await self._ws.send_str(protocol.encode(frame))
             except (ConnectionResetError, RuntimeError):
                 return
 
@@ -163,11 +309,42 @@ class Connection:
 
     async def close(self) -> None:
         self._closing = True
+        # Anything parked on room in the outbox is parked on a
+        # connection that will never drain again.
+        self._room.set()
+        self._arrived.set()
         for task in list(self._tasks):
             task.cancel()
         for task in list(self._tasks):
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+        if self._overflow is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._overflow
+
+
+#: The one event name that is never evicted even though its frame type
+#: is. E46 gives it to this server's own completion frame and contract
+#: §8 seeds the registry with the program's announcement of the same
+#: name; both are the news a client is waiting for, and neither has a
+#: second way to be learned. Everything else on the event stream can be
+#: fetched again from the events file through ``attach-session``.
+FINISHED_EVENT = "invocation.finished"
+
+
+def _droppable(frame: dict[str, Any] | bytes) -> bool:
+    """Whether the outbox may throw *frame* away to make room.
+
+    The two build streams and nothing else. A BINARY chunk is not a
+    ``dict`` and never qualifies; a command's ``result`` or ``error``
+    answer is what a caller is blocked on; ``invocation.finished`` is
+    the frame E46 exists to deliver.
+    """
+    if not isinstance(frame, dict):
+        return False
+    if frame.get("type") == protocol.TYPE_LOG:
+        return True
+    return frame.get("type") == protocol.TYPE_EVENT and frame.get("event") != FINISHED_EVENT
 
 
 #: The command table, **derived** from the verb table rather than
@@ -204,6 +381,14 @@ async def _run_command(state: Any, connection: Connection, command: Command) -> 
         )
         return
     try:
+        # A handler that answers `None` has already put its own result
+        # frame on the outbox and written whatever had to follow it.
+        # There is exactly one such verb — `get-artifact`, whose result
+        # frame announces an archive that the BINARY frames behind it
+        # then deliver (E45) — and the ordering is the reason: a frame
+        # this loop sent *after* the handler returned would arrive after
+        # the bytes it was supposed to announce, and a BINARY frame
+        # carries no id to repair that with.
         payload = await handler(state, connection, command)
     except ProtocolError as exc:
         await connection.send(protocol.error_frame(command.id, exc.code, exc.message, **exc.detail))
@@ -224,7 +409,8 @@ async def _run_command(state: Any, connection: Connection, command: Command) -> 
             )
         )
     else:
-        await connection.send(protocol.result_frame(command.id, payload))
+        if payload is not None:
+            await connection.send(protocol.result_frame(command.id, payload))
 
 
 async def websocket_handler(request: web.Request) -> web.StreamResponse:
@@ -280,6 +466,10 @@ async def websocket_handler(request: web.Request) -> web.StreamResponse:
                 await connection.await_announcement(task)
     finally:
         state.connections.discard(connection)
+        # A closed socket leaves the invocations it was watching running
+        # — connection loss is never abandonment — so what goes away
+        # here is only this connection's place in their audience.
+        state.backend.detach(connection)
         await connection.close()
         writer.cancel()
         with contextlib.suppress(asyncio.CancelledError):

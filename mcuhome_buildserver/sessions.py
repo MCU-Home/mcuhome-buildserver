@@ -49,14 +49,20 @@ the whitelist — lives in :mod:`mcuhome_buildserver.ingress`, and the
 directory, the pin document and the freeze in
 :mod:`mcuhome_buildserver.contextstore`.
 
-What is deliberately not here yet — the container backend, the overlay
-patch views, invocations and scheduling — answers with a typed
-``session.not-implemented`` instead of a guess, so a client sees a
-protocol that is honest about its state rather than one that almost
-works. ``cancel`` is real since the second amendment settled its wire
-shape (E38) — bookkeeping, acknowledgement, the ``already_finished``
-answer — and only the sentinel file the acknowledgement promises stays
-with the container backend (:func:`_signal_cancellation`).
+**The working path is real too, and it lives one module over.**
+``verify`` and ``build`` re-measure the locked context, hand it to
+:mod:`mcuhome_buildserver.backend` and answer an invocation id
+immediately; the completion arrives as an ``invocation.finished`` event
+with the status and the artifact list, the program's own events are
+relayed verbatim and its raw log travels as its own frame kind (E46).
+``get-artifact`` answers a ``tar.zst`` announced in its result frame and
+streamed as BINARY frames behind it (E45), and ``attach-session``
+replays an invocation's events from a sequence number the client states
+— out of the NDJSON file on disk, which is the replay buffer.
+
+Nothing in the verb set answers ``session.not-implemented`` any more.
+The code stays registered, because the registry is append-only and a
+future verb will want it; nothing raises it.
 
 Admission and negotiation live at ``open-session``, not in ``verify``:
 a version mismatch is a typed rejection at the door, never a downstream
@@ -69,11 +75,13 @@ answered by ``send-context`` rather than here.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
 import re
 import secrets
 import time
+import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -82,12 +90,14 @@ from typing import Any
 from mcuhome.model.context import CONTEXT_FILE
 from mcuhome.model.hashes import sha256_file
 
+from mcuhome_buildserver import artifacts, events, protocol
 from mcuhome_buildserver.contextstore import (
     ContextPins,
     SessionPaths,
     count_context_files,
     freeze_context,
     parse_context_yaml,
+    recheck_locked_context,
     recheck_patch_policy,
 )
 from mcuhome_buildserver.errors import SessionError
@@ -210,6 +220,17 @@ DEFAULT_MAX_OPEN_SESSIONS = 4
 STATE_OPEN = "open"
 STATE_CLOSED = "closed"
 
+#: The shape of a server-assigned invocation id: ``inv-`` and a counter
+#: that starts at 1 and rises for the life of one session. Monotonic per
+#: session rather than random, because the id is a path segment
+#: (``invocations/<id>/``) and an ordinal is the one form that is
+#: readable in a log, sortable by age and impossible to collide inside
+#: the session that issues it. It is never named to the program —
+#: contract §5.2 has no invocation field, and the backend addresses an
+#: invocation by the paths it chose for it — so nothing outside this
+#: server depends on the spelling.
+INVOCATION_ID = re.compile(r"inv-[1-9][0-9]{0,9}\Z")
+
 #: The context's three states inside a session. They exist because the
 #: freeze is an **explicit verb** rather than an implicit one on "the
 #: first writing command": an implicit freeze needs an enumerated list
@@ -267,9 +288,25 @@ class Session:
     #: get-artifact and close-session keep working, which is the point.
     poisoned: bool = False
     #: Every invocation this session ever ran, id -> INVOCATION_* state.
-    #: The bookkeeping `cancel` addresses; the container backend is what
-    #: will populate it and flip entries to FINISHED.
+    #: The bookkeeping `cancel` addresses; the container backend
+    #: populates it and flips entries to FINISHED.
     invocations: dict[str, str] = field(default_factory=dict)
+    #: What the next invocation of this session is called. Per session,
+    #: so two sessions both have an `inv-1` and neither can name the
+    #: other's — the id is only ever resolved against the session that
+    #: issued it.
+    invocation_counter: int = 0
+    #: The context id ``lock-context`` computed and answered. Held
+    #: because attribution always uses the id **this server** computed:
+    #: it is what every working invocation is measured against before it
+    #: starts and what the result document's own ``context`` is compared
+    #: to when it comes back.
+    context_id: str | None = None
+    #: What ``send-context`` learned about the build container serving
+    #: this session, or ``None`` before it. Duck-typed rather than
+    #: imported, because the verbs call the backend and the backend
+    #: never calls the verbs.
+    image: Any = None
     #: The per-session directory this session owns, once ``send-context``
     #: has created one. ``None`` until then and after :meth:`discard`,
     #: which is the same thing as "there is nothing on disk to delete".
@@ -445,6 +482,8 @@ class Session:
         self.paths = None
         self.pins = None
         self.context_yaml_sha256 = None
+        self.context_id = None
+        self.image = None
         self.context_state = CONTEXT_NONE
         self.ledger.disk_bytes = 0
 
@@ -656,8 +695,7 @@ class SessionManager:
         client asked for a state and that state holds.
 
         **A busy session is cancelled implicitly** (E39): every running
-        invocation gets the stop signal first, its result document is
-        still written by the backend, then the session is reaped.
+        invocation gets the stop signal, and then the session is reaped.
         Refusing to close while an invocation runs was rejected because
         connection loss is never abandonment — that is
         ``attach-session``'s reason to exist — so closing must never
@@ -665,6 +703,18 @@ class SessionManager:
         crashed client's session would otherwise hold its resources
         until lease expiry as the *normal* path rather than the
         fallback.
+
+        **The sentinel here is best-effort and nothing more.** E39's
+        "the result document is still written" orders the *program's*
+        shutdown — write before you die — and promises nobody a
+        document: the client gets no result for an implicitly cancelled
+        invocation either way, and the directory the document would be
+        read from is the one this close deletes. So the sentinel is set
+        for a program that happens to be between polls, the container is
+        removed, and only then is the tree discarded — which is the one
+        ordering in which nothing writes into a directory that is being
+        deleted underneath it. The discard is the caller's, because the
+        container has to go first and reaping it is asynchronous.
         """
         session = self._sessions.get(session_id)
         if session is None:
@@ -678,7 +728,6 @@ class SessionManager:
                 session.invocations[invocation_id] = INVOCATION_CANCELLING
                 _signal_cancellation(session, invocation_id)
         session.state = STATE_CLOSED
-        session.discard_context()
         return session
 
 
@@ -687,7 +736,7 @@ class SessionManager:
 # --------------------------------------------------------------------------
 
 
-def capabilities_payload(state: Any) -> dict[str, Any]:
+def capabilities_payload(state: Any, containers: list[dict[str, Any]]) -> dict[str, Any]:
     """What the ``capabilities`` verb answers — pre-session, cheap.
 
     It stays the **pre-session query** after the freeze verb landed:
@@ -698,11 +747,21 @@ def capabilities_payload(state: Any) -> dict[str, Any]:
     of dying mid-session, and it is the one verb that carries no session
     id, because there is no session yet to carry.
 
-    ``containers`` is a placeholder, marked as such until its backend
-    lands: it will list the available build-container images as
-    ``{"tag", "digest", "labels"}`` entries once the container backend
-    exists. Empty until then, and an empty list is the truthful answer —
-    this server can admit sessions and build nothing.
+    ``containers`` is real since the container backend landed: every
+    local image carrying the ``org.mcuhome.contract`` label, with its
+    reference, its repo digest and its three §2.1 labels — which is
+    ADR 0019 §2's "tag + digest + contract labels". The labels are
+    pre-start scheduling data and are answered as such: an image is in
+    this list for carrying them, and what its program can actually do is
+    ``describe``'s answer, which ``send-context`` asks for once a
+    context names one. Nothing here starts a container, because a client
+    asking what this server has is not yet asking any image to prove it.
+
+    An empty list is still a truthful answer, and now it means what it
+    says: this host has no build-container image. So does a host whose
+    container runtime is down — the question is which images this server
+    can serve, and "none" is a fact rather than an error. The refusal
+    for a missing runtime belongs to the verb that needs a container.
 
     There is deliberately **no ``quota.work``** and no cost class. ADR
     0019's amendment binds work metering and cost classes to the hosted
@@ -723,7 +782,7 @@ def capabilities_payload(state: Any) -> dict[str, Any]:
             "context_format": {"min": CONTEXT_FORMAT_MIN, "max": CONTEXT_FORMAT_MAX},
             "profiles": list(PROFILES),
         },
-        "containers": [],
+        "containers": containers,
         # The server's patch configuration IS the policy; unlisted layers
         # are denied by default (concept §6). Advertised per layer so the
         # workbench refuses a patched context before uploading it.
@@ -739,7 +798,7 @@ def capabilities_payload(state: Any) -> dict[str, Any]:
 
 async def capabilities(state: Any, connection: Any, command: Command) -> dict[str, Any]:
     """``capabilities`` — see :func:`capabilities_payload`."""
-    return capabilities_payload(state)
+    return capabilities_payload(state, await state.backend.inventory())
 
 
 async def open_session(state: Any, connection: Any, command: Command) -> dict[str, Any]:
@@ -775,8 +834,10 @@ async def open_session(state: Any, connection: Any, command: Command) -> dict[st
 
     ``negotiated.backend_profile`` is ``container`` or ``subprocess``
     (build-container contract §1.2), the field ADR 0019's amendment puts
-    in this response, and ``null`` until this server has a backend: a
-    server that drives neither cannot truthfully declare one. Patch
+    in this response. It is ``container`` and can never be anything
+    else here: a ``subprocess``-profile backend "serves exactly one
+    build environment — the one it runs in", and this process is an
+    orchestrator that is never itself a build environment. Patch
     *policy* is enforced against the files actually present, so it runs
     at ``send-context``/``extend-context`` time, not here.
     """
@@ -809,22 +870,9 @@ async def open_session(state: Any, connection: Any, command: Command) -> dict[st
         "negotiated": {
             "protocol_version": SESSION_PROTOCOL_VERSION,
             "context_format": {"min": CONTEXT_FORMAT_MIN, "max": CONTEXT_FORMAT_MAX},
-            "backend_profile": None,
+            "backend_profile": state.backend.profile,
         },
     }
-
-
-def _not_implemented(verb: str, session: Session, **details: Any) -> SessionError:
-    """The typed answer of every verb whose backend is future work."""
-    return SessionError(
-        "session.not-implemented",
-        f'"{verb}" is part of session protocol {SESSION_PROTOCOL_VERSION} and its '
-        "server logic lands with the container backend. The session itself is real: "
-        "it was admitted, it holds its lease, and close-session releases it.",
-        verb=verb,
-        session_id=session.id,
-        **details,
-    )
 
 
 def _archive_announcement(command: Command, key: str = "archive") -> tuple[int, str]:
@@ -914,16 +962,18 @@ def _unpack_into(
 
 
 def _signal_cancellation(session: Session, invocation_id: str) -> None:
-    """Raise the stop signal for one invocation. **Seam for the backend.**
+    """Raise the stop signal for one invocation: create the sentinel file.
 
-    What this becomes is fixed by build-container contract §8 and is
-    deliberately one small thing: the backend creates the **cancel
-    sentinel file** that this invocation's request document named, and
-    the *existence* of the file means "stop". The program polls it,
-    stops within ``limits.cancel_grace_seconds`` and writes a result
-    document with ``status: "cancelled"`` — which carries ``reason:
-    null`` and ``error: null``, because nothing was diagnosed. SIGTERM/
-    SIGKILL stays the backend's hard path behind the cooperative one.
+    Build-container contract §8, and it is deliberately one small thing:
+    the backend creates the **cancel sentinel file** that this
+    invocation's request document named, and the *existence* of the file
+    means "stop". The program polls it, stops within
+    ``limits.cancel_grace_seconds`` and writes a result document with
+    ``status: "cancelled"`` — which carries ``reason: null`` and
+    ``error: null``, because nothing was diagnosed. SIGTERM and then
+    SIGKILL stay the backend's hard path behind the cooperative one, and
+    :mod:`mcuhome_buildserver.backend` starts that ladder when it sees
+    this file appear.
 
     A sentinel file rather than a signal, for the same reason the verb
     exists at all: killing a ``docker exec`` client does not kill the
@@ -932,20 +982,29 @@ def _signal_cancellation(session: Session, invocation_id: str) -> None:
     directory and never inside the context, which is what keeps the
     context a genuinely read-only mount.
 
-    The bookkeeping the verb needs exists now (:attr:`Session.invocations`,
-    the E38 wire shape), so this is no longer a refusal: the caller has
-    already recorded :data:`INVOCATION_CANCELLING`, and what is missing
-    is only the file — which needs a per-invocation directory, which
-    needs the container backend. Until then the mark IS the signal, and
-    the backend's arrival changes this function's body, not its callers.
+    **It is here rather than on the backend** because both callers are
+    here — the ``cancel`` verb and ``close-session``'s implicit cancel —
+    and because the path is the session's own: the per-invocation
+    directory is named by :class:`~mcuhome_buildserver.contextstore.SessionPaths`,
+    which the session record already holds. Nothing about creating the
+    file needs a container, and the one thing it must not do is fail:
+    every caller is answering something else, and a cancel that raised
+    over a missing directory would turn an acknowledgement into an
+    internal error.
 
-    One consequence is already fixed and belongs to the backend rather
-    than here: a cancellation that lands **mid patch application**
-    poisons the session (:meth:`Session.poison`, ``session.poisoned``) —
-    a crash, a cancel or an out-of-memory kill after some patches but
-    before all leaves trees no future build may trust.
+    One consequence belongs to the backend rather than here: a
+    cancellation that lands **mid patch application** poisons the
+    session (:meth:`Session.poison`, ``session.poisoned``) — a crash, a
+    cancel or an out-of-memory kill after some patches but before all
+    leaves trees no future build may trust. The program is what reports
+    it, as ``error.patch.incomplete``, on the invocation after.
     """
-    del session, invocation_id  # the sentinel file arrives with the backend
+    if session.paths is None:
+        return
+    with contextlib.suppress(OSError, ValueError):
+        directory = session.paths.invocation(invocation_id)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (directory / "cancel").touch(mode=0o600, exist_ok=True)
 
 
 async def send_context(state: Any, connection: Any, command: Command) -> dict[str, Any]:
@@ -971,34 +1030,37 @@ async def send_context(state: Any, connection: Any, command: Command) -> dict[st
     files, and that is allowed here — what a ``build`` needs beyond
     existence, ``keys/signing.pub`` above all, is checked by ``build``.
 
-    **What the response does not carry, and why.** ADR 0019's amendment
-    has ``send-context`` answer "the serving build container's contract
-    version and its command set", the half of the discovery payload that
-    only the context determines. This server has no container backend,
-    so it can name no serving container; that half arrives with the
-    backend rather than as a placeholder. What is answered is what this
-    server actually decided: the pins it accepted and where the context
-    now stands.
+    **The response carries the serving container**, which is the half of
+    the discovery payload ADR 0019's amendment moved here: with no
+    context at ``open-session`` the backend does not yet know *which*
+    container serves the session, and the digest arrives with the pins.
+    ``container`` therefore answers the image's contract version, its
+    program identity and its command set — all of them out of
+    ``describe``, which is authoritative, rather than out of the labels,
+    which are a pre-start hint that is cross-checked against it.
 
-    **The pins are checked for spelling and not for truth, and the gap
-    is deliberate rather than overlooked.** Build-container contract
-    §9.1 requires the backend to check ``container.digest`` against the
-    image it actually pulled, ``mcuhome.package.sha256`` against the
-    package bytes it actually fetched and unpacked, and ``target.board``
-    against the pins the session was admitted on. This server pulls no
-    image and fetches no package, so two of the three have nothing to
-    compare against yet, and the third has nothing either — admission
-    carries no pins since ADR 0019's amendment took the manifest header
-    away from ``open-session``. What stands in its place today is the
-    freeze's re-check of ``context.yaml`` against the bytes accepted
-    here. The remaining two land with the backend that pulls and fetches.
+    That is also where ``version.builder-unavailable`` becomes real. The
+    pin is resolved against this host's **local** image inventory and
+    nothing is pulled, so a context naming an image that is not here is
+    refused at the moment the pins arrive rather than minutes into a
+    build. And it is refused before the context is frozen, which is the
+    useful moment: the client can open a new session against an image
+    this server has, without having paid for a lock.
 
-    For the same reason no ``version.builder-unavailable`` is raised
-    here: the registry entry exists for "no build container on this
-    server satisfies the context's container.digest pin", and this
-    server's container inventory is an empty placeholder rather than an
-    inventory. Refusing every context against it would be a false
-    refusal, not a strict one.
+    **Two of §9.1's three pin cross-checks happen from here, and the
+    third has no other place.** ``container.digest`` is checked against
+    the image this host actually resolved — that is the lookup itself.
+    ``mcuhome.package.sha256`` is checked against the package bytes when
+    they are fetched and unpacked, which is the first working command,
+    because the pin to fetch against is the one the *lock* wrote.
+    ``target.board`` is compared against the pins the session was
+    admitted on by the pre-invocation re-check
+    (:func:`~mcuhome_buildserver.contextstore.recheck_locked_context`):
+    admission carries no pins since ADR 0019's amendment took the
+    manifest header away from ``open-session``, so the pins this
+    ``send-context`` accepted *are* what the session was admitted on,
+    and re-measuring the manifest against them is the only comparison
+    that exists to be made.
 
     On any refusal the whole upload is discarded — the directory is
     deleted and the session goes back to :data:`CONTEXT_NONE`, so the
@@ -1034,16 +1096,23 @@ async def send_context(state: Any, connection: Any, command: Command) -> dict[st
             )
             recheck_patch_policy(paths.context, frozenset(state.config.allowed_patch_layers))
             context_yaml_sha256 = sha256_file(entry)
+            # Discovery last, and inside the same guard: an image this
+            # host does not have makes the whole send-context a refusal,
+            # so the context goes with it rather than sitting in a
+            # session that can never build against it.
+            image = await state.backend.resolve_image(pins)
         except BaseException:
             session.discard_context()
             raise
     session.pins = pins
     session.context_yaml_sha256 = context_yaml_sha256
+    session.image = image
     session.context_state = CONTEXT_UNLOCKED
     return {
         "session_id": session.id,
         "context": {"state": session.context_state, "format": pins.context_version},
         "pins": pins.to_wire(),
+        "container": image.to_wire(),
     }
 
 
@@ -1460,12 +1529,74 @@ async def lock_context(state: Any, connection: Any, command: Command) -> dict[st
         identity = freeze_context(
             paths, session.pins, context_yaml_sha256=session.context_yaml_sha256
         )
+        # Kept, because attribution always uses the id this server
+        # computed itself: every working invocation is measured against
+        # it before it starts, and the result document's own `context`
+        # is compared to it when it comes back.
+        session.context_id = identity
         session.context_state = CONTEXT_LOCKED
     return {"context_id": identity}
 
 
+async def _start_working(
+    state: Any, connection: Any, command: Command, *, action: str, mode: str | None = None
+) -> dict[str, Any]:
+    """The shared body of ``verify`` and ``build``.
+
+    One function because the two differ in exactly two things — the
+    action in ``argv[1]`` and whether a ``mode`` travels with it — and
+    everything in front of that is identical: the same state-machine
+    gates, the same integrity re-check, the same lazily materialized
+    container, the same immediate answer.
+
+    **The context is re-measured before every working invocation**
+    rather than trusted from the lock (product-owner decision). Contexts
+    are small, and what the re-check buys is the one thing the freeze
+    cannot: the manifest and the files are compared *now*, so an
+    invocation is never attributed to an identity that moved after it
+    was answered. A disagreement is ``context.integrity-mismatch``
+    naming every offending path, and it does **not** poison the session
+    — nothing was applied to any tree, and a client that fixes its
+    context is fixing something this session never acted on.
+
+    **The answer is the invocation id and nothing else** (E46). A build
+    is minutes to hours; a command frame that waited for it would make
+    every client's socket a build timer, and a client that lost the
+    socket would lose the result of work that is still running. So the
+    verb acknowledges and the completion travels as an
+    ``invocation.finished`` event carrying the status and the artifact
+    list — on the channel that survives a reconnect, because the
+    invocation continues detached and ``attach-session`` re-joins it.
+    """
+    session = state.sessions.require(command.require_str("session_id"))
+    session.require_workable()
+    session.require_locked_context()
+    paths = _require_paths(session)
+    if session.pins is None or session.context_id is None:  # pragma: no cover - set together
+        raise SessionError(
+            "context.missing",
+            f'Session "{session.id}" has no frozen context to work on.',
+            session_id=session.id,
+        )
+    recheck_locked_context(paths, session.pins, expected_id=session.context_id)
+    record = await state.backend.invoke(
+        session,
+        connection,
+        action=action,
+        pins=session.pins,
+        context_id=session.context_id,
+        mode=mode,
+    )
+    return {
+        "session_id": session.id,
+        "invocation_id": record.id,
+        "action": action,
+        "context_id": session.context_id,
+    }
+
+
 async def verify(state: Any, connection: Any, command: Command) -> dict[str, Any]:
-    """``verify`` — check the effective context against the lock. **Stub.**
+    """``verify`` — check the effective context against the lock.
 
     A working command, so it runs **only from the lock onwards** and
     answers ``context.not-locked`` before it. That gate repairs the verb
@@ -1477,32 +1608,72 @@ async def verify(state: Any, connection: Any, command: Command) -> dict[str, Any
     the first working action — which is what leaves something to check
     against.
 
-    Optional even when real: the fast path skips it. It applies no
-    patches and touches no source tree (contract §7.3).
+    It applies no patches and touches no source tree (contract §7.3), and
+    the writable views §4.1 requires are still supplied: "verify simply
+    does not use them, and a view it never writes to is
+    indistinguishable from one it was not given". What is **not**
+    supplied is a ``required`` pointer at any of them — demanding that a
+    verify honour a tree it is forbidden to write would ask a conforming
+    program to refuse for the wrong reason.
+
+    A mismatch the program reports is a **failed invocation and not a
+    poisoned session**. The distinction is the one §6.2 draws: a session
+    poisons when an interrupted patch application leaves trees no future
+    build may trust, and a verify never touches a tree. So the client
+    gets ``status: "failure"`` with ``error.context.mismatch`` on the
+    invocation's own event, and the session stays usable — which matters,
+    because the obvious next move is to open a new session with a
+    corrected context rather than to discover that this one is now dead
+    for having been checked.
+
+    Optional even when real: the fast path skips it, and it is not a
+    complete integrity check on its own.
     """
-    session = state.sessions.require(command.require_str("session_id"))
-    session.require_workable()
-    session.require_locked_context()
-    raise _not_implemented("verify", session)
+    return await _start_working(state, connection, command, action="verify")
+
+
+#: The two modes contract §7.2 defines. ``clean`` is the default and the
+#: safe one — an absent ``params``, a ``params`` without ``mode`` and an
+#: empty ``params`` all mean it — because it is the mode that never
+#: silently reuses state, and it is what a release artifact requires.
+BUILD_MODES = ("clean", "incremental")
 
 
 async def build(state: Any, connection: Any, command: Command) -> dict[str, Any]:
-    """``build [mode]`` — clean or incremental. **Stub.**
+    """``build [mode]`` — clean or incremental.
 
     The other working command, and the other half of "only from here":
     before the lock it answers ``context.not-locked``, which is also the
     structural reason the verb set could not stay at nine — a client
     that never locks the context can never reach ``build``.
 
-    When real: every invocation gets a server-assigned invocation id,
-    outputs land in ``/out/<invocation-id>/``, and the result names the
-    effective context id actually built, so artifacts stay attributable.
-    That id is what ``get-artifact`` and ``cancel`` address.
+    Payload::
+
+        {"session_id": "s-…", "mode": "clean"}   # mode optional
+
+    ``mode`` is the one parameter, and an unknown value is refused here
+    rather than passed on. §5.2 makes the *value* count in ``required``
+    and not only the pointer, so a mode this server does not know would
+    be a mode it demanded a program honour without knowing what it
+    means. ``incremental`` is session-private and falls back to
+    ``clean`` inside the container when there is no prior state of this
+    session in ``work``.
+
+    Every invocation gets a server-assigned invocation id, and it is
+    what ``get-artifact`` and ``cancel`` address. It is never named to
+    the program: contract §5.2 has no invocation field, and the backend
+    addresses an invocation by the ``out``, ``result`` and ``events``
+    paths it chose for it.
     """
-    session = state.sessions.require(command.require_str("session_id"))
-    session.require_workable()
-    session.require_locked_context()
-    raise _not_implemented("build", session)
+    mode = command.optional_str("mode", "clean") or "clean"
+    if mode not in BUILD_MODES:
+        raise ProtocolError(
+            f'"build" takes mode {" or ".join(BUILD_MODES)}, not "{mode}". clean is the '
+            "default and the safe one: it never silently reuses state, and it is what a "
+            "release artifact requires.",
+            frame_id=command.id,
+        )
+    return await _start_working(state, connection, command, action="build", mode=mode)
 
 
 async def cancel(state: Any, connection: Any, command: Command) -> dict[str, Any]:
@@ -1578,8 +1749,52 @@ async def cancel(state: Any, connection: Any, command: Command) -> dict[str, Any
     }
 
 
-async def get_artifact(state: Any, connection: Any, command: Command) -> dict[str, Any]:
-    """``get-artifact(invocation id, path)`` — streamed, hash-verified. **Stub.**
+async def get_artifact(state: Any, connection: Any, command: Command) -> None:
+    """``get-artifact(invocation id[, path])`` — an archive, announced then streamed.
+
+    Payload::
+
+        {"session_id": "s-…",
+         "invocation_id": "inv-1",
+         "path": "firmware.hex"}      # optional; absent means all of them
+
+    **The wire shape is the mirror of E41's upload, and the bytes are a
+    ``tar.zst``** (E45): one archive format in both directions. With a
+    ``path`` the archive holds exactly that declared artifact, without
+    one it holds every declared artifact of the invocation under its
+    declared path. The result frame **is** the announcement — the
+    archive's size and its SHA-256, plus what is in it — and the BINARY
+    frames follow it. There is no acknowledgement frame after them for
+    the same reason the upload needs one and this does not: the
+    receiving side is the client, and it knows the transfer is complete
+    when it has taken the announced number of bytes.
+
+    The announced hash is the **archive's**, computed at egress while
+    the bytes are read off disk. Per-file integrity stays the client's
+    own check against the result document it already holds, which is
+    what keeps this hash a transport check rather than a second
+    integrity claim that could disagree with the first.
+
+    What is served is the intersection of declared and verified (§9.3).
+    The verification happened when the invocation finished — every
+    declared artifact re-hashed from the bytes on disk, paths normalized
+    and contained, links, devices and oversized files refused — and it
+    **happens again here**, while the archive is packed: the session's
+    tree stays writable until ``close-session``, so "was a regular file
+    then" is not "is that file now", and an archive gives a client no
+    way to notice a member that was swapped in between. A member that no
+    longer is what was verified is ``artifact.integrity-mismatch`` and
+    the delivery is refused rather than built around it. A path that was
+    never offered is ``artifact.unknown`` with the declared paths in its
+    details — a different statement, and one about the request.
+
+    **One download at a time per connection**, held over the whole verb.
+    The announcement and the bytes behind it are one indivisible
+    sequence on the wire, because a BINARY frame carries no id: two
+    interleaved downloads leave a client holding chunks it cannot
+    attribute. The spool is named uniquely per request as well, so that
+    two deliveries can never share a file even if the guard is ever
+    taken away.
 
     **Inside the session and nowhere else.** The per-session directory —
     the context and every artifact in it — is deleted at
@@ -1589,48 +1804,226 @@ async def get_artifact(state: Any, connection: Any, command: Command) -> dict[st
     nothing said how long, while the directory it kept alive holds a
     device's Matter commissioning credentials.
 
-    Like ``cancel``, it is deliberately not gated on the lock. The flow
-    diagram lists it after ``verify``/``build``, but only those two
-    carry the "only from here" qualification, and an invocation id can
-    only exist because a build produced it. The refusal for an unknown
-    invocation id or an unknown path is named nowhere, so this stub does
-    not invent one.
+    Like ``cancel``, it is deliberately not gated on the lock and not
+    gated on poison. The flow diagram lists it after ``verify``/
+    ``build``, but only those two carry the "only from here"
+    qualification, and an invocation id can only exist because a working
+    command produced one. On a poisoned session it is the verb that
+    matters most: that is exactly the moment its owner wants the logs
+    and partial artifacts that explain what happened.
     """
     session = state.sessions.require(command.require_str("session_id"))
-    raise _not_implemented("get-artifact", session)
+    invocation_id = command.require_str("invocation_id")
+    if invocation_id not in session.invocations:
+        raise SessionError(
+            "invocation.unknown",
+            f'Session "{session.id}" has no invocation "{invocation_id}".',
+            session_id=session.id,
+            invocation_id=invocation_id,
+            known=sorted(session.invocations),
+        )
+    record = state.backend.record(session.id, invocation_id)
+    available = () if record is None else record.artifacts
+    wanted = command.optional_str("path")
+    if wanted is not None:
+        chosen = tuple(entry for entry in available if entry.path == wanted)
+        if not chosen:
+            raise SessionError(
+                "artifact.unknown",
+                f'Invocation "{invocation_id}" declared no artifact at "{wanted}". This '
+                "server serves exactly the intersection of what the build declared and "
+                "what it could verify from the bytes on disk; the paths it did declare "
+                "are in the details.",
+                session_id=session.id,
+                invocation_id=invocation_id,
+                path=wanted,
+                declared=[entry.path for entry in available],
+            )
+    else:
+        chosen = available
+
+    paths = _require_paths(session)
+    spool = paths.downloads / f"{invocation_id}-{uuid.uuid4().hex}.tar.zst"
+    spool.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    async with connection.download_lock:
+        try:
+            # Off the event loop: this tars and zstd-compresses every
+            # artifact of a build and then re-reads the spool to hash
+            # it. On the loop it would stall every other session and
+            # every other connection for the length of a firmware set.
+            delivery = await asyncio.to_thread(
+                artifacts.build_archive,
+                out=record.out if record is not None else paths.downloads,
+                artifacts=chosen,
+                spool=spool,
+            )
+            await connection.send(
+                protocol.result_frame(
+                    command.id,
+                    {
+                        "session_id": session.id,
+                        "invocation_id": invocation_id,
+                        "archive": {"size": delivery.size, "sha256": delivery.sha256},
+                        "artifacts": [entry.to_wire() for entry in delivery.members],
+                    },
+                )
+            )
+            await connection.send_archive(spool)
+        finally:
+            # The archive is a rendering of what is already on disk, so
+            # it is rebuilt on the next request rather than kept:
+            # keeping it would double the footprint of every artifact a
+            # client asks for, inside a per-session quota that is there
+            # to be bounded.
+            spool.unlink(missing_ok=True)
+    return None
 
 
 async def attach_session(state: Any, connection: Any, command: Command) -> dict[str, Any]:
     """``attach-session`` — connection loss is not abandonment.
 
-    Answers the session record and its lease, which is the real half:
-    a reconnecting client learns its session survived, and the record
-    says where the context stands, which is what tells the client
-    whether it still has to lock. Permitted in **any** context state —
-    it is the read-only reconnection verb, and no document restricts it
-    to one side of the lock. The buffered event replay (server-side
-    sequence numbers, resume from an offset) is future work and lands
-    with the streams it would replay.
+    Payload::
+
+        {"session_id": "s-…",
+         "invocation_id": "inv-1",     # optional: replay this one's events
+         "from_seq": 12}               # optional: from here on, default 1
+
+    Answers the session record and its lease: a reconnecting client
+    learns its session survived, and the record says where the context
+    stands, which is what tells the client whether it still has to lock.
+    Permitted in **any** context state — it is the read-only
+    reconnection verb, and no document restricts it to one side of the
+    lock.
+
+    **Two things happen beyond the record, and both are what makes the
+    verb worth having.** The connection re-joins the session's live
+    stream, so an invocation that has been running detached starts
+    reaching this socket again. And, if the client names an invocation,
+    its events are replayed from the sequence number the client last
+    saw — read straight out of the NDJSON file the program wrote, which
+    stays on disk for the life of the session and **is** the replay
+    buffer (E46). There is no in-memory ring behind it, so there is
+    nothing a long reconnect can find already evicted.
+
+    The replayed events go out **before** this verb's own result frame,
+    which is what lets a client treat the boundary as a boundary: every
+    event frame it sees before the answer is history, and everything
+    after it is live.
+
+    **That is an ordering claim, so the replay finishes before the
+    connection joins the live stream.** Attaching first and reading
+    afterwards put live frames *inside* the region the verb calls
+    history — every ``await`` in the replay loop is a turn for the
+    supervisor that is relaying an invocation still running, which is
+    the exact situation this verb exists for — and delivered an event
+    twice when the relay overtook the reader. So: read the file to
+    exhaustion, send it, and only then join, telling the backend which
+    ``seq`` of which invocation was the last thing already delivered.
+    Events at or below that boundary are not relayed to this connection
+    a second time; everything after it is live, which is what the client
+    was promised.
+
+    Only events replay. The raw log is not written to disk by this
+    server and is not replayable — it is a "raw, opaque log stream"
+    consumers must not parse for machine decisions, and its own counter
+    is what tells a client it missed lines.
     """
     session = state.sessions.require(command.require_str("session_id"))
-    return {"session": session.to_dict(), "lease": session.lease_dict()}
+    replayed = 0
+    boundary: tuple[str, int] | None = None
+    invocation_id = command.optional_str("invocation_id")
+    if invocation_id is not None:
+        record = state.backend.record(session.id, invocation_id)
+        if record is None:
+            raise SessionError(
+                "invocation.unknown",
+                f'Session "{session.id}" has no invocation "{invocation_id}" to replay.',
+                session_id=session.id,
+                invocation_id=invocation_id,
+                known=sorted(session.invocations),
+            )
+        from_seq = command.optional_int("from_seq", 1) or 1
+        sent_upto = from_seq - 1
+        # Bounded passes rather than "until it stops growing": the file
+        # of a running invocation may never stop growing, and a verb
+        # that replayed until it did would never answer.
+        for _ in range(_REPLAY_PASSES):
+            fresh = events.replay(record.events, from_seq=sent_upto + 1)
+            if not fresh:
+                break
+            for line in fresh:
+                payload = dict(line)
+                payload["session_id"] = session.id
+                payload["invocation_id"] = invocation_id
+                await connection.send(protocol.event_frame(str(line["event"]), payload))
+                replayed += 1
+            sent_upto = _last_seq(fresh, sent_upto)
+        if replayed:
+            boundary = (invocation_id, sent_upto)
+    state.backend.attach(session.id, connection, boundary=boundary)
+    return {
+        "session": session.to_dict(),
+        "lease": session.lease_dict(),
+        "replayed": replayed,
+    }
+
+
+#: How many times ``attach-session`` re-reads the events file before it
+#: joins the live stream. More than one because the first pass takes
+#: time and a running program appends during it; bounded because a
+#: program that appends faster than the file is read would otherwise
+#: hold the verb open forever.
+_REPLAY_PASSES = 4
+
+
+def _last_seq(lines: tuple[dict[str, Any], ...], fallback: int) -> int:
+    """The highest ``seq`` in *lines*, or *fallback*.
+
+    §8 makes ``seq`` monotonic and nothing more, and an event whose
+    ``seq`` is unreadable is relayed rather than dropped — so the
+    boundary is the largest number actually seen and never the count of
+    lines.
+    """
+    found = [
+        line["seq"]
+        for line in lines
+        if isinstance(line.get("seq"), int) and not isinstance(line.get("seq"), bool)
+    ]
+    return max(found) if found else fallback
 
 
 async def close_session(state: Any, connection: Any, command: Command) -> dict[str, Any]:
-    """``close-session`` — release the session (and, later, its container).
+    """``close-session`` — release the session and reap its container.
 
-    It reaps the container and deletes the per-session directory with
-    the context and every artifact in it, which is why ``get-artifact``
-    has to run before it. Permitted in any context state; the lock does
-    not gate the way out.
+    Three things go, **in this order**, and the order is the whole of
+    what this verb guarantees.
 
-    Whether it must first cancel a still-running invocation, whether the
-    client gets a result for that invocation, and whether closing a busy
-    session is refused at all are **not settled** by any document. This
-    server closes the record either way, and the question lands with the
-    container backend that would have something to reap.
+    1. The stop signal is set for every running invocation. It is
+       best-effort: a program polls the sentinel on its own schedule,
+       and nothing here waits for it to notice.
+    2. The container is removed, ``--force``. That is the kill — the
+       cancel sentinel never reached the process inside the container,
+       and killing a ``docker exec`` client never did either.
+    3. The per-session directory is deleted, with the context and every
+       artifact in it, which is why ``get-artifact`` has to run before
+       this.
+
+    Deleting the tree *before* removing the container was the order this
+    verb had, and it was wrong in the one way that matters: it pulls the
+    mount source out from under a program that is still running in it.
+
+    **The client gets no result for an implicitly cancelled invocation**
+    (E39), and this verb no longer promises one survives. The guarantee
+    that the result document is still written orders the *program's*
+    shutdown — it is not a deliverable, and there is nowhere left to
+    deliver it to.
+
+    Permitted in any context state; the lock does not gate the way out.
     """
-    session = state.sessions.close(command.require_str("session_id"))
+    session_id = command.require_str("session_id")
+    session = state.sessions.close(session_id)
+    await state.backend.release(session_id)
+    session.discard_context()
     return {"session": session.to_dict()}
 
 

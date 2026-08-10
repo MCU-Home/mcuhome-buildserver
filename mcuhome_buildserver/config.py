@@ -50,7 +50,14 @@ from mcuhome_buildserver.security import DEFAULT_PAIR_FILE, read_token_file
 from mcuhome_buildserver.sessions import PATCH_LAYERS, is_patch_layer_name
 
 __all__ = [
+    "DEFAULT_BUILD_DEADLINE_SECONDS",
+    "DEFAULT_BUILD_JOBS",
+    "DEFAULT_CANCEL_GRACE_SECONDS",
+    "DEFAULT_CONTAINER_MEMORY",
+    "DEFAULT_CONTAINER_PIDS",
+    "DEFAULT_DOCKER",
     "DEFAULT_HOST",
+    "DEFAULT_MAX_ARTIFACT_BYTES",
     "DEFAULT_MAX_COMPRESSED_BYTES",
     "DEFAULT_MAX_CONTEXT_YAML_BYTES",
     "DEFAULT_MAX_DECOMPRESSED_BYTES",
@@ -103,6 +110,60 @@ DEFAULT_SESSION_QUOTA_BYTES = 2 * 1024 * 1024 * 1024
 #: together with safe-load, no duplicate keys and no anchors; the number
 #: is this server's default and an operator's to change.
 DEFAULT_MAX_CONTEXT_YAML_BYTES = 64 * 1024
+
+#: The container runtime this server drives. A name rather than a path,
+#: looked up on the server's own ``PATH``: an operator who wants
+#: ``podman`` says so, and an operator who wants a wrapper script names
+#: it here rather than shadowing ``docker`` for the whole account.
+DEFAULT_DOCKER = "docker"
+
+#: ``limits.jobs`` for every working invocation — **authoritative**, and
+#: resolved host-side on purpose (contract §5.2): the container sees the
+#: host CPU count but not the RAM budget, so a program that fell back to
+#: ``nproc`` would run several concurrent sessions at full width and be
+#: killed for it. Two, because a Matter build on the machine this
+#: project develops on is a ``-j2`` build: CHIP's compile units are what
+#: decide the ceiling, and the ceiling is memory rather than cores.
+DEFAULT_BUILD_JOBS = 2
+
+#: ``limits.deadline_seconds`` — relative to program start, advisory to
+#: the program and **enforced here** (§9.1). Ninety minutes: generous
+#: against a cold Matter build, mean against one that is not going to
+#: end. A program that honours the advisory value stops itself and says
+#: ``error.deadline.exceeded``; one that does not gets the liveness
+#: ladder of :mod:`mcuhome_buildserver.backend`.
+DEFAULT_BUILD_DEADLINE_SECONDS = 5400
+
+#: ``limits.cancel_grace_seconds`` — how long a cooperative program has
+#: to notice the cancel sentinel and write a ``cancelled`` result before
+#: the hard path starts. Sixty seconds, which is long enough to finish
+#: writing an artifact and short enough that a client waiting on a
+#: cancel is not left guessing.
+DEFAULT_CANCEL_GRACE_SECONDS = 60
+
+#: The egress size cap of contract §9.3, per artifact, "applied during
+#: enumeration, from the bytes on disk — an artifact entry declares no
+#: size". Separate from the ingress caps because it bounds the opposite
+#: direction: what the least trusted component in the system may put on
+#: the wire towards other people's machines.
+DEFAULT_MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
+
+#: The per-session container's memory ceiling, in ``docker run --memory``
+#: spelling. Contract §1.2 makes "per-session resource limits" a promise
+#: of the ``container`` profile and §9.1 makes them the backend's to set
+#: and to enforce, so there is a number here rather than a hope: without
+#: one, a single build's linker takes the host down and every other
+#: session with it. Eight gibibytes is generous against a cold Matter
+#: build at ``--build-jobs 2`` and mean against a runaway, and it is the
+#: value that makes ``limits.memory_bytes``' absence from the request
+#: document honest — the runtime enforces, so the document does not ask.
+DEFAULT_CONTAINER_MEMORY = "8g"
+
+#: ``docker run --pids-limit`` for the same container. A build legitimately
+#: spawns hundreds of short-lived children — which is why ``--init`` is
+#: there at all — and a fork bomb spawns them faster; four thousand is
+#: past any real toolchain and short of a host that stops scheduling.
+DEFAULT_CONTAINER_PIDS = 4096
 
 
 def default_context_root(env: Mapping[str, str]) -> Path:
@@ -178,9 +239,65 @@ class Config:
     max_context_yaml_bytes: int = DEFAULT_MAX_CONTEXT_YAML_BYTES
 
     #: The per-session disk quota of the same decision — "typed
-    #: quota-exceeded instead of host exhaustion". Today only the
-    #: context spends it; ``/out`` joins when there are build outputs.
+    #: quota-exceeded instead of host exhaustion". It meters what a
+    #: **client** put on this host: the context, and the SDK package
+    #: deliberately not (that one is the operator's own file, and
+    #: charging it would let a package's size decide whether a context
+    #: fits). What a build writes into ``out`` is bounded by
+    #: :attr:`max_artifact_bytes` per artifact at egress instead, which
+    #: is where contract §9.3 puts the cap and the only place a number
+    #: can be measured from the bytes on disk.
     session_quota_bytes: int = DEFAULT_SESSION_QUOTA_BYTES
+
+    #: The container runtime, and the numbers that go into every
+    #: invocation's request document. All four are configuration for the
+    #: same reason the ingress caps are — the config is the policy, and
+    #: a number an operator cannot move is a number they will work
+    #: around. ``limits.memory_bytes`` is deliberately **not** among
+    #: them: it is advisory, this server enforces memory through the
+    #: runtime rather than by asking, and a number written into the
+    #: document that nothing behind it enforces would be a promise to
+    #: the program that no one keeps.
+    docker: str = DEFAULT_DOCKER
+    build_jobs: int = DEFAULT_BUILD_JOBS
+    build_deadline_seconds: int = DEFAULT_BUILD_DEADLINE_SECONDS
+    cancel_grace_seconds: int = DEFAULT_CANCEL_GRACE_SECONDS
+    max_artifact_bytes: int = DEFAULT_MAX_ARTIFACT_BYTES
+
+    #: The per-session container's resource ceilings — the enforcement
+    #: half of the sentence above. They are ``docker run`` flags rather
+    #: than request-document fields on purpose: the program is told what
+    #: parallelism to use (``limits.jobs``) and the runtime is told what
+    #: the container may consume, which is the only arrangement in which
+    #: "advisory to the program, enforced by the backend" is true of
+    #: both. ``container_cpus`` is unset by default because
+    #: ``limits.jobs`` already bounds the parallelism a conforming
+    #: program asks for and a hard CPU ceiling on top of it is an
+    #: operator's choice, not a safety property.
+    container_memory: str | None = DEFAULT_CONTAINER_MEMORY
+    container_cpus: str | None = None
+    container_pids: int | None = DEFAULT_CONTAINER_PIDS
+
+    #: Where SDK packages are found, in search order (E48). ADR 0019's
+    #: amendment fixes the order — "a local directory first, then
+    #: ``packages.mcuhome.org``, then any other external source" — and
+    #: v1 of this server implements the first tier only: these
+    #: directories, holding ``mcuhome-sdk-<version>.tar.zst``. Empty by
+    #: default, which means a working action refuses with
+    #: ``sdk.unavailable`` naming the empty list; there is no built-in
+    #: source, because "somewhere on the internet" is not a source list
+    #: an operator chose.
+    sdk_sources: tuple[Path, ...] = ()
+
+    #: An optional shared ccache, offered to every invocation
+    #: **read-only** (contract §10: "shared backends MUST offer a shared
+    #: cache read-only for untrusted work"). There is deliberately no
+    #: way to ask for a writable one: cache warming is "a deliberate
+    #: operator invocation with a writable cache and trusted contexts
+    #: only", which is a verb this server does not have, and an option
+    #: that made an untrusted build's cache writable would be the one
+    #: setting that turns a shared cache into a shared attack surface.
+    ccache_dir: Path | None = None
 
     #: True when :func:`load_config` had to invent the token, so that
     #: startup can print it exactly once.
@@ -229,9 +346,66 @@ _CAP_OPTIONS: tuple[tuple[str, str, int, str], ...] = (
     ),
 )
 
-_LIMIT_ATTRIBUTES: tuple[str, ...] = tuple(entry[1] for entry in _CAP_OPTIONS) + (
-    "session_quota_bytes",
+#: The backend's own numbers, as ``(option, attribute, default, help)``.
+#: Same table shape as the caps and for the same reason: one table
+#: drives the command line, the environment and the defaults, so a knob
+#: cannot exist in one of the three and not the others.
+_BACKEND_OPTIONS: tuple[tuple[str, str, int, str], ...] = (
+    (
+        "--build-jobs",
+        "build_jobs",
+        DEFAULT_BUILD_JOBS,
+        "limits.jobs for every invocation — authoritative, resolved host-side",
+    ),
+    (
+        "--build-deadline-seconds",
+        "build_deadline_seconds",
+        DEFAULT_BUILD_DEADLINE_SECONDS,
+        "how long one invocation may run before this server stops it",
+    ),
+    (
+        "--cancel-grace-seconds",
+        "cancel_grace_seconds",
+        DEFAULT_CANCEL_GRACE_SECONDS,
+        "how long a cancelled invocation has to stop itself before the hard path",
+    ),
+    (
+        "--max-artifact-bytes",
+        "max_artifact_bytes",
+        DEFAULT_MAX_ARTIFACT_BYTES,
+        "egress cap: the size of one artifact this server will serve",
+    ),
+    (
+        "--container-pids",
+        "container_pids",
+        DEFAULT_CONTAINER_PIDS,
+        "docker run --pids-limit for the session container",
+    ),
 )
+
+_LIMIT_ATTRIBUTES: tuple[str, ...] = (
+    tuple(entry[1] for entry in _CAP_OPTIONS)
+    + ("session_quota_bytes",)
+    + tuple(entry[1] for entry in _BACKEND_OPTIONS)
+)
+
+
+def _text_option(
+    configured: str | None, env: Mapping[str, str], name: str, default: str | None
+) -> str | None:
+    """A string option in which ``""`` is a value and absence is not.
+
+    ``--container-memory ""`` means "no ceiling", so the empty string
+    cannot ride on the ``or`` chain the other string options use: there,
+    absence and emptiness are the same thing and both take the default,
+    which would silently keep a limit an operator asked to remove.
+    """
+    found = configured
+    if found is None:
+        found = env.get(ENV_PREFIX + name)
+    if found is None:
+        found = default
+    return (found or "").strip() or None
 
 
 def _env_int(env: Mapping[str, str], name: str) -> int | None:
@@ -333,6 +507,56 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--docker",
+        metavar="PROGRAM",
+        help=f"container runtime to drive (default {DEFAULT_DOCKER})",
+    )
+    parser.add_argument(
+        "--sdk-source",
+        action="append",
+        type=Path,
+        metavar="PATH",
+        dest="sdk_sources",
+        help=(
+            "directory holding mcuhome-sdk-<version>.tar.zst packages; repeatable and "
+            "searched in the order given. The url in a context is a hint and is never "
+            "fetched — packages come from these directories only"
+        ),
+    )
+    parser.add_argument(
+        "--ccache-dir",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "shared compiler cache, offered to every invocation read-only "
+            "(there is no writable mode: cache warming is not a verb this server has)"
+        ),
+    )
+    parser.add_argument(
+        "--container-memory",
+        metavar="SIZE",
+        help=(
+            "docker run --memory for the session container, in docker's own spelling "
+            f"(default {DEFAULT_CONTAINER_MEMORY}); the empty string removes the limit"
+        ),
+    )
+    parser.add_argument(
+        "--container-cpus",
+        metavar="N",
+        help=(
+            "docker run --cpus for the session container (default: unset — limits.jobs "
+            "already bounds the parallelism a conforming program asks for)"
+        ),
+    )
+    for option, attribute, default, what in _BACKEND_OPTIONS:
+        parser.add_argument(
+            option,
+            type=int,
+            metavar="N",
+            dest=attribute,
+            help=f"{what} (default {default})",
+        )
+    parser.add_argument(
         "--log-level",
         metavar="LEVEL",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -410,6 +634,14 @@ def load_config(
     if context_root is None:
         context_root = default_context_root(env)
 
+    sdk_sources = [Path(entry) for entry in (args.sdk_sources or ())]
+    if env.get(ENV_PREFIX + "SDK_SOURCES"):
+        sdk_sources += [
+            Path(item.strip())
+            for item in env[ENV_PREFIX + "SDK_SOURCES"].split(",")
+            if item.strip()
+        ]
+
     limits: dict[str, int] = {}
     for attribute in _LIMIT_ATTRIBUTES:
         value = getattr(args, attribute, None)
@@ -418,8 +650,13 @@ def load_config(
         if value is None:
             continue
         if value <= 0:
-            raise SystemExit(f"--{attribute.replace('_', '-')} must be a positive number of bytes.")
+            raise SystemExit(f"--{attribute.replace('_', '-')} must be a positive number.")
         limits[attribute] = value
+
+    container_memory = _text_option(
+        args.container_memory, env, "CONTAINER_MEMORY", DEFAULT_CONTAINER_MEMORY
+    )
+    container_cpus = _text_option(args.container_cpus, env, "CONTAINER_CPUS", None)
 
     config = Config(
         host=args.host or env.get(ENV_PREFIX + "HOST") or DEFAULT_HOST,
@@ -429,6 +666,14 @@ def load_config(
         log_level=args.log_level or env.get(ENV_PREFIX + "LOG_LEVEL") or "INFO",
         allowed_patch_layers=tuple(dict.fromkeys(patch_layers)),
         context_root=context_root,
+        docker=args.docker or env.get(ENV_PREFIX + "DOCKER") or DEFAULT_DOCKER,
+        # Order-preserving de-duplication: the search order is fixed
+        # (ADR 0019's amendment) and a directory listed twice must not
+        # move the one behind it.
+        sdk_sources=tuple(dict.fromkeys(sdk_sources)),
+        ccache_dir=path_option(args.ccache_dir, "CCACHE_DIR"),
+        container_memory=container_memory,
+        container_cpus=container_cpus,
         **limits,
     )
 

@@ -80,10 +80,16 @@ __all__ = [
     "freeze_context",
     "parse_context_yaml",
     "prepare_context_root",
+    "recheck_locked_context",
     "recheck_patch_policy",
 ]
 
 _SESSION_ID = re.compile(r"s-[A-Za-z0-9_-]{1,64}\Z")
+
+#: The shape :mod:`mcuhome_buildserver.sessions` issues invocation ids
+#: in — ``inv-`` and a per-session counter. Pinned here as well as
+#: there because this is where one becomes a path segment.
+_INVOCATION_ID = re.compile(r"inv-[1-9][0-9]{0,9}\Z")
 
 
 class UnsafeContextRoot(Exception):
@@ -134,8 +140,29 @@ def prepare_context_root(root: Path) -> Path:
     The checks follow symlinks, which is the right question to ask: what
     matters is who owns the directory the name resolves to.
 
+    **A relative root is refused before any of that**, and it is refused
+    here rather than resolved, because resolving it would answer a
+    different question than the operator asked. Every path in an
+    invocation's request document descends from this one, and contract
+    §5.2 rule 4 is unambiguous: "a path value that is not absolute ⇒
+    ``unsupported.request``" — so a relative root produces a document
+    every conforming program must refuse. The same string is also a
+    ``docker run --volume`` source, where docker reads a name without a
+    slash as a *named volume* rather than a bind mount and would hand
+    the program an empty directory instead of the context. Silently
+    calling ``resolve()`` would pick whatever the server's working
+    directory happened to be, which is not a location an operator chose.
+
     Returns *root* so a caller can use it in one expression.
     """
+    if not root.is_absolute():
+        raise UnsafeContextRoot(
+            f"{root} is a relative path and --context-root has to be absolute. Every path "
+            "in a build container's request document descends from it, and the contract "
+            "requires all of them to be absolute; the same value is also a bind-mount "
+            "source, where a name without a leading slash is a named volume rather than a "
+            "directory. Name the directory in full."
+        )
     missing: list[Path] = []
     probe = root
     while not probe.exists():
@@ -179,7 +206,7 @@ def _check_trusted(path: Path) -> None:
 class SessionPaths:
     """The directory tree one session owns, and how it goes away.
 
-    Three children, and the split matters. ``context/`` is the context
+    The context half, and the split matters. ``context/`` is the context
     itself — the only part that outlives a verb. ``spool`` holds the
     unpacked tar of an upload in flight and is deleted as soon as it has
     been read. ``staging/`` is where an ``extend-context`` archive is
@@ -188,6 +215,33 @@ class SessionPaths:
     settles whether an extension is atomic, and a half-applied one on a
     context whose ID is about to be computed is not something to leave
     to chance.
+
+    The backend half arrived with the container backend, and every one
+    of its four children is named by build-container contract §4 or §5:
+
+    * ``work/`` is the session's persistent working area, "exclusive to
+      this session". It is per session by construction here — one
+      directory named by session id — which is how §9.1's "one session
+      per ``work``" is kept without a check.
+    * ``sdk/`` is the SDK package unpacked for this session (§9.1's
+      verified SDK, E48). Per session rather than shared, which is what
+      lets it be handed over *writable* when the ``sdk`` layer carries
+      patches without an overlay and without anybody else's tree being
+      at risk.
+    * ``invocations/<id>/`` is the **backend-owned per-invocation
+      directory** of §5.1 step 1, holding ``out/``, ``tmp/``, the
+      request document, the result document, the events file and the
+      cancel sentinel. It is outside the context, which is exactly what
+      lets ``context`` be a kernel-enforced read-only mount, and it is
+      per invocation, which removes the data race two concurrent
+      ``docker exec`` invocations had over one fixed path.
+    * ``downloads/`` is where ``get-artifact`` builds the archive it is
+      about to stream, and nothing else lives there.
+
+    ADR 0019 §2 spells the per-invocation area ``/out/<invocation-id>/``.
+    That is superseded prose rather than a layout to mimic: ``out`` is
+    one of *five* things an invocation needs a directory for, and the
+    contract that came after names all five.
     """
 
     root: Path
@@ -203,6 +257,48 @@ class SessionPaths:
     @property
     def staging(self) -> Path:
         return self.root / "staging"
+
+    @property
+    def work(self) -> Path:
+        return self.root / "work"
+
+    @property
+    def sdk(self) -> Path:
+        return self.root / "sdk"
+
+    @property
+    def invocations(self) -> Path:
+        return self.root / "invocations"
+
+    @property
+    def downloads(self) -> Path:
+        return self.root / "downloads"
+
+    def invocation(self, invocation_id: str) -> Path:
+        """The per-invocation directory for *invocation_id*.
+
+        The id is checked against the shape this server issues, for the
+        reason :meth:`create` gives about the session id: a path element
+        assembled from an identifier is exactly where "it can only ever
+        be safe" stops being true after a refactor. Here it is more than
+        theory — the id reaches this function straight from a client
+        payload at ``get-artifact`` and ``cancel``.
+        """
+        if _INVOCATION_ID.fullmatch(invocation_id) is None:
+            raise ValueError(f"{invocation_id!r} is not an invocation id this server issues")
+        return self.invocations / invocation_id
+
+    def prepare_backend(self) -> None:
+        """Create the directories the container mounts, before it starts.
+
+        All of them, and before the container rather than with the first
+        invocation, because a bind-mount source that does not exist is
+        created **by docker, owned by root** — and the whole point of
+        running the program as this server's own user is that everything
+        it writes comes back readable.
+        """
+        for directory in (self.work, self.sdk, self.invocations, self.downloads):
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     @staticmethod
     def create(context_root: Path, session_id: str) -> SessionPaths:
@@ -596,6 +692,119 @@ def freeze_context(paths: SessionPaths, pins: ContextPins, *, context_yaml_sha25
     )
     _write_manifest(manifest, context / MANIFEST_FILE)
     return identity
+
+
+def recheck_locked_context(paths: SessionPaths, pins: ContextPins, *, expected_id: str) -> str:
+    """Re-measure a locked context before every working invocation.
+
+    Three duties in one pass, and none of them is the freeze repeated.
+
+    **The integrity list, re-measured.** Every file of the context is
+    re-hashed and compared against ``manifest.yaml``'s ``files``. A file
+    that is missing, one whose bytes hash to something else, and one
+    present but absent from the list are one outcome and one refusal
+    naming every offending path — which is the same trio contract §7.3
+    defines for ``verify``, checked here on the *backend's* side of the
+    boundary, where it does not depend on the container being honest.
+
+    **The pins, cross-checked.** §9.1 makes the backend compare
+    ``container.digest``, ``mcuhome.package.sha256`` and ``target.board``
+    "against the header the session was admitted on", and ADR 0018's
+    amendment states the duty normatively because ``verify_context``
+    cannot establish it: a self-consistently forged manifest verifies
+    clean. This server wrote the manifest itself, so what this catches
+    is a manifest that changed *after* it was written — which is exactly
+    the gap the duty names.
+
+    **The identity, recomputed.** Attribution always uses the id this
+    server computed itself; the one recomputed here is compared against
+    the one the lock answered, so an invocation is never attributed to
+    an id the client was never told.
+
+    Contexts are small — a model, a key, a few patches — so this runs
+    before **every** working invocation rather than once at the lock.
+    That is the product owner's decision and it is the cheap half of a
+    guarantee whose expensive half (the container's own ``verify``) is
+    optional for callers.
+
+    Returns the recomputed id, so a caller never has two values to keep
+    in step.
+    """
+    context = paths.context
+    manifest_path = context / MANIFEST_FILE
+    recorded = _read_manifest(manifest_path)
+    offending = _pin_disagreements(recorded, pins)
+
+    listed = {entry.path: entry.sha256 for entry in recorded.files}
+    measured = {entry.path: entry.sha256 for entry in collect_context_files(context)}
+    offending += sorted(
+        path for path in set(listed) | set(measured) if listed.get(path) != measured.get(path)
+    )
+    if offending:
+        raise SessionError(
+            "context.integrity-mismatch",
+            "The locked context no longer matches the manifest this server wrote for it. "
+            "A file is missing, a file's bytes changed, a file appeared that the integrity "
+            "list does not carry, or a pin was rewritten — the context id is computed over "
+            "all of them, so the invocation is refused rather than attributed to an "
+            "identity nobody agreed on.",
+            paths=offending,
+            context_id=expected_id,
+        )
+
+    identity = recorded.compute_id()
+    if identity != expected_id:
+        raise SessionError(
+            "context.integrity-mismatch",
+            "The context id recomputed from the manifest is not the id this session "
+            "answered at lock-context. Attribution always uses the id this server computed "
+            "itself, so an invocation whose identity moved underneath it is refused.",
+            paths=[MANIFEST_FILE],
+            context_id=expected_id,
+            computed=identity,
+        )
+    return identity
+
+
+def _read_manifest(path: Path) -> ContextManifest:
+    """``manifest.yaml`` back as an object, or the integrity refusal.
+
+    This server wrote the file, so a document that will not parse is not
+    a client's mistake — it is a manifest that changed on disk, which is
+    the same news the hash comparison carries and gets the same code.
+    """
+    yaml = YAML(typ="safe", pure=True)
+    try:
+        data = yaml.load(path.read_text(encoding="utf-8"))
+        return ContextManifest.from_dict(data)
+    except (OSError, YAMLError, UnicodeDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise SessionError(
+            "context.integrity-mismatch",
+            f"The manifest this server wrote at lock-context cannot be read back ({exc}). "
+            "It carries the integrity list every working action is measured against, so "
+            "there is nothing left to measure.",
+            paths=[MANIFEST_FILE],
+        ) from exc
+
+
+def _pin_disagreements(recorded: ContextManifest, pins: ContextPins) -> list[str]:
+    """Which of the three pins moved since ``send-context`` accepted them.
+
+    Named as pseudo-paths (``container.digest`` and friends) so that one
+    ``paths`` list in the refusal can carry both kinds of disagreement.
+    A client fixing either does the same thing — send the context again
+    — and splitting the answer in two would only make it guess which
+    half it got.
+    """
+    return [
+        name
+        for name, expected, found in (
+            ("container.digest", pins.container.digest, recorded.container.digest),
+            ("mcuhome.package.sha256", pins.sdk.sha256, recorded.sdk.sha256),
+            ("target.board", pins.board, recorded.board),
+        )
+        if expected != found
+    ]
 
 
 def _write_manifest(manifest: ContextManifest, path: Path) -> None:

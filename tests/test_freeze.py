@@ -298,9 +298,12 @@ async def test_the_lock_is_one_way_and_unlocks_the_working_commands(client) -> N
 
     After the lock every writing command is refused — a second
     ``lock-context`` as much as another patch — and ``verify`` and
-    ``build`` stop answering ``context.not-locked`` and start answering
-    for their own missing backend. Reaching the second answer is what
-    proves the gate opened rather than merely stopped complaining.
+    ``build`` stop answering ``context.not-locked``. What they answer
+    instead is now the *next* thing that is missing rather than a
+    missing backend: this session's SDK pin names a package no source
+    directory holds, so both reach ``sdk.unavailable``. Reaching a
+    refusal from inside the working path is what proves the gate opened
+    rather than merely stopped complaining.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
@@ -311,7 +314,7 @@ async def test_the_lock_is_one_way_and_unlocks_the_working_commands(client) -> N
             assert frame["error"]["code"] == "context.locked", verb
         for index, verb in enumerate(("verify", "build")):
             frame = await call(ws, verb, {"session_id": session_id}, frame_id=f"r{index}")
-            assert frame["error"]["code"] == "session.not-implemented", verb
+            assert frame["error"]["code"] == "sdk.unavailable", verb
 
 
 # --------------------------------------------------------------------------

@@ -79,19 +79,69 @@ async def test_send_context_accepts_a_base_context_and_answers_its_pins(client) 
     assert body["pins"]["target"] == {"board": "nrf7002dk/nrf5340/cpuapp"}
 
 
-async def test_the_serving_container_is_not_answered_because_there_is_none(client) -> None:
+async def test_send_context_answers_the_serving_container(client) -> None:
     """ADR 0019's amendment gives ``send-context`` the container half of
     the discovery payload — the serving build container's contract
-    version and its command set. This server drives no container, so it
-    names none: an empty placeholder would be a claim, and the whole
-    reason that half moved here is that ``open-session`` could not
-    answer it truthfully.
+    version and its command set — because only the context determines
+    it: the digest arrives with the pins, and ``open-session`` therefore
+    cannot answer it truthfully.
+
+    Every value in the answer comes from ``describe`` rather than from
+    the image labels. ``describe`` is authoritative about what a program
+    can do; the labels are a pre-start hint the backend cross-checks
+    against it and must not rely on where the two disagree.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         frame = await send_archive(ws, "send-context", session_id, base_context())
 
-    assert set(frame["payload"]) == {"session_id", "context", "pins"}
+    assert set(frame["payload"]) == {"session_id", "context", "pins", "container"}
+    serving = frame["payload"]["container"]
+    assert serving["digest"] == "sha256:" + "b" * 64
+    assert serving["contract"] == 1
+    assert serving["program"] == "org.mcuhome.build-container"
+    assert serving["actions"] == ["describe", "verify", "build"]
+
+
+async def test_a_context_pinning_an_image_this_host_has_not_is_refused(client, docker) -> None:
+    """``version.builder-unavailable``, at the moment the pins arrive.
+
+    The digest is resolved against this host's **local** image inventory
+    and nothing is pulled, so an image that is not here is a final
+    answer rather than a fetch this server declined to make. Refusing at
+    ``send-context`` is the useful moment: the client can open a new
+    session against an image this server has, without having paid for a
+    lock — and the context is discarded, so nothing of it is left in a
+    session that could never have built it.
+    """
+    docker.images.clear()
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        frame = await send_archive(ws, "send-context", session_id, base_context())
+
+    error = frame["error"]
+    assert error["code"] == "version.builder-unavailable"
+    assert error["retryable"] is False
+    assert error["details"]["digest"] == "sha256:" + "b" * 64
+
+
+async def test_a_container_runtime_that_is_down_is_retryable(client, docker) -> None:
+    """``builder.runtime-unavailable`` — and it is the retryable one.
+
+    Nothing about the context is wrong, the session is untouched, and
+    the same command works once the daemon is up. That is exactly what
+    ``retryable: true`` promises, and it is why a missing *image* does
+    not share the code: an image that is not on this host will not
+    appear on its own.
+    """
+    docker.version_status = 1
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        frame = await send_archive(ws, "send-context", session_id, base_context())
+
+    error = frame["error"]
+    assert error["code"] == "builder.runtime-unavailable"
+    assert error["retryable"] is True
 
 
 async def test_the_context_lands_in_a_directory_the_server_owns(client, state) -> None:
@@ -1618,6 +1668,38 @@ def test_the_context_root_is_created_private_and_level_by_level(tmp_path: Path) 
         os_module.umask(previous)
     for level in (root, root.parent, root.parent.parent):
         assert level.stat().st_mode & 0o077 == 0, level
+
+
+def test_a_relative_context_root_is_refused_at_startup(tmp_path: Path, monkeypatch) -> None:
+    """Contract §5.2 rule 4: "a path value that is not absolute ⇒
+    ``unsupported.request``".
+
+    Every path in an invocation's request document descends from the
+    context root — ``out``, ``work``, ``tmp``, ``context``, ``result``,
+    ``events``, ``cancel`` — so a relative root produces a document
+    every conforming program has to refuse, and the same string is a
+    ``--volume`` source, where docker reads a name without a slash as a
+    *named volume* and hands the program an empty directory instead of
+    the context. Refused rather than quietly resolved: ``resolve()``
+    would pick whatever the server's working directory happened to be,
+    which is not a location an operator chose.
+
+    A startup refusal because it is an operator's mistake about a path,
+    and every session would make it again.
+    """
+    from mcuhome_buildserver.config import load_config
+    from mcuhome_buildserver.contextstore import UnsafeContextRoot, prepare_context_root
+
+    # Chdir first: without the refusal the relative name resolves against
+    # the working directory, and the point of the refusal is that nobody
+    # chose that directory.
+    monkeypatch.chdir(tmp_path)
+    configured = load_config(["--context-root", "relative/sessions"], env={})
+    assert not configured.context_root.is_absolute()
+    with pytest.raises(UnsafeContextRoot) as refusal:
+        prepare_context_root(configured.context_root)
+    assert "absolute" in str(refusal.value)
+    assert not (tmp_path / "relative").exists(), "nothing was created for it either"
 
 
 def test_a_context_root_under_a_world_writable_directory_refuses_to_serve(tmp_path: Path) -> None:

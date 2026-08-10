@@ -121,9 +121,12 @@ async def test_capabilities_answers_the_negotiation_surface(client) -> None:
     assert body["protocol"]["version"] == sessions.SESSION_PROTOCOL_VERSION
     assert body["protocol"]["context_format"] == {"min": 1, "max": 1}
     assert set(body["protocol"]["profiles"]) == {"oneshot", "dev", "test"}
-    # Placeholder until the container backend exists — and an empty
-    # inventory is the truthful answer, not a missing key.
-    assert body["containers"] == []
+    # Real since the container backend landed: every local image
+    # carrying the org.mcuhome.contract label, with the tag, the digest
+    # and the labels ADR 0019 §2 asks for. Nothing here starts a
+    # container — describe costs one, and a client asking what this
+    # server has is not yet asking any image to prove it.
+    assert [entry["digest"] for entry in body["containers"]] == ["sha256:" + "b" * 64]
     # The config is the policy: nothing configured, everything denied.
     # Four layers, because build-container contract §1.1 defines four —
     # `mcuboot` is one because every device build is `west build
@@ -249,9 +252,11 @@ async def test_open_session_admits_with_id_lease_and_negotiation(client) -> None
     # contract version is send-context's answer, because at this point
     # the backend does not yet know which container serves the session.
     assert set(negotiated) == {"protocol_version", "context_format", "backend_profile"}
-    # `container` | `subprocess`, and null until this server has a
-    # backend it could truthfully name.
-    assert negotiated["backend_profile"] is None
+    # `container` | `subprocess` (contract §1.2), and it can only ever be
+    # the first here: a subprocess-profile backend "serves exactly one
+    # build environment — the one it runs in", and this process is an
+    # orchestrator that is never itself a build environment.
+    assert negotiated["backend_profile"] == "container"
 
 
 async def test_a_protocol_version_mismatch_is_rejected_at_the_door(client) -> None:
@@ -354,25 +359,27 @@ def _admit(manager: sessions.SessionManager | None = None) -> sessions.Session:
     )
 
 
-async def test_the_stubbed_verbs_answer_typed_not_implemented(client) -> None:
-    """The one verb a fresh session's state machine lets through.
+async def test_no_verb_answers_not_implemented_any_more(client) -> None:
+    """The container backend was the last stub, and it landed.
 
-    The list is this short because everything else is either real or
-    gated. ``send-context`` and ``extend-context`` are the context path
-    and answer for themselves; ``lock-context`` needs a base context,
-    ``verify`` and ``build`` need a locked one, so from a fresh session
-    they answer a state-machine refusal instead — which is the better
-    answer, because it names what the client has to do next. ``cancel``
-    needs an invocation id and is exercised with one below. What is left
-    is ``get-artifact``, whose backend is the container backend.
+    Every verb now answers for itself: the context path, the freeze, the
+    two working commands, the download and the two reconnection verbs.
+    ``session.not-implemented`` stays in the registry, because the
+    registry is append-only and a future verb will want it, and nothing
+    raises it — which is what this asserts, from the one verb that used
+    to.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await _open(ws)
-        frame = await call(ws, "get-artifact", {"session_id": session_id}, frame_id="g")
-        error = frame["error"]
-        assert error["code"] == "session.not-implemented"
-        assert error["retryable"] is False
-        assert error["details"]["verb"] == "get-artifact"
+        frame = await call(
+            ws,
+            "get-artifact",
+            {"session_id": session_id, "invocation_id": "inv-1"},
+            frame_id="g",
+        )
+        # An invocation this session never ran, not a missing backend.
+        assert frame["error"]["code"] == "invocation.unknown"
+    assert "session.not-implemented" in REGISTRY
 
 
 async def test_a_stub_still_requires_a_real_session(client) -> None:
@@ -565,18 +572,21 @@ async def test_the_lock_closes_the_context_to_every_writing_command(client, stat
 
 
 async def test_the_lock_unlocks_verify_and_build(client, state) -> None:
-    """Past the lock they stop being refused and start being stubs.
+    """Past the lock they stop being refused and start doing work.
 
-    ``session.not-implemented`` is the answer of a verb whose backend is
-    missing; ``context.not-locked`` is the answer of a verb that was
-    never allowed to run. Reaching the first proves the gate opened.
+    ``context.not-locked`` is the answer of a verb that was never
+    allowed to run. This session's ``context_state`` was moved by hand
+    and there is no directory behind it, so what the two reach instead
+    is ``context.missing`` — a refusal from *inside* the working path,
+    which is what proves the gate opened rather than merely stopped
+    complaining.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await _open(ws)
         state.sessions.require(session_id).context_state = sessions.CONTEXT_LOCKED
         for index, verb in enumerate(("verify", "build")):
             frame = await call(ws, verb, {"session_id": session_id}, frame_id=str(index))
-            assert frame["error"]["code"] == "session.not-implemented", verb
+            assert frame["error"]["code"] == "context.missing", verb
 
 
 async def test_attach_session_reports_the_context_state_in_any_of_them(client, state) -> None:
@@ -702,13 +712,18 @@ async def test_a_poisoned_session_refuses_work_and_keeps_its_exits(client, state
             frame = await call(ws, verb, {"session_id": session_id}, frame_id=f"p-{verb}")
             assert frame["error"]["code"] == "session.poisoned", verb
 
+        # The exit that matters most: `get-artifact` answers about the
+        # invocation rather than about the poison. This one declared
+        # nothing (it never ran), so the answer is `artifact.unknown`
+        # with the declared paths — not a refusal of the session.
         artifact = await call(
             ws,
             "get-artifact",
             {"session_id": session_id, "invocation_id": "inv-1", "path": "firmware.hex"},
             frame_id="g",
         )
-        assert artifact["error"]["code"] == "session.not-implemented"
+        assert artifact["error"]["code"] == "artifact.unknown"
+        assert artifact["error"]["details"]["declared"] == []
 
         cancelled = await call(
             ws, "cancel", {"session_id": session_id, "invocation_id": "inv-1"}, frame_id="c"

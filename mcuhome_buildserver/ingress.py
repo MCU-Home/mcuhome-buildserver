@@ -71,6 +71,7 @@ __all__ = [
     "patch_layer_of",
     "type_conflict",
     "unpack",
+    "unpack_tree",
 ]
 
 #: The whitelisted top-level directories, from the model's own constants
@@ -606,6 +607,110 @@ def unpack(
     reads one — and honouring it would let an archive ask for setuid
     bits on a file this server owns.
     """
+    return _extract(
+        archive,
+        into=into,
+        caps=caps,
+        ledger=ledger,
+        quota_bytes=quota_bytes,
+        layout=_ContextLayout(allowed_layers=allowed_layers, allow_context_file=allow_context_file),
+    )
+
+
+def unpack_tree(
+    archive: Path,
+    *,
+    into: Path,
+    caps: IngressCaps,
+    quota_bytes: int,
+) -> tuple[str, ...]:
+    """Safe extraction with **no layout whitelist** — the SDK package (E48).
+
+    The same extraction rule as :func:`unpack` and deliberately the same
+    code path: regular files and directories only; absolute paths, ``..``
+    after normalization, symlinks, hardlinks and device nodes rejected.
+    Build-container contract §9.1 states that rule once for "whatever
+    transport delivered" an input, and a second implementation of it in
+    this repository would be a second chance to get a symlink escape
+    wrong.
+
+    What is dropped is only the part that is about a *context*: the
+    ``context.yaml`` / ``model/`` / ``keys/`` / ``patches/<layer>/``
+    whitelist, and the patch policy that hangs off it. An SDK package is
+    a source tree with a shape this server has no business knowing, so
+    the layout check is what varies between the two callers and nothing
+    else is.
+
+    It takes no :class:`IngressLedger`, and that is a decision rather
+    than an omission: the ledger meters what a **client** spent of its
+    session's budget, and the SDK package is the operator's own file
+    fetched by this server. Charging a client's quota for it would let
+    the operator's package size decide whether a context fits.
+    """
+    return _extract(
+        archive,
+        into=into,
+        caps=caps,
+        ledger=IngressLedger(),
+        quota_bytes=quota_bytes,
+        layout=_AnyLayout(),
+    )
+
+
+class _Layout:
+    """Which paths an extraction target may hold. The one varying part."""
+
+    def file(self, path: str) -> None:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def directory(self, path: str) -> None:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class _ContextLayout(_Layout):
+    """ADR 0019 decision 8's whitelist, plus the patch policy on it."""
+
+    allowed_layers: frozenset[str]
+    allow_context_file: bool
+
+    def file(self, path: str) -> None:
+        # Shape before policy: `patches/0001.patch` names no layer at
+        # all, and answering "layer 0001.patch is denied" would tell the
+        # client to ask an operator for something that could never be
+        # allowed.
+        check_file_target(path, allow_context_file=self.allow_context_file)
+        layer = patch_layer_of(path)
+        if layer is not None:
+            check_patch_layer(layer, self.allowed_layers, where=path)
+
+    def directory(self, path: str) -> None:
+        _check_directory_target(path)
+        layer = _patch_layer_directory(path)
+        if layer is not None:
+            check_patch_layer(layer, self.allowed_layers, where=path)
+
+
+class _AnyLayout(_Layout):
+    """No whitelist: every safe path is a path this target may hold."""
+
+    def file(self, path: str) -> None:
+        return None
+
+    def directory(self, path: str) -> None:
+        return None
+
+
+def _extract(
+    archive: Path,
+    *,
+    into: Path,
+    caps: IngressCaps,
+    ledger: IngressLedger,
+    quota_bytes: int,
+    layout: _Layout,
+) -> tuple[str, ...]:
+    """The extraction rule itself, once, for both of its callers."""
     into.mkdir(parents=True, exist_ok=True)
     written: list[str] = []
     files: set[str] = set()
@@ -628,10 +733,7 @@ def unpack(
                 if depth > caps.path_depth:
                     raise _too_large("path depth", caps.path_depth, depth, entry=path)
                 if member.isdir():
-                    _check_directory_target(path)
-                    layer = _patch_layer_directory(path)
-                    if layer is not None:
-                        check_patch_layer(layer, allowed_layers, where=path)
+                    layout.directory(path)
                     _check_kinds(path, files=files, directories=directories, directory=True)
                     (into / path).mkdir(parents=True, exist_ok=True)
                     continue
@@ -643,14 +745,7 @@ def unpack(
                         "an archive is a way out of the directory it is unpacked into.",
                         entry=path,
                     )
-                # Shape before policy: `patches/0001.patch` names no layer
-                # at all, and answering "layer 0001.patch is denied" would
-                # tell the client to ask an operator for something that
-                # could never be allowed.
-                check_file_target(path, allow_context_file=allow_context_file)
-                layer = patch_layer_of(path)
-                if layer is not None:
-                    check_patch_layer(layer, allowed_layers, where=path)
+                layout.file(path)
                 if path in files:
                     raise _unreadable(f"it names {path!r} twice, so its content is ambiguous")
                 _check_kinds(path, files=files, directories=directories, directory=False)

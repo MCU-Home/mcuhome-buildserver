@@ -32,42 +32,38 @@ nothing else.
 > a bearer token on a plaintext connection is a token you have given
 > away.
 
-## Status: the context path is real; it still cannot build
+## Status: it builds
 
-What is real is the **protocol surface and the whole context path**: the
-transport, the bearer token, the frame envelope, session admission with
-version negotiation, the lease bookkeeping, the context state machine
-with its typed refusals, the per-layer patch policy, the typed error
-registry — and, since 2026-08-10, receiving a context, extending it and
-freezing it. A client can connect, negotiate, open a session, upload a
-base context as a `tar.zst`, add to it and remove from it, lock it, get
-the context ID back, and close the session.
+The whole protocol surface is real, and since 2026-08-10 so is the
+**container backend**. A client can connect, negotiate, open a session,
+upload a base context as a `tar.zst`, extend it, lock it, run `verify`
+and `build` in a per-session container, watch the invocation's events
+and raw log as they happen, download the artifacts as a `tar.zst`, and
+close the session — which reaps the container and deletes everything it
+held.
 
-What is not here is **the container backend** — the overlay patch views,
-invoking the build program, progress streaming, artifact retrieval and
-scheduling. Every verb that needs it answers a typed
-`session.not-implemented` instead of a guess, so a client sees a
-protocol that is honest about its state rather than one that almost
-works.
+No verb answers `session.not-implemented` any more. The code stays in
+the registry, because the registry is append-only and a future verb will
+want it.
 
-One stub is a **seam** rather than a bare refusal: **the cancellation
-signal** behind `cancel`. What it becomes is fixed by the container
-contract §8 — the backend creates the per-invocation cancel sentinel
-file, whose *existence* means "stop" — and there is no per-invocation
-directory to put one in until there is a backend. The bookkeeping around
-it is real.
+What a build costs before it starts: the image the context pins has to
+be **on this host** (this server resolves the digest against the local
+docker inventory and pulls nothing), and the SDK package the context
+pins has to be in a directory named by `--sdk-source`. Neither is
+fetched from the network — build-container contract §9.1 makes external
+inputs "the backend's to fetch and to hand over as paths", and ADR 0019
+§8 makes the url in a context a hint that is never followed.
 
-Two things the context path does that the documents require and this
-server cannot yet do, named here rather than left to be discovered:
-build-container contract §9.1 requires the backend to check
-`container.digest` against the image it **actually pulled** and
-`mcuhome.package.sha256` against the package bytes it **actually
-fetched**. This server pulls and fetches nothing, so it checks the
-*spelling* of both (§3.3.1, refused and never normalized) and defers the
-comparison to the backend that will have something to compare against.
-For the same reason no `version.builder-unavailable` is raised: the
-container inventory is an empty placeholder, and refusing every context
-against it would be a false refusal rather than a strict one.
+Three duties of §9.1 that used to be deferred are now discharged:
+`container.digest` is checked against the image actually resolved,
+`mcuhome.package.sha256` against the package bytes actually unpacked,
+and `target.board` against the pins the session was admitted on — the
+last one as part of a full re-measurement of the locked context that
+runs before **every** working invocation.
+
+What is deliberately not here: no image is pulled, no registry is
+configured, and no cache is ever offered writable. Each is a decision
+rather than a gap, and each is argued where it is implemented.
 
 The one-shot job protocol that used to live here — `submit_job`,
 `cancel_job`, `follow_job`, `download_artifacts`, `queue_status`, the
@@ -94,16 +90,50 @@ the command line wins. `--help` lists them all.
 | `--token`, `--token-file` | generated | the bearer token. There is no configuration without one |
 | `--pair-file` | `/share/mcuhome/build-server.token` | where the token is published for a same-host App pair (written only if the directory exists) |
 | `--allowed-origin` | none | accepted browser origin for the WebSocket upgrade (repeatable) |
-| `--allow-patch-layer` | none | allow build-context patches for a layer (`sdk`, `zephyr`, `chip`); repeatable; unlisted layers are denied |
+| `--allow-patch-layer` | none | allow build-context patches for a layer (`sdk`, `zephyr`, `chip`, `mcuboot`, or an `x-` name); repeatable; unlisted layers are denied |
+| `--sdk-source` | none | directory holding `mcuhome-sdk-<version>.tar.zst`; repeatable and searched in order. With none configured, every working action refuses `sdk.unavailable` |
+| `--docker` | `docker` | the container runtime to drive |
+| `--build-jobs` | `2` | `limits.jobs` for every invocation — authoritative, resolved host-side |
+| `--build-deadline-seconds` | `5400` | how long one invocation may run before this server stops it |
+| `--cancel-grace-seconds` | `60` | how long a cancelled invocation has to stop itself before the hard path |
+| `--max-artifact-bytes` | 256 MiB | egress cap: the size of one artifact this server will serve |
+| `--container-memory` | `8g` | `docker run --memory` for the session container; the empty string removes the ceiling |
+| `--container-pids` | `4096` | `docker run --pids-limit` for the session container |
+| `--container-cpus` | none | `docker run --cpus` for the session container |
+| `--ccache-dir` | none | shared compiler cache, offered to every invocation **read-only** |
 | `--log-level` | `INFO` | logging verbosity |
 
+`--build-jobs` is authoritative and is resolved here on purpose: "the
+container sees the host CPU count but not the RAM budget" (contract
+§5.2), so a program that fell back to `nproc` would run several
+concurrent sessions at full width and be killed for it. The default is
+2 because a Matter build's ceiling is memory rather than cores.
+
+The three `--container-*` limits are the enforcement half of the same
+sentence. §1.2's `container` row promises "per-session resource limits"
+and §9.1 makes them the backend's to set, and they go on the `run` that
+creates the container rather than on the `exec` that uses it — an exec
+limit bounds one process tree, and the promise is about the session.
+`--container-memory` is also what makes the request document's silence
+about `limits.memory_bytes` honest: the value is advisory to the
+program, the runtime enforces the real one, so the document does not
+state a number nothing behind it keeps. `--container-cpus` is unset by
+default because `--build-jobs` already bounds the parallelism a
+conforming program asks for.
+
+There is no writable-cache option and there will not be one. §10:
+"shared backends MUST offer a shared cache read-only for untrusted
+work; cache warming is a deliberate operator invocation with a writable
+cache and trusted contexts only" — which is a verb this server does not
+have, and an option that made an untrusted build's cache writable would
+be the one setting that turns a shared cache into a shared attack
+surface.
+
 The per-server limits that ADR 0019 names for v1.0 — maximum concurrent
-sessions, session TTL, idle timeout, disk budget and the compile-lane
-limit — are **not configurable yet**. Three of them exist as defaults on
-`SessionManager` (`sessions.py`) with no option in front of them; the
-other two have nothing to limit until the container backend exists. They
-belong to that work, not to this configuration surface, and inventing
-options for them now would advertise knobs that do nothing.
+sessions, session TTL, idle timeout and the compile-lane limit — are
+**not configurable yet**: they exist as defaults on `SessionManager`
+(`sessions.py`) with no option in front of them. Inventing options for
+them now would advertise knobs that do nothing.
 
 ## The API
 
@@ -140,17 +170,17 @@ verbs, the complete set of dashboard ADR 0012 decision 3.
 
 | Verb | Payload | Today |
 |---|---|---|
-| `capabilities` | `{}` | **answers**: protocol version, build-container inventory (empty until the backend exists), per-layer patch policy from configuration, session quota |
-| `open-session` | `{"profile", "protocol_version", "context_format"}` | **answers**: admission — session id, lease, negotiated versions, backend profile. A version mismatch is a typed rejection at the door |
-| `send-context` | `{"session_id", "archive": {"size", "sha256"}}` + BINARY frames | **answers**: the pins accepted and the context state. `context.exists` on a second base context, `context.locked` after the lock |
+| `capabilities` | `{}` | **answers**: protocol version, the local build-container inventory (reference, digest and the three §2.1 labels), per-layer patch policy from configuration, session quota |
+| `open-session` | `{"profile", "protocol_version", "context_format"}` | **answers**: admission — session id, lease, negotiated versions, backend profile (`container`). A version mismatch is a typed rejection at the door |
+| `send-context` | `{"session_id", "archive": {"size", "sha256"}}` + BINARY frames | **answers**: the pins accepted, the context state and **the serving build container** — its digest, contract version, program id and command set, all out of `describe`. `version.builder-unavailable` if this host has no such image, `context.exists` on a second base context |
 | `extend-context` | `{"session_id", "archive"?, "remove"?}` + BINARY frames | **answers**: the context state, the file count and how many named paths were removed. `context.pins-immutable` for `context.yaml`, `context.missing` with no base context, `context.locked` after the lock |
 | `lock-context` | `{"session_id"}` | **answers**: `{"context_id"}` and nothing else. `context.missing` with no base context, `context.locked` on a second lock |
-| `verify` | `{"session_id"}` | `context.not-locked` before the lock; typed `session.not-implemented` after it |
-| `build` | `{"session_id", "mode"}` | `context.not-locked` before the lock; typed `session.not-implemented` after it |
-| `cancel` | `{"session_id", "invocation_id"}` | **answers**: the stop signal is set (never "it stopped"); `already_finished` for a completed invocation, `invocation.unknown` for one this session never ran. The session, its lease and its context are untouched |
-| `get-artifact` | `{"session_id", "invocation_id", "path"}` | typed `session.not-implemented` |
-| `attach-session` | `{"session_id"}` | **answers**: the session record with its context state, and the lease (event replay is future work) |
-| `close-session` | `{"session_id"}` | **answers**: the closed session record |
+| `verify` | `{"session_id"}` | **answers immediately**: `{"invocation_id", "action", "context_id"}`. The outcome arrives as an `invocation.finished` event. `context.not-locked` before the lock |
+| `build` | `{"session_id", "mode"?}` | the same, with `mode` ∈ `clean` (default) \| `incremental`. `context.not-locked` before the lock |
+| `cancel` | `{"session_id", "invocation_id"}` | **answers**: the stop signal is set (never "it stopped") — it creates the cancel sentinel the request document named; `already_finished` for a completed invocation, `invocation.unknown` for one this session never ran. The session, its lease and its context are untouched |
+| `get-artifact` | `{"session_id", "invocation_id", "path"?}` | **answers**: an announcement (`{"archive": {"size", "sha256"}, "artifacts": […]}`) followed by the `tar.zst` as BINARY frames. One download at a time per connection, because a BINARY frame carries no id. `artifact.unknown` for a path the invocation did not declare, `invocation.unknown` for an id it never ran, `artifact.integrity-mismatch` for a declared artifact that is no longer the file §9.3 verified |
+| `attach-session` | `{"session_id", "invocation_id"?, "from_seq"?}` | **answers**: the session record with its context state, the lease and how many events were replayed. The connection re-joins the session's live stream; named an invocation, its events are replayed from `from_seq` **before** the answer |
+| `close-session` | `{"session_id"}` | **answers**: the closed session record. Running invocations get the stop signal, the directory is deleted and the container is removed |
 
 An unknown verb is answered with `version.verb-unknown`, whose details
 name the verbs this server does have.
@@ -259,6 +289,190 @@ therefore happens **on the client**: the workbench computes the ID from
 the bytes it sent and closes the session on a disagreement. This server
 never sees the client's value, so it can never raise that mismatch.
 
+### One invocation, end to end
+
+`verify` and `build` are the two working actions, and both take the same
+path. It is worth reading once, because every step of it is a duty
+somebody wrote down.
+
+1. **The state machine.** The session must not be poisoned and its
+   context must be locked, or the verb refuses before doing anything.
+2. **The context is re-measured.** Every file is re-hashed against the
+   `files` list in the `manifest.yaml` this server wrote, and the three
+   pins in that manifest are compared against the ones `send-context`
+   accepted. A disagreement is `context.integrity-mismatch` naming every
+   offending path, and it does **not** poison the session: nothing was
+   applied to any tree. Contexts are small, so this runs before every
+   invocation rather than once at the lock.
+3. **The container, lazily.** On the first working command of a session:
+   the image is resolved by digest, `describe` is asked (once per image
+   digest per server start, then cached) and cross-checked against the
+   §2.1 labels, the SDK package is found by `(version, sha256)` and
+   unpacked into the session's own directory, the mounts are composed
+   and one container is started. One session is one container is the
+   trust boundary.
+4. **The per-invocation directory.** `invocations/inv-N/` with an empty
+   `out`, an empty `tmp`, an empty `events.ndjson` and the request
+   document written atomically — outside the context, which is what lets
+   the context be a kernel-enforced read-only mount.
+5. **The invocation.** `docker exec … /mcuhome/run <action> <request>`:
+   exactly two positional operands, never a flag, an argv that is frozen
+   and never grows.
+6. **The answer, immediately.** `{"invocation_id"}`. A build is minutes
+   to hours, and a command frame that waited for it would make every
+   client's socket a build timer.
+7. **The streams.** The program's events are relayed from the NDJSON
+   file as it appends to them; its merged stdout and stderr travel as
+   `log` frames with their own counter.
+8. **The verdict.** The result document is read **if it exists,
+   regardless of the exit code**, and the invocation is successful
+   exactly when all seven conditions of contract §5.3 hold — including
+   that every declared artifact exists as a regular file under its
+   declared root, re-hashes to its declared value, and that the context
+   id the program computed matches the one this server computed. A
+   contradiction between exit code and document is answered
+   pessimistically **and** raises a contract violation against the
+   image, which travels to the client.
+9. **`invocation.finished`**, carrying the status, the artifact list and,
+   on a failure, the session protocol's own error envelope.
+
+The invocation is owned by this server and not by the connection that
+started it, which is the mechanical half of "connection loss is not
+abandonment": a client may drop its socket, and the build keeps going,
+keeps writing its events file, and finishes into a record a reattaching
+client can still read.
+
+**Liveness** is a ladder, and the sentinel is its first rung because it
+is the only one that lets the program write a result document. A cancel
+or a passed deadline creates the sentinel; `--cancel-grace-seconds`
+later the `docker exec` client gets SIGTERM; ten seconds after that,
+SIGKILL. It is worth saying plainly that SIGTERM does not reach the
+process inside the container — killing a `docker exec` client never has,
+which is exactly why the contract has a cooperative sentinel at all.
+What actually reaps a program that ignored both is the container going
+away at `close-session`.
+
+**Patched layers cost nothing to make writable.** In the `container`
+profile the container's own copy-on-write layer **is** the writable view
+§6.2 asks for: the image's trees are writable inside the container by
+construction, one session is one container, and the container is
+discarded at `close-session` — so a patched `zephyr` cannot outlive the
+session that patched it. This server asserts `writable: true` for an
+in-image tree at the path `describe` reported and mounts nothing for it.
+There is no overlay, no copy and no `docker cp` anywhere in this server.
+The one tree that *is* a mount is the SDK, and a patched one is handed
+over writable because it was unpacked per session and dies with it.
+
+**The container sees the request document's paths and nothing else.**
+The session tree is mounted piece by piece rather than as one writable
+root with read-only holes carved out of it, because a hole is only as
+good as the order the mounts are given in — and because the SDK, which
+lives under the session root and is mounted at the path `describe`
+asks for, was writable under its other name for exactly that reason.
+Container path equals host path throughout, which is what makes a
+stalled build inspectable from the host.
+
+| Host path | In the container | Mode |
+|---|---|---|
+| `<session>/context` | same | read-only |
+| `<session>/work` | same | writable |
+| `<session>/invocations` | same | writable |
+| `<session>/sdk` | `trees.sdk.path` (`describe`'s, else the host path) | read-only, writable if the `sdk` layer is patched |
+| `<ccache>/<program.id>` | same | read-only, and only when `--ccache-dir` is set |
+
+`invocations/` rather than one mount per invocation because bind mounts
+are fixed when a container is created and an invocation directory does
+not exist yet; the parent is the mount, so every `out`, `tmp`, request
+and result created in it later is inside it. What is deliberately *not*
+in the table: the upload spool, `staging/`, and `downloads/`, where
+`get-artifact` builds the archive it is about to stream.
+
+### Events, logs and replay
+
+Three kinds of unprompted frame, and they are different kinds because
+the contract makes them different things.
+
+```jsonc
+// a program event, relayed verbatim with this server's addressing added
+{"type": "event", "event": "build.image.started",
+ "payload": {"event": "build.image.started", "seq": 4, "image": "mcuboot",
+             "current": 1, "total": 2,
+             "session_id": "s-…", "invocation_id": "inv-1"}}
+// one line of the raw log, with its own counter
+{"type": "log", "payload": {"session_id": "s-…", "invocation_id": "inv-1",
+                            "seq": 812, "line": "-- west build"}}
+// this server's verdict on the invocation
+{"type": "event", "event": "invocation.finished",
+ "payload": {"session_id": "s-…", "invocation_id": "inv-1", "action": "build",
+             "status": "success", "context": "sha256:…",
+             "artifacts": [{"root": "out", "path": "firmware.hex",
+                            "role": "firmware", "sha256": "…"}],
+             "error": null}}
+```
+
+**Unknown event names are relayed opaquely** — verbatim, with their
+fields intact, never dropped and never rewritten — which is what lets a
+third-party program report its own phases under `x-` names through a
+server that has never heard of them. Lines over 8192 bytes and lines
+that are not JSON objects are discarded and counted, never treated as an
+abort.
+
+`invocation.finished` is both a registry event the *program* emits
+("once, immediately before the result document is written") and the name
+E46 gives this server's own completion frame. Both reach the client,
+because a relayed event is never dropped, and **`seq` is what tells them
+apart**: contract §8 makes every program event carry a monotonic `seq`
+and this server never invents one, so a frame of that name carrying
+`seq` is the program's announcement and one without it is the verdict.
+Only the verdict carries `artifacts`, `context` and `error`.
+
+The events file stays on disk for the life of the session and **is** the
+replay buffer. `attach-session` with an `invocation_id` and a `from_seq`
+reads it back; there is no in-memory ring, so there is nothing a long
+reconnect can find already evicted. The raw log is not replayable — it
+is a raw opaque stream consumers must not parse for machine decisions,
+and its counter is what tells a client it missed lines.
+
+### Downloading artifacts
+
+`get-artifact` is the mirror of the upload, and the bytes are a
+`tar.zst` in both directions:
+
+```jsonc
+→ {"id": "9", "type": "get-artifact", "payload": {
+     "session_id": "s-…", "invocation_id": "inv-1", "path": "firmware.hex"}}
+← {"id": "9", "type": "result", "payload": {
+     "session_id": "s-…", "invocation_id": "inv-1",
+     "archive": {"size": 8213, "sha256": "<64 lowercase hex digits>"},
+     "artifacts": [{"root": "out", "path": "firmware.hex",
+                    "role": "firmware", "sha256": "…"}]}}
+← <binary frame> <binary frame> …                     // the tar.zst itself
+```
+
+With a `path` the archive holds exactly that declared artifact, without
+one it holds all of them under their declared paths. The announced hash
+is the **archive's**, computed at egress while the bytes are read off
+disk; per-file integrity stays the client's own check against the result
+payload it already holds. There is no acknowledgement frame after the
+bytes, for the reason the upload needs one and this does not: the
+receiving side is the client, and it knows the transfer is complete when
+it has taken the announced number of bytes.
+
+What is served is the **intersection of declared and verified**
+(contract §9.3). After every invocation `out` is enumerated without
+following symlinks; symlinks, hardlinks, devices, FIFOs and sockets are
+refused; every declared path is normalized and strictly contained under
+its named root, with an unknown root skipped rather than resolved; every
+artifact is re-hashed from the bytes on disk against the one legal
+spelling of §3.3.1; and a size cap is applied from those bytes, because
+an artifact entry declares no size. Files that were not declared are not
+served — and not deleted either: they are diagnostic material.
+
+Artifacts live only inside the session. The per-session directory is
+deleted at `close-session`, so download happens after the build and
+before closing; there is no grace period, because the directory holds a
+device's commissioning credentials.
+
 ### The hardening floor
 
 ADR 0019 decision 8, and it is identity-independent: single-tenancy
@@ -337,7 +551,8 @@ Session-protocol errors use a **fixed envelope** in the error frame:
 
 Codes come from the append-only registry in
 `mcuhome_buildserver/errors.py` (`policy.*`, `session.*`, `context.*`,
-`version.*`, `builder.*`; `x-*` is reserved for third parties). A code,
+`version.*`, `builder.*`, `invocation.*`, `sdk.*`, `artifact.*`; `x-*`
+is reserved for third parties). A code,
 once released, is never renamed, removed or re-classified; clients treat
 unknown codes as non-retryable-fatal and surface the message.
 Append-only starts at the first *published* entry, and nothing here is
@@ -351,15 +566,32 @@ Patch policy is configuration (`--allow-patch-layer`, deny by default):
 the server's patch configuration **is** the policy, and `capabilities`
 advertises it per layer so a client fails fast instead of mid-session.
 
+**A build container's own failures reach this envelope through one
+explicit table.** The contract deliberately does not freeze that mapping
+— its `reason` values classify *invocations*, while this envelope
+classifies *protocol operations* — so `errors.REASON_CODES` is this
+server's answer and no document's. Three properties hold across every
+row. `retryable` is never taken from the program: `error.retryable` is
+"the program's promise about its own failure", and relaying it would let
+a container forge the server's own value, so it travels in the details
+as information instead. The `reason` itself always travels verbatim,
+so a client that wants a finer distinction than the code has it. And an
+unmapped reason — an `x-` one from a third-party image, or one added to
+the registry after the table was written — is handled as its status
+class, which is `builder.failed`.
+
 ### Backpressure
 
 A client that stops reading must not apply backpressure through the log
 reader and from there into a compiler, so a full outbox drops its
-**oldest** frame. What makes that safe is that a progress stream carries
-resumable offsets: a client whose offsets jump asks for the gap instead
-of displaying a log with a silent hole in it. The stream this applies to
-lands with the container backend; the outbox that will carry it is
-already here.
+**oldest** frame. Program events and log lines go out that way, and both
+survive it: the log carries a counter that makes a gap visible, and the
+events file on disk is the replay buffer, so `attach-session` can fetch
+the gap. Two frames deliberately do **not** drop. `invocation.finished`
+is the one frame a client is waiting on and there is no second way to
+learn it, and a download's BINARY frames would not degrade under a drop
+— they would corrupt, and the client would find out from a hash that
+does not match at the end of a transfer it already paid for.
 
 ### REST
 
@@ -376,18 +608,40 @@ truthfully. What this server can build is a question for the
 
 ## What is on disk
 
-**Nothing yet.** Sessions are in-memory on purpose: a session is bound
-to one build environment on this machine, so unlike a job record it has
-nothing worth surviving a restart — a restarted server has no
-containers, and leases guarantee clients find out through typed
-`session.unknown` answers rather than hangs.
+One directory per session, under `--context-root`, named by session id
+and created `0o700`:
 
-Per-session directories arrive with the container backend, and ADR 0019
-already fixes their lifetime: **the context and every artifact in it are
-deleted at `close-session`.** Artifact download therefore happens inside
-the session, after the build and before closing. There is no grace
-period, because the directory it would keep alive holds a device's
-commissioning credentials.
+```
+<context-root>/s-<id>/
+  context/                 the context, and manifest.yaml written at the lock
+  work/                    the session's persistent working area (contract §4)
+  sdk/                     the SDK package, unpacked for this session
+  invocations/inv-N/       out/  tmp/  request.json  result.json
+                           events.ndjson  cancel
+  downloads/               a get-artifact archive, while it is being streamed
+  staging/  upload.tar     an extension in flight
+```
+
+ADR 0019 §2 spells the per-invocation area `/out/<invocation-id>/`. That
+is superseded prose rather than a layout to mimic: `out` is one of five
+things an invocation needs a directory for, and the contract that came
+after names all five.
+
+**Everything under it is deleted at `close-session`**, at lease or idle
+expiry, on any refused upload, and when the server shuts down — and the
+session's container is removed with it, because the directory *is* the
+container's mounts. Artifact download therefore happens inside the
+session, after the build and before closing. There is no grace period,
+because the directory holds a device's commissioning credentials.
+
+Sessions themselves are in-memory on purpose: a session is bound to one
+container on this machine, so unlike a job record it has nothing worth
+surviving a restart — a restarted server has no containers, and leases
+guarantee clients find out through typed `session.unknown` answers
+rather than hangs. A server that is *killed outright* leaves containers
+behind, which is what the `org.mcuhome.build-server.session` label on
+each of them is for; there is deliberately no startup sweep, for the
+same reason the context root is not swept at startup.
 
 ## Deployment
 
@@ -450,13 +704,21 @@ Packaging lives in the future packaging repo, not here. What this
 package expects of it: `/share` mounted so the token can be published
 for the dashboard App to find, and a build environment it can drive —
 which in an App is the `subprocess` profile of the container contract,
-since an App has no container runtime of its own.
+since an App has no container runtime of its own. **This server does not
+implement that profile**: it is a `container`-profile backend and says
+so at `open-session`. A `subprocess`-profile backend "serves exactly one
+build environment — the one it runs in", which is a different program
+from this one.
 
 ### Standalone and self-hosted
 
 The primary target (ADR 0019): a machine an operator installs the
-service on and reaches over the transport above. Storage for
-per-session context and output arrives with the container backend.
+service on and reaches over the transport above. It needs a container
+runtime, at least one build-container image **already present** on the
+host (nothing is pulled), a directory of SDK packages named by
+`--sdk-source`, and room under `--context-root` for one session
+directory per concurrent session — the context, the SDK unpacked, the
+build's working area and its output.
 
 ## Development
 
@@ -465,10 +727,22 @@ pytest                       # the whole suite, no real build
 ruff check --fix . && ruff format .
 ```
 
-The suite never compiles anything, and nothing in it fakes a build
-environment either: this server is an orchestrator, so what is under
-test is the transport, the bearer token and the session protocol — all
-of which run without a toolchain anywhere near them.
+**The suite never starts a container and never compiles anything.**
+Docker is stubbed at the two impure functions of
+`mcuhome_buildserver/container.py`, by an **autouse** fixture: a test
+that forgot to ask for the stub would otherwise start a real container
+on the machine running the suite, which is the exact failure mode the
+reference implementation warns about. The fake is a *conforming
+program* by default — it answers `describe` with a complete `program`
+block, writes real files into `out`, declares them with the hashes they
+actually have and emits the events contract §8 seeds its registry with —
+so a test that does not care about the container never has to know what
+one looks like, and a test that wants a non-conforming one replaces a
+single attribute.
+
+What that leaves under test is exactly what a backend is: the argv it
+composes, the request documents it writes, what it makes of the result
+documents that come back, and what reaches the client while it happens.
 
 The frame envelope is kept from drifting apart from the dashboard's by
 `tests/test_protocol.py`, which compares this package's constants
@@ -488,3 +762,11 @@ install the sibling checkout's backend (`pip install -e
 | `errors.py` | the session protocol's error envelope and its append-only code registry |
 | `sessions.py` | session protocol v2: the session registry and one handler per verb |
 | `ws.py` | the `/ws` endpoint and the command loop |
+| `ingress.py` | the streaming ingress caps and safe extraction, for a context and for an SDK package |
+| `contextstore.py` | the per-session directory, `context.yaml`, the freeze, and the re-measurement before every invocation |
+| `backend.py` | the container backend: image discovery, the session's container, invocations, liveness and the streams |
+| `container.py` | docker, and the one seam every call to it goes through |
+| `abi.py` | the invocation ABI: the request document out, the result document back |
+| `events.py` | the invocation's NDJSON event stream: relay and replay |
+| `artifacts.py` | egress hardening, and the download archive |
+| `sdkstore.py` | the SDK package: found by its pin, verified by its hash, unpacked per session |

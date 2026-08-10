@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from aiohttp import web
 
 from mcuhome_buildserver import __version__, sessions, ws
+from mcuhome_buildserver.backend import ContainerBackend
 from mcuhome_buildserver.config import Config
 from mcuhome_buildserver.contextstore import prepare_context_root
 from mcuhome_buildserver.security import STATE_KEY, auth_middleware
@@ -61,9 +62,15 @@ class ServerState:
     connections: set[ws.Connection] = field(default_factory=set)
     started_at: float = field(default_factory=time.monotonic)
     sessions: sessions.SessionManager = field(init=False)
+    #: The container backend: image discovery, the session's container,
+    #: invocations and their streams. One per process, because the
+    #: ``describe`` cache and the container registry are properties of
+    #: the host rather than of a session.
+    backend: ContainerBackend = field(init=False)
 
     def __post_init__(self) -> None:
         self.sessions = sessions.SessionManager()
+        self.backend = ContainerBackend(self.config)
 
 
 async def health(request: web.Request) -> web.Response:
@@ -107,6 +114,12 @@ async def _reap_loop(state: ServerState) -> None:
         await asyncio.sleep(sessions.DEFAULT_REAP_INTERVAL)
         try:
             reaped = state.sessions.reap()
+            # The container goes with the directory, and for the same
+            # reason: the directory *is* the container's mounts, so a
+            # container left running against a deleted mount source is
+            # the one state neither half can recover from.
+            for session_id in reaped:
+                await state.backend.release(session_id)
         except Exception:  # pragma: no cover - defensive; a sweep is a dict walk
             logger.exception("the session reaper failed a sweep")
         else:
@@ -131,7 +144,14 @@ async def _stop_reaper(app: web.Application) -> None:
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
-    app[STATE_KEY].sessions.shutdown()
+    state = app[STATE_KEY]
+    state.sessions.shutdown()
+    # And the containers those sessions were running in. A process that
+    # is killed outright still leaves them, which is what the
+    # ``org.mcuhome.build-server.session`` label on each is for — there
+    # is deliberately no startup sweep, for the reason
+    # ``SessionManager.shutdown`` gives about the context root.
+    await state.backend.release_all()
 
 
 def create_app(state: ServerState) -> web.Application:

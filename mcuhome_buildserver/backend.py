@@ -71,7 +71,8 @@ from mcuhome_buildserver.abi import Artifact, TreeEntry
 from mcuhome_buildserver.config import Config
 from mcuhome_buildserver.contextstore import ContextPins, SessionPaths, derive_patch_layers
 from mcuhome_buildserver.errors import SessionError
-from mcuhome_buildserver.ingress import IngressCaps
+
+_LOGGER = logging.getLogger(__name__)
 
 __all__ = [
     "ACTION_BUILD",
@@ -363,6 +364,14 @@ class ContainerBackend:
         which reads back as "no result document was written" and
         disqualifies a perfectly good image.
         """
+        static = await self._read_static_description(facts)
+        if static is not None:
+            program = static
+            problem = _program_problem(program, facts)
+            if problem is not None:
+                raise _not_conforming(facts, problem)
+            return ImageProfile(facts=facts, program=program)
+
         probe = self.config.context_root / ".probe" / f"describe-{uuid.uuid4().hex}"
         probe.mkdir(mode=0o700, parents=True, exist_ok=False)
         request = probe / "request.json"
@@ -402,6 +411,39 @@ class ContainerBackend:
         if problem is not None:
             raise _not_conforming(facts, problem)
         return ImageProfile(facts=facts, program=program)
+
+    async def _read_static_description(self, facts: container.ImageFacts) -> dict[str, Any] | None:
+        """``/mcuhome/describe.json``, where the image carries one (§2.2.1).
+
+        The contract's answer to the chicken-and-egg the SDK split
+        creates: the program body arrives with a mounted tree, but where
+        that tree must be mounted is what discovery would have supplied —
+        so an image MAY ship its ``describe`` answer as a static file,
+        and this backend reads it in place of invoking ``describe``
+        pre-mount. §2.2.1 binds the file by §2.1's rule ("a disagreement
+        is a violation against the image"), and it is exactly a
+        ``describe`` result document, so it goes through the same §5.4
+        reading as a live answer.
+
+        ``None`` means "no file" — absent, unreadable, or not parseable
+        as a result document — and the caller then invokes ``describe``
+        exactly as it always did: "there is no new failure mode in
+        either direction, because the fallback is the thing that was
+        already mandatory."
+        """
+        completed = await self.docker.read_file(
+            image=facts.reference, path="/mcuhome/describe.json"
+        )
+        if completed is None:
+            return None
+        outcome = abi.read_static_describe(completed)
+        if outcome is None:
+            _LOGGER.warning(
+                "image %s carries an unreadable /mcuhome/describe.json; falling back "
+                "to invoking describe",
+                facts.reference,
+            )
+        return outcome
 
     # ----------------------------------------------------------------
     # The session's container
@@ -457,8 +499,13 @@ class ContainerBackend:
             sha256=pins.sdk.sha256,
             sources=self.config.sdk_sources,
             into=paths.sdk,
-            caps=IngressCaps.from_config(self.config),
-            max_bytes=self.config.max_decompressed_bytes,
+            # The operator's own material, not the client's upload — the
+            # SDK gets its own bounds (sdkstore.SDK_CAPS), because E44's
+            # numbers were argued for contexts and holding the operator's
+            # source tree to the client's budget shape makes the two
+            # knobs fight.
+            caps=sdkstore.SDK_CAPS,
+            max_bytes=sdkstore.SDK_MAX_BYTES,
         )
         trees, mounts = self._arrange_trees(profile, paths, package, patched)
         ccache, cache_mount = self._arrange_ccache(profile)

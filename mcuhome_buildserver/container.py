@@ -552,6 +552,24 @@ class Docker:
         )
         return await self._run(*argv[1:])
 
+    async def read_file(self, *, image: str, path: str) -> str | None:
+        """One file out of an image, without starting the program (§2.2.1).
+
+        A throwaway ``--rm`` run whose command is ``cat`` — the cheapest
+        read an image allows a backend that must not depend on the
+        program being invocable yet (the static self-description exists
+        for exactly the image whose program body arrives with a mount).
+        ``--network=none`` and no mounts: reading a file grants nothing.
+
+        ``None`` for every failure — image absent, file absent, runtime
+        down — because the caller's fallback is invoking ``describe``,
+        which was already mandatory and reports its own refusals.
+        """
+        completed = await self._run("run", "--rm", "--network=none", image, "cat", path)
+        if completed.status != 0:
+            return None
+        return completed.output
+
     async def remove(self, container: str) -> None:
         """Reap the container. Never raises.
 

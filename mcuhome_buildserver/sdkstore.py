@@ -55,6 +55,26 @@ from mcuhome.model.hashes import sha256_file
 from mcuhome_buildserver.errors import SessionError
 from mcuhome_buildserver.ingress import IngressCaps, unpack_tree
 
+#: The caps an SDK package is unpacked under. Deliberately NOT the
+#: client-facing session caps from the config: those size a *context*
+#: (model, keys, patches — kilobytes to a few megabytes), while an SDK
+#: package is the operator's own source tree, and holding the operator's
+#: material to the client's budget shape would make the two knobs fight
+#: (E44's numbers were argued for contexts, not for source trees). The
+#: numbers are generous bounds against a corrupt or malicious archive,
+#: not a policy anyone tunes — an operator who does not trust an SDK
+#: source should not list it.
+SDK_CAPS = IngressCaps(
+    compressed_bytes=256 * 1024 * 1024,
+    decompressed_bytes=1024 * 1024 * 1024,
+    entries=65536,
+    file_bytes=256 * 1024 * 1024,
+    path_depth=24,
+)
+
+#: The decompressed budget handed to the quota check, same argument.
+SDK_MAX_BYTES = 1024 * 1024 * 1024
+
 __all__ = ["SdkPackage", "acquire_sdk", "package_filename"]
 
 logger = logging.getLogger(__name__)

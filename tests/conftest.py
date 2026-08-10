@@ -214,6 +214,12 @@ class FakeDocker:
         self.images.setdefault(IMAGE_REFERENCE, inspected)
         self.images.setdefault(f"{IMAGE}:zephyr-4.4.0-r4", inspected)
         self.listed = self.listed or [f"{IMAGE}:zephyr-4.4.0-r4"]
+        #: §2.2.1's static self-description: the default fake image
+        #: carries none, so the backend exercises the invoke-describe
+        #: fallback most tests are about. A test of the static path sets
+        #: this to a describe result document (JSON text).
+        self.static_description: str | None = None
+        self.static_reads: list[str] = []
         if self.program is None:
             self.program = json.loads(json.dumps(PROGRAM))
         if self.run_program is None:
@@ -244,6 +250,14 @@ class FakeDocker:
             ]
             status = 0 if len(lines) == len(references) else 1
             return container.Completed(status=status, output="\n".join(lines))
+        if rest[:1] == ["run"] and rest[-2:-1] == ["cat"]:
+            # §2.2.1's static self-description read. The default fake
+            # image carries none, so the backend falls back to invoking
+            # describe — the path most tests exercise.
+            self.static_reads.append(rest[-1])
+            if self.static_description is None:
+                return container.Completed(status=1, output="")
+            return container.Completed(status=0, output=self.static_description)
         if rest[:1] == ["run"] and "--rm" in rest:
             return self._describe(rest)
         if rest[:1] == ["run"]:

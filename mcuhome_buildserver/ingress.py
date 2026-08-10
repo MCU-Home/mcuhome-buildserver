@@ -654,6 +654,7 @@ def unpack_tree(
         ledger=IngressLedger(),
         quota_bytes=quota_bytes,
         layout=_AnyLayout(),
+        preserve_exec=True,
     )
 
 
@@ -709,6 +710,7 @@ def _extract(
     ledger: IngressLedger,
     quota_bytes: int,
     layout: _Layout,
+    preserve_exec: bool = False,
 ) -> tuple[str, ...]:
     """The extraction rule itself, once, for both of its callers."""
     into.mkdir(parents=True, exist_ok=True)
@@ -751,7 +753,14 @@ def _extract(
                 _check_kinds(path, files=files, directories=directories, directory=False)
                 if member.size > caps.file_bytes:
                     raise _too_large("per-file size", caps.file_bytes, member.size, entry=path)
-                _write_member(tar, member, into / path, ledger=ledger, quota=quota_bytes)
+                _write_member(
+                    tar,
+                    member,
+                    into / path,
+                    ledger=ledger,
+                    quota=quota_bytes,
+                    preserve_exec=preserve_exec,
+                )
                 written.append(path)
     except tarfile.TarError as exc:
         raise _unreadable(f"the tar stream is not valid ({exc})") from exc
@@ -798,6 +807,7 @@ def _write_member(
     *,
     ledger: IngressLedger,
     quota: int,
+    preserve_exec: bool = False,
 ) -> None:
     """Copy one member out, counting as it goes rather than afterwards.
 
@@ -832,5 +842,13 @@ def _write_member(
                     measured=ledger.disk_bytes + copied,
                 )
             handle.write(block)
-    target.chmod(0o600)
+    # 0600 strips every mode bit an archive could smuggle in — setuid,
+    # setgid, sticky, group/world access. The one bit a caller may ask to
+    # keep is the owner's execute bit, and only the SDK asks: §6.1's
+    # `generate.program` is *executed as a child process*, so an SDK
+    # unpacked without it answers exit 127 where code generation should
+    # be. Context uploads never ask — nothing in model/, keys/ or
+    # patches/ is run.
+    executable = preserve_exec and bool(member.mode & 0o100)
+    target.chmod(0o700 if executable else 0o600)
     ledger.disk_bytes += copied

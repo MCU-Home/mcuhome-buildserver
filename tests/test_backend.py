@@ -32,6 +32,7 @@ from tests.conftest import (
     IMAGE_REFERENCE,
     FakeProcess,
     auth,
+    base_context,
     buildable_context,
     call,
     collect,
@@ -2250,3 +2251,124 @@ async def test_a_rewritten_pin_is_caught_by_the_same_re_measurement(client, conf
 
     assert frame["error"]["code"] == "context.integrity-mismatch"
     assert "target.board" in frame["error"]["details"]["paths"]
+
+
+async def test_a_static_description_replaces_the_probe(client, config, docker, state) -> None:
+    """§2.2.1: read the file where present, invoke describe otherwise.
+
+    The static path exists for the image whose program body arrives with
+    a mounted tree — undiscoverable before the mount point is known,
+    and the mount point is what discovery would have supplied. The fake
+    answers the `cat` with a describe result document, and the assertion
+    is that NO describe container ran: the file replaced the probe, it
+    did not precede it.
+    """
+    import json as _json
+
+    docker.static_description = _json.dumps(
+        {"result": 1, "status": "success", "action": "describe", "program": docker.program}
+    )
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        await send_archive(ws, "send-context", session_id, base_context())
+    assert docker.static_reads == ["/mcuhome/describe.json"]
+    describe_runs = [
+        call
+        for call in docker.calls
+        if call[1:2] == ["run"] and "--rm" in call and call[-2:-1] != ["cat"]
+    ]
+    assert describe_runs == [], "the file replaced the probe"
+
+
+async def test_an_unreadable_static_description_falls_back_to_describe(
+    client, config, docker
+) -> None:
+    """Half-readable must not be a third behaviour (§2.2.1).
+
+    "There is no new failure mode in either direction, because the
+    fallback is the thing that was already mandatory" — broken JSON in
+    the file lands on exactly the probe path an image without the file
+    gets, and the session proceeds.
+    """
+    docker.static_description = "{not json"
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        frame = await send_archive(ws, "send-context", session_id, base_context())
+    assert frame["payload"]["container"]["contract"] == 1
+    describe_runs = [
+        call
+        for call in docker.calls
+        if call[1:2] == ["run"] and "--rm" in call and call[-2:-1] != ["cat"]
+    ]
+    assert len(describe_runs) == 1, "the fallback probe ran"
+
+
+async def test_the_sdk_keeps_its_executable_bit_and_nothing_else(tmp_path) -> None:
+    """§6.1's `generate.program` is *executed*; 0600 across the board kills it.
+
+    The context extractor strips every mode bit an archive could smuggle
+    in, and that is right for contexts — nothing in model/, keys/ or
+    patches/ is run. The SDK is the one tree with a program in it, so
+    its unpack keeps exactly the owner's execute bit of regular files
+    (0700) and still strips setuid/setgid/sticky/group/world. Found as
+    a blocker by the B2 spec round: an SDK unpacked by this server
+    answered exit 127 where code generation should be.
+    """
+    import io
+    import tarfile
+
+    import zstandard
+
+    from mcuhome_buildserver import sdkstore
+
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tar:
+        program = tarfile.TarInfo("bin/generate")
+        payload = b"#!/usr/bin/env python3\n"
+        program.size = len(payload)
+        program.mode = 0o4775  # setuid + group/world bits: all must go
+        tar.addfile(program, io.BytesIO(payload))
+        quiet = tarfile.TarInfo("mcuhome-sdk.json")
+        body = b'{"sdk": 1, "generate": {"program": "bin/generate", "runtime": "python3"}}'
+        quiet.size = len(body)
+        quiet.mode = 0o664
+        tar.addfile(quiet, io.BytesIO(body))
+    archive = zstandard.ZstdCompressor().compress(raw.getvalue())
+
+    import hashlib
+
+    source = tmp_path / "sources"
+    source.mkdir()
+    (source / "mcuhome-sdk-9.9.9.tar.zst").write_bytes(archive)
+    into = tmp_path / "sdk"
+    sdkstore.acquire_sdk(
+        version="9.9.9",
+        sha256=hashlib.sha256(archive).hexdigest(),
+        sources=(source,),
+        into=into,
+        caps=sdkstore.SDK_CAPS,
+        max_bytes=sdkstore.SDK_MAX_BYTES,
+    )
+    assert (into / "bin" / "generate").stat().st_mode & 0o7777 == 0o700
+    assert (into / "mcuhome-sdk.json").stat().st_mode & 0o7777 == 0o600
+
+
+async def test_the_sdk_is_not_held_to_the_clients_budget_shape(tmp_path) -> None:
+    """The operator's material gets its own bounds, not the session caps.
+
+    E44's numbers were argued for contexts (kilobytes to a few
+    megabytes); an SDK is a source tree. Holding the operator's package
+    to the client's budget shape would make the two knobs fight — an
+    operator tightening context caps against abusive clients would
+    break their own SDK. Pinned by the constant, not by a giant archive:
+    the caps handed to the unpack are SDK_CAPS, and SDK_CAPS is roomier
+    than any default context cap.
+    """
+    from mcuhome_buildserver import config as config_module
+    from mcuhome_buildserver import sdkstore
+    from mcuhome_buildserver.ingress import IngressCaps
+
+    session_caps = IngressCaps.from_config(config_module.Config(token="t"))
+    assert sdkstore.SDK_CAPS.compressed_bytes > session_caps.compressed_bytes
+    assert sdkstore.SDK_CAPS.decompressed_bytes > session_caps.decompressed_bytes
+    assert sdkstore.SDK_CAPS.entries > session_caps.entries

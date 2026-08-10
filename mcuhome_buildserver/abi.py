@@ -424,6 +424,29 @@ def write_request(document: dict[str, Any], path: Path) -> None:
 # --------------------------------------------------------------------------
 
 
+def read_static_describe(text: str) -> dict[str, Any] | None:
+    """The ``program`` block out of a static self-description (§2.2.1).
+
+    The file's content is "exactly what invoking ``describe`` on this
+    image answers, and nothing else" — a §5.4 result document — so it is
+    read with the same expectations a live answer meets: one JSON
+    object, ``status: "success"``, and a complete ``program`` block.
+    ``None`` for anything less, because the caller's fallback (invoking
+    ``describe``) was already mandatory and reports its own refusals;
+    a half-readable file must not be a third behaviour.
+    """
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or data.get("status") != "success":
+        return None
+    program = data.get("program")
+    if not isinstance(program, dict) or not _program_block_complete(program):
+        return None
+    return program
+
+
 def read_result(
     *,
     path: Path,

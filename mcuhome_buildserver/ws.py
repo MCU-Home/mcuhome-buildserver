@@ -53,10 +53,10 @@ from aiohttp import WSCloseCode, WSMsgType, web
 
 from mcuhome_buildserver import errors, protocol, sessions
 from mcuhome_buildserver.ingress import Upload
-from mcuhome_buildserver.protocol import Command, ProtocolError
+from mcuhome_buildserver.protocol import MAX_FRAME_BYTES, Command, ProtocolError
 from mcuhome_buildserver.security import STATE_KEY, check_origin
 
-__all__ = ["COMMANDS", "FINISHED_EVENT", "Connection", "websocket_handler"]
+__all__ = ["COMMANDS", "VERDICT_EVENT", "Connection", "websocket_handler"]
 
 logger = logging.getLogger(__name__)
 
@@ -64,20 +64,11 @@ logger = logging.getLogger(__name__)
 #: dashboard's, because build output is the traffic.
 OUTBOX_LIMIT = 1024
 
-#: The largest single frame this endpoint accepts, in bytes. A cap on
-#: the *frame* and not on a payload: it is the WebSocket's own
-#: ``max_msg_size``, which is the only limit that can refuse a message
-#: before it has been buffered. The session protocol's context upload
-#: is bounded separately and by a different mechanism — a streaming
-#: ingress cap answering ``policy.ingress-limit-exceeded``
-#: (:mod:`mcuhome_buildserver.errors`) — because a limit that only
-#: fires after the bytes arrived is not a limit.
-MAX_FRAME_BYTES = 8 * 1024 * 1024
-
 #: How much of a download archive goes into one outbound BINARY frame.
-#: Well under :data:`MAX_FRAME_BYTES`, deliberately: that cap is this
-#: endpoint's own ``max_msg_size`` and says nothing about the client's,
-#: and a client with a smaller one would drop the connection rather than
+#: Well under :data:`~mcuhome_buildserver.protocol.MAX_FRAME_BYTES`,
+#: deliberately: that cap is this endpoint's own ``max_msg_size``, which
+#: this server announces and a third-party client need not match — a
+#: client with a smaller one would drop the connection rather than
 #: the frame. A quarter of a megabyte is small enough that no reasonable
 #: client refuses it and large enough that a firmware image is a handful
 #: of frames.
@@ -229,7 +220,7 @@ class Connection:
         log carries a counter that makes one visible, and the events
         file on disk is the replay buffer ``attach-session`` fetches it
         from. What it may never throw away is a BINARY chunk of a
-        download, a command's answer, or the ``invocation.finished``
+        download, a command's answer, or the ``invocation.verdict``
         frame a client is waiting on.
 
         An outbox holding nothing but those is a client that has stopped
@@ -324,12 +315,13 @@ class Connection:
 
 
 #: The one event name that is never evicted even though its frame type
-#: is. E46 gives it to this server's own completion frame and contract
-#: §8 seeds the registry with the program's announcement of the same
-#: name; both are the news a client is waiting for, and neither has a
-#: second way to be learned. Everything else on the event stream can be
-#: fetched again from the events file through ``attach-session``.
-FINISHED_EVENT = "invocation.finished"
+#: is. E46 gives it to this server's own completion frame and E58 gives
+#: that frame a name of its own, which is what makes this guarantee
+#: exact: the verdict is this server's judgement, it is written to no
+#: events file, and a dropped one is lost for good. Everything else on
+#: the event stream — the program's ``invocation.finished`` included —
+#: can be fetched again from the events file through ``attach-session``.
+VERDICT_EVENT = "invocation.verdict"
 
 
 def _droppable(frame: dict[str, Any] | bytes) -> bool:
@@ -337,14 +329,14 @@ def _droppable(frame: dict[str, Any] | bytes) -> bool:
 
     The two build streams and nothing else. A BINARY chunk is not a
     ``dict`` and never qualifies; a command's ``result`` or ``error``
-    answer is what a caller is blocked on; ``invocation.finished`` is
+    answer is what a caller is blocked on; ``invocation.verdict`` is
     the frame E46 exists to deliver.
     """
     if not isinstance(frame, dict):
         return False
     if frame.get("type") == protocol.TYPE_LOG:
         return True
-    return frame.get("type") == protocol.TYPE_EVENT and frame.get("event") != FINISHED_EVENT
+    return frame.get("type") == protocol.TYPE_EVENT and frame.get("event") != VERDICT_EVENT
 
 
 #: The command table, **derived** from the verb table rather than

@@ -52,9 +52,11 @@ directory, the pin document and the freeze in
 **The working path is real too, and it lives one module over.**
 ``verify`` and ``build`` re-measure the locked context, hand it to
 :mod:`mcuhome_buildserver.backend` and answer an invocation id
-immediately; the completion arrives as an ``invocation.finished`` event
-with the status and the artifact list, the program's own events are
-relayed verbatim and its raw log travels as its own frame kind (E46).
+immediately; the completion arrives as an ``invocation.verdict`` event
+with the status and the artifact list (E58 gave it that name of its own,
+so that it is never confused with the program's contract §8
+``invocation.finished``), the program's own events are relayed verbatim
+and its raw log travels as its own frame kind (E46).
 ``get-artifact`` answers a ``tar.zst`` announced in its result frame and
 streamed as BINARY frames behind it (E45), and ``attach-session``
 replays an invocation's events from a sequence number the client states
@@ -763,6 +765,22 @@ def capabilities_payload(state: Any, containers: list[dict[str, Any]]) -> dict[s
     can serve, and "none" is a fact rather than an error. The refusal
     for a missing runtime belongs to the verb that needs a container.
 
+    **``ingress`` is announced rather than discovered** (E57). The five
+    caps of ADR 0019 decision 8 exist so that a client can refuse an
+    oversized upload before the first byte leaves, and a cap it cannot
+    see can only be found by hitting it — after the bytes have been
+    sent, which is the one cost the caps exist to avoid. They are
+    answered from *this server's configuration* and never from a
+    constant, because E44 makes the config the policy: an operator who
+    lowered a cap has lowered what this block says.
+
+    The sixth number is not one of the five. ``frame_bytes`` is the
+    largest WebSocket message the endpoint accepts
+    (:data:`~mcuhome_buildserver.protocol.MAX_FRAME_BYTES`) — a bound
+    that lives *below* the verbs, whose overrun is a dropped connection
+    rather than a typed refusal, and which therefore has to be knowable
+    in advance or not at all.
+
     There is deliberately **no ``quota.work``** and no cost class. ADR
     0019's amendment binds work metering and cost classes to the hosted
     phase and says of v1.0, in as many words, that there is neither; a
@@ -771,6 +789,7 @@ def capabilities_payload(state: Any, containers: list[dict[str, Any]]) -> dict[s
     """
     config = state.config
     allowed = frozenset(config.allowed_patch_layers)
+    caps = IngressCaps.from_config(config)
     # The four names contract §1.1 fixes, plus any third-party `x-` layer
     # this operator listed. An `x-` name cannot be enumerated — the
     # prefix exists precisely so vendors need no registration — so the
@@ -787,6 +806,18 @@ def capabilities_payload(state: Any, containers: list[dict[str, Any]]) -> dict[s
         # are denied by default (concept §6). Advertised per layer so the
         # workbench refuses a patched context before uploading it.
         "patch_policy": {layer: {"allow": layer in allowed} for layer in layers},
+        # What one upload may cost here (E44's five caps), plus the
+        # transport bound under the verbs. Read from the config, so the
+        # announcement follows an operator's setting rather than a
+        # constant this module could drift from.
+        "ingress": {
+            "compressed_bytes": caps.compressed_bytes,
+            "decompressed_bytes": caps.decompressed_bytes,
+            "entries": caps.entries,
+            "file_bytes": caps.file_bytes,
+            "path_depth": caps.path_depth,
+            "frame_bytes": protocol.MAX_FRAME_BYTES,
+        },
         "quota": {
             "sessions": {
                 "open": state.sessions.open_count,
@@ -1564,9 +1595,12 @@ async def _start_working(
     every client's socket a build timer, and a client that lost the
     socket would lose the result of work that is still running. So the
     verb acknowledges and the completion travels as an
-    ``invocation.finished`` event carrying the status and the artifact
+    ``invocation.verdict`` event carrying the status and the artifact
     list — on the channel that survives a reconnect, because the
     invocation continues detached and ``attach-session`` re-joins it.
+    The verdict is this server's, and the program's own
+    ``invocation.finished`` (contract §8, numbered like every program
+    event) is a different frame that arrives before it (E58).
     """
     session = state.sessions.require(command.require_str("session_id"))
     session.require_workable()

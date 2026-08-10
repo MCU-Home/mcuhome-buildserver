@@ -101,7 +101,7 @@ async def test_the_session_container_is_started_with_the_contracts_two_flags(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config, **{"model/device-model.json": MODEL})
         await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
 
     started = next(
         argv for argv in docker.calls if argv[:2] == ["docker", "run"] and "--detach" in argv
@@ -146,7 +146,7 @@ async def test_the_session_tree_is_mounted_piece_by_piece_and_never_wholesale(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
         paths = state.sessions.require(session_id).paths
 
     started = next(argv for argv in docker.calls if "--detach" in argv)
@@ -177,7 +177,7 @@ async def test_a_read_only_tree_has_no_writable_second_name(client, config, dock
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
         paths = state.sessions.require(session_id).paths
 
     document = docker.invocations[-1].request
@@ -206,7 +206,7 @@ async def test_the_session_container_is_started_with_this_servers_resource_limit
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
 
     started = next(argv for argv in docker.calls if "--detach" in argv)
     assert started[started.index("--memory") + 1] == config.container_memory == "8g"
@@ -281,7 +281,7 @@ async def test_the_invocation_is_two_positional_operands_and_never_a_flag(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
 
     executed = next(argv for argv in docker.calls if argv[1] == "exec")
     program = executed.index("/mcuhome/run")
@@ -312,7 +312,7 @@ async def test_the_request_document_carries_every_mandatory_field(client, config
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
 
     document = docker.invocations[-1].request
     assert document["request"] == 1
@@ -340,7 +340,7 @@ async def test_the_request_document_names_no_invocation_id(client, config, docke
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         answer = await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
 
     assert answer["payload"]["invocation_id"] == "inv-1"
     assert "invocation" not in docker.invocations[-1].request
@@ -359,7 +359,7 @@ async def test_limits_are_authoritative_and_memory_is_not_promised(client, confi
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
 
     limits = docker.invocations[-1].request["limits"]
     assert limits["jobs"] == config.build_jobs == 2
@@ -380,7 +380,7 @@ async def test_build_states_its_mode_and_demands_it_be_honoured(client, config, 
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id, "mode": "incremental"}, frame_id="b")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
 
     document = docker.invocations[-1].request
     assert document["params"] == {"mode": "incremental"}
@@ -399,7 +399,7 @@ async def test_verify_gets_the_trees_and_demands_nothing(client, config, docker)
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config, **{"patches/zephyr/0001-fix.patch": PATCH})
         await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
 
     document = docker.invocations[-1].request
     assert document["trees"]["zephyr"] == {"path": "/opt/zephyr", "writable": True}
@@ -428,7 +428,7 @@ async def test_a_patched_in_image_tree_is_writable_where_describe_put_it(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config, **{f"patches/{layer}/0001-fix.patch": PATCH})
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
 
     document = docker.invocations[-1].request
     declared = document["trees"][layer]
@@ -450,7 +450,7 @@ async def test_an_unpatched_tree_gets_no_entry_at_all(client, config, docker) ->
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
 
     assert set(docker.invocations[-1].request["trees"]) == {"sdk"}
 
@@ -466,7 +466,7 @@ async def test_a_patched_sdk_is_handed_over_writable(client, config, docker) -> 
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config, **{"patches/sdk/0001-fix.patch": PATCH})
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
 
     assert docker.invocations[-1].request["trees"]["sdk"]["writable"] is True
     started = next(argv for argv in docker.calls if "--detach" in argv)
@@ -495,7 +495,7 @@ async def test_a_working_verb_answers_the_invocation_id_immediately(client, conf
             "action": "build",
             "context_id": context_id,
         }
-        frames = await collect(ws, until="invocation.finished")
+        frames = await collect(ws, until="invocation.verdict")
 
     finished = frames[-1]["payload"]
     assert finished["status"] == "success"
@@ -514,7 +514,7 @@ async def test_the_finished_event_attributes_to_the_servers_own_context_id(clien
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, context_id = await locked(ws, config)
         await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        frames = await collect(ws, until="invocation.finished")
+        frames = await collect(ws, until="invocation.verdict")
 
     assert frames[-1]["payload"]["context"] == context_id
 
@@ -553,7 +553,7 @@ async def test_program_events_are_relayed_verbatim_with_the_servers_addressing(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        frames = await collect(ws, until="invocation.finished")
+        frames = await collect(ws, until="invocation.verdict")
 
     unknown = next(frame for frame in frames if frame.get("event") == "x-acme.flashing")
     assert unknown["payload"]["chip"] == "nrf5340"
@@ -598,7 +598,7 @@ async def test_the_raw_log_is_its_own_frame_type_with_its_own_counter(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        frames = await collect(ws, until="invocation.finished")
+        frames = await collect(ws, until="invocation.verdict")
 
     logs = [frame for frame in frames if frame.get("type") == "log"]
     assert [entry["payload"]["seq"] for entry in logs] == [1, 2]
@@ -639,7 +639,7 @@ async def test_an_over_long_event_line_is_discarded_and_not_an_abort(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        frames = await collect(ws, until="invocation.finished")
+        frames = await collect(ws, until="invocation.verdict")
 
     assert not any(frame.get("event") == "x-huge" for frame in frames)
     assert frames[-1]["payload"]["status"] == "success"
@@ -662,7 +662,7 @@ async def test_no_result_document_is_builder_crashed_and_retryable(client, confi
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        frames = await collect(ws, until="invocation.finished")
+        frames = await collect(ws, until="invocation.verdict")
 
     payload = frames[-1]["payload"]
     assert payload["status"] == "failure"
@@ -712,7 +712,7 @@ async def test_a_declared_artifact_that_does_not_re_hash_is_not_served(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        frames = await collect(ws, until="invocation.finished")
+        frames = await collect(ws, until="invocation.verdict")
 
     payload = frames[-1]["payload"]
     assert payload["status"] == "failure"
@@ -765,7 +765,7 @@ async def test_an_artifact_outside_out_is_skipped_rather_than_resolved(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        frames = await collect(ws, until="invocation.finished")
+        frames = await collect(ws, until="invocation.verdict")
 
     payload = frames[-1]["payload"]
     assert payload["artifacts"] == []
@@ -805,7 +805,7 @@ async def test_exit_zero_with_a_failing_document_is_a_contract_violation(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        frames = await collect(ws, until="invocation.finished")
+        frames = await collect(ws, until="invocation.verdict")
 
     payload = frames[-1]["payload"]
     assert payload["status"] == "failure"
@@ -838,7 +838,7 @@ async def test_an_unknown_status_is_read_as_failure(client, config, docker) -> N
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        frames = await collect(ws, until="invocation.finished")
+        frames = await collect(ws, until="invocation.verdict")
 
     assert frames[-1]["payload"]["status"] == "failure"
 
@@ -880,7 +880,7 @@ async def test_an_interrupted_patch_application_poisons_the_session(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config, **{"patches/zephyr/0001.patch": PATCH})
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        frames = await collect(ws, until="invocation.finished")
+        frames = await collect(ws, until="invocation.verdict")
         again = await call(ws, "build", {"session_id": session_id}, frame_id="b2")
 
     assert frames[-1]["payload"]["error"]["code"] == "session.poisoned"
@@ -922,7 +922,7 @@ async def test_a_verify_mismatch_fails_the_invocation_without_poisoning(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        frames = await collect(ws, until="invocation.finished")
+        frames = await collect(ws, until="invocation.verdict")
         attached = await call(ws, "attach-session", {"session_id": session_id}, frame_id="a")
 
     assert frames[-1]["payload"]["error"]["code"] == "context.integrity-mismatch"
@@ -983,7 +983,7 @@ async def test_a_build_that_delivers_no_report_is_not_a_successful_build(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        frames = await collect(ws, until="invocation.finished")
+        frames = await collect(ws, until="invocation.verdict")
 
     payload = frames[-1]["payload"]
     assert payload["status"] == "failure"
@@ -1003,7 +1003,7 @@ async def test_a_build_with_two_reports_is_not_a_successful_build_either(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        frames = await collect(ws, until="invocation.finished")
+        frames = await collect(ws, until="invocation.verdict")
 
     payload = frames[-1]["payload"]
     assert payload["status"] == "failure"
@@ -1020,7 +1020,7 @@ async def test_a_build_with_no_firmware_at_all_is_not_a_successful_build(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        frames = await collect(ws, until="invocation.finished")
+        frames = await collect(ws, until="invocation.verdict")
 
     payload = frames[-1]["payload"]
     assert payload["status"] == "failure"
@@ -1047,7 +1047,7 @@ async def test_the_delivery_rule_is_measured_on_what_verified_and_not_on_what_wa
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        frames = await collect(ws, until="invocation.finished")
+        frames = await collect(ws, until="invocation.verdict")
 
     payload = frames[-1]["payload"]
     assert payload["status"] == "failure"
@@ -1078,7 +1078,7 @@ async def test_a_declared_artifact_this_server_cannot_resolve_fails_the_build(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        frames = await collect(ws, until="invocation.finished")
+        frames = await collect(ws, until="invocation.verdict")
 
     finished = frames[-1]["payload"]
     assert finished["status"] == "failure"
@@ -1127,7 +1127,7 @@ async def test_a_build_that_reports_no_layers_for_a_patched_context_is_not_succe
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config, **{"patches/zephyr/0001-fix.patch": PATCH})
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        frames = await collect(ws, until="invocation.finished")
+        frames = await collect(ws, until="invocation.verdict")
 
     payload = frames[-1]["payload"]
     assert payload["status"] == "failure"
@@ -1169,7 +1169,7 @@ async def test_the_shared_cache_is_offered_read_only_and_keyed_by_program_id(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, cached)
         await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
 
     store = cached.ccache_dir / "org.mcuhome.build-container"
     assert docker.invocations[-1].request["ccache"] == {"path": str(store), "writable": False}
@@ -1197,7 +1197,7 @@ async def test_a_program_id_that_is_not_a_path_segment_gets_no_cache_at_all(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, cached)
         await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
 
     assert "ccache" not in docker.invocations[-1].request
     started = next(argv for argv in docker.calls if "--detach" in argv)
@@ -1222,7 +1222,7 @@ async def test_get_artifact_announces_an_archive_and_streams_it(client, config) 
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
 
         await ws.send_json(
             {
@@ -1265,7 +1265,7 @@ async def test_get_artifact_with_a_path_holds_exactly_that_one(client, config) -
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
         await ws.send_json(
             {
                 "id": "g",
@@ -1297,7 +1297,7 @@ async def test_a_path_that_is_not_a_declared_artifact_is_typed(client, config) -
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
         frame = await call(
             ws,
             "get-artifact",
@@ -1358,7 +1358,7 @@ async def test_the_programs_own_retryable_travels_as_the_programs_and_not_as_the
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        frames = await collect(ws, until="invocation.finished")
+        frames = await collect(ws, until="invocation.verdict")
 
     error = frames[-1]["payload"]["error"]
     assert error["details"]["container_retryable"] is True
@@ -1382,23 +1382,25 @@ async def test_a_runtime_that_dies_between_send_context_and_build_is_typed(
         frame = await call(ws, "build", {"session_id": session_id}, frame_id="b")
         docker.version_status = 0
         again = await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
 
     assert frame["error"]["code"] == "builder.runtime-unavailable"
     assert frame["error"]["retryable"] is True
     assert again["type"] == "result", "the session survived the refusal"
 
 
-async def test_the_finished_frame_is_sent_and_never_offered(client, config, docker, monkeypatch):
+async def test_the_verdict_frame_is_sent_and_never_offered(client, config, docker, monkeypatch):
     """E46's one frame with no second way to be learned.
 
-    ``_publish`` says it plainly — "the ``invocation.finished`` frame is
+    ``_publish`` says it plainly — "the ``invocation.verdict`` frame is
     sent instead, because it is the one frame a client is waiting on and
     there is no second way to learn it" — and the distinction between
     the two enqueue paths was asserted nowhere, so the completion frame
     could be made droppable with the suite green. The log and the
     program's events are offered, for the reason the same docstring
-    gives: both survive a gap.
+    gives: both survive a gap — the program's own ``invocation.finished``
+    among them, since it is a line in the events file ``attach-session``
+    replays from.
     """
     from mcuhome_buildserver.ws import Connection
 
@@ -1420,19 +1422,19 @@ async def test_the_finished_frame_is_sent_and_never_offered(client, config, dock
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
 
     def verdict(frames):
-        return [
-            frame
-            for frame in frames
-            if frame.get("event") == "invocation.finished" and "seq" not in frame["payload"]
-        ]
+        return [frame for frame in frames if frame.get("event") == "invocation.verdict"]
 
     assert len(verdict(sent)) == 1
     assert verdict(offered) == []
     assert any(frame.get("type") == "log" for frame in offered)
     assert any(frame.get("event") == "artifact.collected" for frame in offered)
+    # And the program's own §8 announcement is on the droppable side of
+    # the same run (E58): same invocation, two frames, told apart by
+    # name rather than by the absence of a field.
+    assert any(frame.get("event") == "invocation.finished" for frame in offered)
 
 
 async def test_the_per_invocation_directory_is_prepared_the_way_9_1_asks(
@@ -1471,7 +1473,7 @@ async def test_the_per_invocation_directory_is_prepared_the_way_9_1_asks(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
         directory = state.sessions.require(session_id).paths.invocation("inv-1")
 
     assert (directory / "events.ndjson").exists()
@@ -1517,7 +1519,7 @@ async def test_nothing_filesystem_heavy_runs_on_the_event_loop(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
         await ws.send_json(
             {
                 "id": "g",
@@ -1573,7 +1575,7 @@ async def test_one_download_at_a_time_per_connection_and_never_one_spool(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
         for frame_id in ("g1", "g2"):
             await ws.send_json(
                 {
@@ -1621,7 +1623,7 @@ async def test_a_download_that_no_longer_matches_what_was_verified_is_refused(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
 
         out = state.sessions.require(session_id).paths.invocation("inv-1") / "out"
         outside = state.config.context_root / "outside"
@@ -1680,7 +1682,7 @@ async def test_attach_session_replays_before_it_joins_the_live_stream(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
         timeline.clear()
         answer = await call(
             ws,
@@ -1749,7 +1751,7 @@ async def test_attach_session_replays_events_from_a_stated_seq(client, config) -
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
 
         await ws.send_json(
             {
@@ -1789,7 +1791,7 @@ async def test_cancel_creates_the_sentinel_file_the_request_named(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
         session = state.sessions.require(session_id)
         session.invocations["inv-1"] = sessions.INVOCATION_RUNNING
         await call(ws, "cancel", {"session_id": session_id, "invocation_id": "inv-1"}, frame_id="c")
@@ -1830,7 +1832,7 @@ async def test_the_liveness_ladder_starts_with_the_sentinel_and_then_signals(
         session_id, _ = await locked(ws, state.config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
         await call(ws, "cancel", {"session_id": session_id, "invocation_id": "inv-1"}, frame_id="c")
-        frames = await collect(ws, until="invocation.finished")
+        frames = await collect(ws, until="invocation.verdict")
 
     assert processes[0].terminated is True
     # No result document was ever written, so the invocation is the
@@ -1857,7 +1859,7 @@ async def test_the_deadline_is_enforced_by_this_server(aiohttp_client, config, d
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, state.config)
         answer = await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
         sentinel = (
             state.sessions.require(session_id).paths.invocation(answer["payload"]["invocation_id"])
             / "cancel"
@@ -1894,7 +1896,7 @@ async def test_a_client_that_ignores_sigterm_is_killed(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, state.config)
         await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
 
     assert processes[0].terminated is True
     assert processes[0].killed is True
@@ -1942,7 +1944,7 @@ async def test_close_session_reaps_the_container(client, config, docker) -> None
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
         await call(ws, "close-session", {"session_id": session_id}, frame_id="x")
 
     assert docker.removed == docker.containers
@@ -2064,7 +2066,7 @@ async def test_the_sdk_is_unpacked_per_session_and_mounted_where_describe_asked(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.finished")
+        await collect(ws, until="invocation.verdict")
         paths = state.sessions.require(session_id).paths
 
     assert (paths.sdk / "mcuhome/__init__.py").read_bytes() == b"# the SDK\n"

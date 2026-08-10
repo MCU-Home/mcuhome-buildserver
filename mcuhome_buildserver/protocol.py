@@ -50,6 +50,7 @@ from typing import Any
 __all__ = [
     "ERROR_BAD_REQUEST",
     "ERROR_INTERNAL",
+    "MAX_FRAME_BYTES",
     "TYPE_ERROR",
     "TYPE_EVENT",
     "TYPE_LOG",
@@ -67,6 +68,25 @@ __all__ = [
 TYPE_RESULT = "result"
 TYPE_ERROR = "error"
 TYPE_EVENT = "event"
+
+#: The largest single frame a session endpoint accepts, in bytes. A cap
+#: on the *frame* and not on a payload: it is the WebSocket's own
+#: ``max_msg_size``, which is the only limit that can refuse a message
+#: before it has been buffered. The session protocol's context upload is
+#: bounded separately and by a different mechanism — a streaming ingress
+#: cap answering ``policy.ingress-limit-exceeded``
+#: (:mod:`mcuhome_buildserver.errors`) — because a limit that only fires
+#: after the bytes arrived is not a limit.
+#:
+#: **It lives with the envelope rather than with the endpoint** because
+#: it is announced (E57): ``capabilities`` carries it in its ``ingress``
+#: block, so that a client can size its chunks instead of discovering
+#: this bound as a dropped connection — the overrun of a frame cap is
+#: not a typed refusal and can never be one. :mod:`mcuhome_buildserver.ws`
+#: applies it to the socket; :mod:`mcuhome_buildserver.sessions`
+#: announces it, and importing the endpoint from the verbs would close
+#: an import cycle.
+MAX_FRAME_BYTES = 8 * 1024 * 1024
 
 #: The raw build log, as its **own** frame type (E46). It is a separate
 #: kind rather than an event with a name because contract §8 makes the

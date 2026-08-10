@@ -474,29 +474,23 @@ def buildable_context(sdk_sha256: str, **files: bytes) -> bytes:
 
 
 async def collect(ws, *, until: str, timeout: float = 15) -> list[dict]:
-    """Read frames until the server's own *until* event, and return all of them.
+    """Read frames until the *until* event, and return all of them.
 
     Event frames carry no frame id — they belong to an invocation rather
     than to a command — so a test that waits for one waits on its name.
 
-    ``seq`` is what tells the two producers apart, and it is the rule the
-    server states rather than this helper's trick: **a frame carrying
-    ``seq`` is the program's, relayed verbatim; one without it is this
-    server speaking.** It matters for exactly one name —
-    ``invocation.finished``, which contract §8's registry seeds and which
-    E46 also gives to the server's own completion frame — and it is
-    structural, because §8 makes every program event carry a monotonic
-    ``seq`` and this server never invents one.
+    **The name is enough** since E58. The end of an invocation is
+    ``invocation.verdict``, which is this server's own frame and no
+    program's: contract §8's frozen registry keeps ``invocation.finished``
+    for the program's announcement, so waiting for one can no longer stop
+    on the other. Before the rename this helper had to filter on the
+    absence of ``seq``, which is exactly the discrimination E58 replaced.
     """
     frames: list[dict] = []
     while True:
         frame = await ws.receive_json(timeout=timeout)
         frames.append(frame)
-        if (
-            frame.get("type") == "event"
-            and frame.get("event") == until
-            and "seq" not in frame.get("payload", {})
-        ):
+        if frame.get("type") == "event" and frame.get("event") == until:
             return frames
 
 

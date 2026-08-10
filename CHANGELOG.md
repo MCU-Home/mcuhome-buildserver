@@ -10,6 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`capabilities` announces the ingress caps** (E57). The answer gains
+  an `ingress` object carrying the five caps of ADR 0019 decision 8 —
+  `compressed_bytes`, `decompressed_bytes`, `entries`, `file_bytes`,
+  `path_depth` — read from *this server's configuration* rather than
+  from constants, because the config is the policy (E44), plus
+  `frame_bytes`: the largest WebSocket message the endpoint accepts.
+  The caps exist so that a client can refuse an oversized upload before
+  the first byte leaves, and a cap it could not see was discoverable
+  only by hitting it; the frame bound is the one limit whose overrun is
+  a dropped connection rather than a typed refusal, so it has to be
+  knowable in advance. `MAX_FRAME_BYTES` moved from `ws` to `protocol`
+  for it — the verbs announce it, the endpoint applies it, and the
+  endpoint imports the verbs.
 - **The container backend — this server builds.** `verify` and `build`
   materialize one container per session, write the request document of
   build-container contract §5.2 into a backend-owned per-invocation
@@ -17,8 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exec`, read the result document *if it exists regardless of the exit
   code*, and judge it against all seven conditions of §5.3. Both verbs
   answer `{"invocation_id"}` immediately and the outcome travels as a
-  typed `invocation.finished` event carrying the status and the artifact
-  list (E46) — a build is minutes to hours, and a command frame that
+  typed `invocation.verdict` event carrying the status and the artifact
+  list (E46, E58) — a build is minutes to hours, and a command frame that
   waited for it would make every client's socket a build timer.
   `session.not-implemented` is now raised by nothing.
 - **Container discovery at `send-context`**, which is where ADR 0019's
@@ -190,6 +203,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The completion verdict is `invocation.verdict`** (E58). E46 gave
+  this server's own completion frame the name contract §8 seeds the
+  event registry with, `invocation.finished`, and left the absence of
+  `seq` to tell them apart — so a program that violated §8 by omitting
+  its counter would have had its own announcement read as this server's
+  judgement. The contract is frozen and keeps its event name; the
+  session layer is not published yet, so the verdict was renamed while
+  renaming still cost nothing. The discrimination is now the name.
+  `ws.FINISHED_EVENT` is `ws.VERDICT_EVENT`, and the non-droppable
+  guarantee it carries is exact for the first time: the verdict is in no
+  events file, while the program's `invocation.finished` is one line of
+  the replay buffer `attach-session` serves.
 - **No host-side overlay, anywhere** (E47). Contract §6.2's writable view
   of a patched layer costs nothing in the `container` profile: the
   image's trees are writable inside the container by construction, one
@@ -294,7 +319,7 @@ An adversarial review of the container backend, answered in full.
   whatever it was — including a BINARY chunk of a download in flight,
   the exact corruption `send_bytes` refuses `offer` to avoid. Only log
   and event frames are droppable now; a BINARY chunk, a command's answer
-  and `invocation.finished` never are, and an outbox holding nothing but
+  and `invocation.verdict` never are, and an outbox holding nothing but
   those closes the connection with a close code instead of delivering an
   archive that will not hash.
 - **One download at a time per connection, and a spool name per
@@ -352,7 +377,7 @@ distinction they turn on, the seven untested rows of §5.4's mandatory
 table, the whole `ccache` path (§10), the `describe` argv — the fake now
 refuses a request path no `--volume` reaches, so the probe mount is
 exercised rather than assumed — `docker exec --user`, the container that
-fails to start, `sdkstore`'s decompression cap, the `invocation.finished`
+fails to start, `sdkstore`'s decompression cap, the `invocation.verdict`
 delivery guarantee, §9.1's per-invocation preparation duties, and three
 tests that stayed green with the behaviour they were named for removed.
 

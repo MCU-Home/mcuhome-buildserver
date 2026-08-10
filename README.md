@@ -170,12 +170,12 @@ verbs, the complete set of dashboard ADR 0012 decision 3.
 
 | Verb | Payload | Today |
 |---|---|---|
-| `capabilities` | `{}` | **answers**: protocol version, the local build-container inventory (reference, digest and the three §2.1 labels), per-layer patch policy from configuration, session quota |
+| `capabilities` | `{}` | **answers**: protocol version, the local build-container inventory (reference, digest and the three §2.1 labels), per-layer patch policy from configuration, session quota, and the **ingress caps** — the five of ADR 0019 decision 8 out of this server's own configuration plus the maximum WebSocket frame, so that a client can size an upload instead of discovering a limit by hitting it (E57) |
 | `open-session` | `{"profile", "protocol_version", "context_format"}` | **answers**: admission — session id, lease, negotiated versions, backend profile (`container`). A version mismatch is a typed rejection at the door |
 | `send-context` | `{"session_id", "archive": {"size", "sha256"}}` + BINARY frames | **answers**: the pins accepted, the context state and **the serving build container** — its digest, contract version, program id and command set, all out of `describe`. `version.builder-unavailable` if this host has no such image, `context.exists` on a second base context |
 | `extend-context` | `{"session_id", "archive"?, "remove"?}` + BINARY frames | **answers**: the context state, the file count and how many named paths were removed. `context.pins-immutable` for `context.yaml`, `context.missing` with no base context, `context.locked` after the lock |
 | `lock-context` | `{"session_id"}` | **answers**: `{"context_id"}` and nothing else. `context.missing` with no base context, `context.locked` on a second lock |
-| `verify` | `{"session_id"}` | **answers immediately**: `{"invocation_id", "action", "context_id"}`. The outcome arrives as an `invocation.finished` event. `context.not-locked` before the lock |
+| `verify` | `{"session_id"}` | **answers immediately**: `{"invocation_id", "action", "context_id"}`. The outcome arrives as an `invocation.verdict` event. `context.not-locked` before the lock |
 | `build` | `{"session_id", "mode"?}` | the same, with `mode` ∈ `clean` (default) \| `incremental`. `context.not-locked` before the lock |
 | `cancel` | `{"session_id", "invocation_id"}` | **answers**: the stop signal is set (never "it stopped") — it creates the cancel sentinel the request document named; `already_finished` for a completed invocation, `invocation.unknown` for one this session never ran. The session, its lease and its context are untouched |
 | `get-artifact` | `{"session_id", "invocation_id", "path"?}` | **answers**: an announcement (`{"archive": {"size", "sha256"}, "artifacts": […]}`) followed by the `tar.zst` as BINARY frames. One download at a time per connection, because a BINARY frame carries no id. `artifact.unknown` for a path the invocation did not declare, `invocation.unknown` for an id it never ran, `artifact.integrity-mismatch` for a declared artifact that is no longer the file §9.3 verified |
@@ -333,7 +333,7 @@ somebody wrote down.
    contradiction between exit code and document is answered
    pessimistically **and** raises a contract violation against the
    image, which travels to the client.
-9. **`invocation.finished`**, carrying the status, the artifact list and,
+9. **`invocation.verdict`**, carrying the status, the artifact list and,
    on a failure, the session protocol's own error envelope.
 
 The invocation is owned by this server and not by the connection that
@@ -402,7 +402,7 @@ the contract makes them different things.
 {"type": "log", "payload": {"session_id": "s-…", "invocation_id": "inv-1",
                             "seq": 812, "line": "-- west build"}}
 // this server's verdict on the invocation
-{"type": "event", "event": "invocation.finished",
+{"type": "event", "event": "invocation.verdict",
  "payload": {"session_id": "s-…", "invocation_id": "inv-1", "action": "build",
              "status": "success", "context": "sha256:…",
              "artifacts": [{"root": "out", "path": "firmware.hex",
@@ -417,13 +417,16 @@ server that has never heard of them. Lines over 8192 bytes and lines
 that are not JSON objects are discarded and counted, never treated as an
 abort.
 
-`invocation.finished` is both a registry event the *program* emits
-("once, immediately before the result document is written") and the name
-E46 gives this server's own completion frame. Both reach the client,
-because a relayed event is never dropped, and **`seq` is what tells them
-apart**: contract §8 makes every program event carry a monotonic `seq`
-and this server never invents one, so a frame of that name carrying
-`seq` is the program's announcement and one without it is the verdict.
+**Two frames end an invocation, and their names tell them apart.**
+`invocation.finished` is the registry event the *program* emits ("once,
+immediately before the result document is written"); `invocation.verdict`
+is this server's own completion frame, emitted after that document has
+been read and judged. Both reach the client, because a relayed event is
+never dropped. E46 first gave them one name and left `seq` to separate
+them — every program event carries a monotonic counter and this server
+invents none — but that made a program's §8 violation readable as this
+server's judgement, so E58 renamed the verdict while the session layer
+was still unpublished. The contract is frozen and keeps its event name.
 Only the verdict carries `artifacts`, `context` and `error`.
 
 The events file stays on disk for the life of the session and **is** the
@@ -490,6 +493,10 @@ reduces none of it.
   deliberately not this: a limit that only fires after the bytes arrived
   is not a limit. A decompression bomb is refused after at most one
   128 KiB output chunk over the budget.
+  All five are **announced** through `capabilities`, together with the
+  frame bound, so that a client refuses an oversized upload before the
+  first byte leaves (E57) — announcing is a courtesy and never the
+  enforcement, which stays here and stays streaming.
 - **Safe extraction** — regular files and directories only; absolute
   paths, `..`, symlinks, hardlinks and device nodes refused
   (`context.unsafe-entry`), and so are a name longer than the filesystem
@@ -587,11 +594,13 @@ reader and from there into a compiler, so a full outbox drops its
 **oldest** frame. Program events and log lines go out that way, and both
 survive it: the log carries a counter that makes a gap visible, and the
 events file on disk is the replay buffer, so `attach-session` can fetch
-the gap. Two frames deliberately do **not** drop. `invocation.finished`
+the gap. Two frames deliberately do **not** drop. `invocation.verdict`
 is the one frame a client is waiting on and there is no second way to
-learn it, and a download's BINARY frames would not degrade under a drop
-— they would corrupt, and the client would find out from a hash that
-does not match at the end of a transfer it already paid for.
+learn it — it is this server's judgement and is in no events file,
+unlike the program's own `invocation.finished` — and a download's BINARY
+frames would not degrade under a drop — they would corrupt, and the
+client would find out from a hash that does not match at the end of a
+transfer it already paid for.
 
 ### REST
 

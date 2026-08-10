@@ -81,22 +81,25 @@ async def test_an_outbox_of_nothing_but_undroppable_frames_closes_the_connection
     await connection.close()
 
 
-async def test_the_finished_frame_is_not_evicted_to_make_room_for_a_log_line() -> None:
+async def test_the_verdict_frame_is_not_evicted_to_make_room_for_a_log_line() -> None:
     """E46's one frame with no second way to be learned.
 
-    ``invocation.finished`` is queued with :meth:`Connection.send` for
+    ``invocation.verdict`` is queued with :meth:`Connection.send` for
     exactly that reason — and being queued said nothing about being
     kept, because the eviction policy looked at the queue rather than at
-    the frame.
+    the frame. Since E58 it is the *name* the policy protects, and it
+    protects only this server's verdict: the program's own
+    ``invocation.finished`` is a line in the events file and survives a
+    drop, which is what makes every other event droppable.
     """
     connection = Connection(ws=None)  # type: ignore[arg-type]
-    await connection.send(protocol.event_frame("invocation.finished", {"status": "success"}))
+    await connection.send(protocol.event_frame("invocation.verdict", {"status": "success"}))
     for index in range(OUTBOX_LIMIT - 1):
         connection.offer(_log(index))
     connection.offer(_log(999))
 
     assert connection.dropped == 1
-    assert connection._outbox[0]["event"] == "invocation.finished"
+    assert connection._outbox[0]["event"] == "invocation.verdict"
 
 
 async def test_a_binary_frame_is_refused_and_the_connection_survives(client) -> None:

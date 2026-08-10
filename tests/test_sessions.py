@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from mcuhome_buildserver import errors, sessions
+from mcuhome_buildserver import errors, protocol, sessions
 from mcuhome_buildserver.errors import LAYERS, REGISTRY, SessionError, envelope
 from tests.conftest import auth, call
 
@@ -112,7 +112,7 @@ def test_a_session_error_carries_its_envelope() -> None:
 # --------------------------------------------------------------------------
 
 
-async def test_capabilities_answers_the_negotiation_surface(client) -> None:
+async def test_capabilities_answers_the_negotiation_surface(client, config) -> None:
     async with client.ws_connect("/ws", headers=auth()) as ws:
         frame = await call(ws, "capabilities")
 
@@ -142,6 +142,72 @@ async def test_capabilities_answers_the_negotiation_surface(client) -> None:
     # Sessions and nothing else: v1.0 has no work metering and no cost
     # classes, so there is no `quota.work` to answer.
     assert set(body["quota"]) == {"sessions"}
+    # E57: what one upload may cost here, announced rather than
+    # discovered by hitting it. The five caps of decision 8 plus the
+    # transport bound below the verbs, whose overrun is a dropped
+    # connection and can never be a typed refusal.
+    assert body["ingress"] == {
+        "compressed_bytes": config.max_compressed_bytes,
+        "decompressed_bytes": config.max_decompressed_bytes,
+        "entries": config.max_entries,
+        "file_bytes": config.max_file_bytes,
+        "path_depth": config.max_path_depth,
+        "frame_bytes": protocol.MAX_FRAME_BYTES,
+    }
+
+
+async def test_the_announced_ingress_caps_come_from_the_configuration(
+    aiohttp_client, config
+) -> None:
+    """E44: the config **is** the policy, so the announcement follows it.
+
+    An operator who lowered a cap has lowered what ``capabilities``
+    says, and a client that sized its upload from the announcement is
+    refused by nothing it could not see. Every one of the five is given
+    a distinctive value here, because five caps announced from five
+    constants would pass an assertion against the defaults.
+    """
+    from dataclasses import replace
+
+    from mcuhome_buildserver.app import ServerState, create_app
+
+    lowered = replace(
+        config,
+        max_compressed_bytes=4001,
+        max_decompressed_bytes=4002,
+        max_entries=4003,
+        max_file_bytes=4004,
+        max_path_depth=7,
+    )
+    client = await aiohttp_client(create_app(ServerState(lowered)))
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        frame = await call(ws, "capabilities")
+
+    assert frame["payload"]["ingress"] == {
+        "compressed_bytes": 4001,
+        "decompressed_bytes": 4002,
+        "entries": 4003,
+        "file_bytes": 4004,
+        "path_depth": 7,
+        # Not configurable and not this server's to relax: it is the
+        # WebSocket's own `max_msg_size`, applied to the socket before
+        # any verb exists to refuse anything.
+        "frame_bytes": protocol.MAX_FRAME_BYTES,
+    }
+
+
+def test_the_frame_bound_is_announced_from_the_one_the_endpoint_applies() -> None:
+    """The announced number and the socket's ``max_msg_size`` are one value.
+
+    It moved to :mod:`~mcuhome_buildserver.protocol` for E57 — the verbs
+    announce it and the endpoint applies it, and the endpoint imports
+    the verbs, so a constant living in ``ws`` could only have been
+    announced by copying it.
+    """
+    from mcuhome_buildserver import ws as ws_module
+
+    assert ws_module.MAX_FRAME_BYTES is protocol.MAX_FRAME_BYTES
+    assert protocol.MAX_FRAME_BYTES == 8 * 1024 * 1024
 
 
 async def test_the_patch_policy_comes_from_the_configuration(aiohttp_client, config) -> None:

@@ -706,7 +706,7 @@ class ContainerBackend:
         """Start one working invocation and answer immediately (E46).
 
         The verb's answer is ``{invocation_id}`` and nothing else: the
-        completion travels as a typed ``invocation.finished`` event
+        completion travels as a typed ``invocation.verdict`` event
         carrying the status and the artifact list, because a build is
         minutes to hours long and a command frame that waited for it
         would make every client's socket a build timer.
@@ -745,7 +745,7 @@ class ContainerBackend:
                 f'Session "{session.id}" is already running an invocation. One invocation '
                 "at a time per session: they share one work directory, and two of them in "
                 "it would build against each other's tree. Cancel it or wait for its "
-                "invocation.finished event."
+                "invocation.verdict event."
             )
 
         record = self._prepare(session, runtime, action=action, context_id=context_id)
@@ -868,7 +868,7 @@ class ContainerBackend:
             session.poison()
         self._publish(
             record,
-            protocol.event_frame("invocation.finished", self._finished(outcome, record)),
+            protocol.event_frame("invocation.verdict", self._verdict(outcome, record)),
         )
 
     async def _supervise(self, record: InvocationRecord) -> int | None:
@@ -1010,8 +1010,8 @@ class ContainerBackend:
             )
         return outcome
 
-    def _finished(self, outcome: abi.InvocationOutcome, record: InvocationRecord) -> dict[str, Any]:
-        """The payload of the ``invocation.finished`` frame (E46).
+    def _verdict(self, outcome: abi.InvocationOutcome, record: InvocationRecord) -> dict[str, Any]:
+        """The payload of the ``invocation.verdict`` frame (E46, E58).
 
         It carries the status and the artifact list, which is what E46
         asks for, plus the two things a client cannot get anywhere else:
@@ -1026,18 +1026,21 @@ class ContainerBackend:
         is reported as a failure, because "where exit code and document
         contradict each other, the pessimistic reading wins".
 
-        **The name collides with a registry event, and the collision is
-        resolved by ``seq``.** Contract §8 seeds the event registry with
-        ``invocation.finished`` — emitted by the *program*, "once,
-        immediately before the result document is written" — and E46
-        gives the same name to this server's own completion frame, which
-        is emitted after that document has been read and judged. Both
-        reach the client, because a relayed event is never dropped. What
-        tells them apart is structural rather than conventional: §8 makes
-        every program event carry a monotonic ``seq``, and this server
-        never invents one, so **a frame of this name carrying ``seq`` is
-        the program's announcement and one without it is the verdict.**
-        Only the verdict carries ``artifacts``, ``context`` and ``error``.
+        **The name is this server's own, and no longer the program's**
+        (E58). E46 first called this frame ``invocation.finished``, which
+        is the name contract §8 seeds the event registry with — emitted
+        by the *program*, "once, immediately before the result document
+        is written", while this frame is emitted after that document has
+        been read and judged. Both reach the client, because a relayed
+        event is never dropped, and the only thing that told them apart
+        was the absence of ``seq``: a program that violated §8 by
+        omitting its counter would have had its own announcement read as
+        this server's verdict. The contract is frozen and keeps its
+        event name; the session layer renamed its frame while renaming
+        still cost nothing, so **the discrimination is the name**.
+        ``invocation.finished`` is always the program's, and
+        ``invocation.verdict`` is always this server's — and only the
+        verdict carries ``artifacts``, ``context`` and ``error``.
         """
         status = _wire_status(outcome)
         payload: dict[str, Any] = {
@@ -1166,9 +1169,10 @@ class ContainerBackend:
         the compiler — and both survive it: the log carries a counter
         that makes a gap visible, and the events file on disk **is** the
         replay buffer, so ``attach-session`` can fetch the gap. The
-        ``invocation.finished`` frame is sent instead, because it is the
+        ``invocation.verdict`` frame is sent instead, because it is the
         one frame a client is waiting on and there is no second way to
-        learn it.
+        learn it: it is this server's own judgement and is in no events
+        file, so a drop would lose it for good.
 
         A connection that joined through ``attach-session`` carries a
         replay boundary, and a frame this server already delivered to it
@@ -1245,9 +1249,11 @@ def _already_replayed(
     """Whether *frame* is inside a connection's own replayed history.
 
     Only a program event can be: the log is not replayed at all, and
-    this server's own frames carry no ``seq`` — which is the same rule
-    that tells the program's ``invocation.finished`` from the backend's
-    verdict of the same name.
+    this server's own frames carry no ``seq``. The ``seq`` test is the
+    load-bearing one here — a replay boundary is a position in the
+    program's numbered stream, and a frame without a number has no
+    position in it — while ``invocation.verdict`` is told from the
+    program's ``invocation.finished`` by name since E58.
     """
     if boundary is None:
         return False

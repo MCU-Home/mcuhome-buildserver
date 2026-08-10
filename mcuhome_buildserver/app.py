@@ -12,6 +12,13 @@ REST is one endpoint:
     Liveness for an orchestrator, before anyone has a token. Says what
     is running and nothing about what it holds.
 
+The application also owns the two things that are true for as long as
+the process runs rather than for the length of one request: the
+**session reaper**, a periodic sweep that closes and deletes sessions
+whose lease or idle timeout ran out, and the startup check that the
+per-session directories are being created somewhere only this server can
+reach.
+
 **Negotiation is not REST here any more.** ``GET /capabilities`` was
 ADR 0006's pre-submission handshake; dashboard ADR 0012 decision 3
 replaces it with the session protocol's ``capabilities`` verb, which
@@ -22,6 +29,8 @@ over the same authenticated socket a client is about to use anyway.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import time
 from dataclasses import dataclass, field
@@ -30,11 +39,15 @@ from aiohttp import web
 
 from mcuhome_buildserver import __version__, sessions, ws
 from mcuhome_buildserver.config import Config
+from mcuhome_buildserver.contextstore import prepare_context_root
 from mcuhome_buildserver.security import STATE_KEY, auth_middleware
 
-__all__ = ["ServerState", "create_app"]
+__all__ = ["REAPER_KEY", "ServerState", "create_app"]
 
 logger = logging.getLogger(__name__)
+
+#: The sweep task, so that shutdown can cancel the one it started.
+REAPER_KEY: web.AppKey[asyncio.Task[None]] = web.AppKey("reaper")
 
 
 @dataclass
@@ -74,11 +87,66 @@ async def health(request: web.Request) -> web.Response:
     )
 
 
+async def _reap_loop(state: ServerState) -> None:
+    """Sweep expired sessions for as long as the server runs.
+
+    The task exists because a lease that is only enforced when a client
+    presents its session id is not a lease at all: the client that most
+    needs reaping is the one that never comes back. Every
+    :data:`~mcuhome_buildserver.sessions.DEFAULT_REAP_INTERVAL` seconds
+    this closes the sessions whose lease or idle timeout ran out and
+    deletes their directories, which is what the README's "deleted at
+    lease expiry" has always claimed and what the credentials in
+    ``keys/`` require.
+
+    It never dies of a sweep. A reaper that stopped on one exception
+    would take the whole server's cleanup with it and say so only in a
+    log line nobody reads until the disk is full.
+    """
+    while True:
+        await asyncio.sleep(sessions.DEFAULT_REAP_INTERVAL)
+        try:
+            reaped = state.sessions.reap()
+        except Exception:  # pragma: no cover - defensive; a sweep is a dict walk
+            logger.exception("the session reaper failed a sweep")
+        else:
+            if reaped:
+                logger.info("reaped %d expired session(s): %s", len(reaped), ", ".join(reaped))
+
+
+async def _start_reaper(app: web.Application) -> None:
+    app[REAPER_KEY] = asyncio.create_task(
+        _reap_loop(app[STATE_KEY]), name="mcuhome-build-session-reaper"
+    )
+
+
+async def _stop_reaper(app: web.Application) -> None:
+    """Stop sweeping, then take the sessions this process still holds.
+
+    A stopping server's sessions are over by definition — they are
+    in-memory records bound to this process — so what is left to do is
+    delete the directories, not wait for a lease.
+    """
+    task = app[REAPER_KEY]
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    app[STATE_KEY].sessions.shutdown()
+
+
 def create_app(state: ServerState) -> web.Application:
+    # Before anything binds: the per-session directories hold a device's
+    # commissioning credentials, and a root somebody else can rename is
+    # not a place to put them (`prepare_context_root`). It is a startup
+    # refusal rather than a per-session one because it is an operator's
+    # mistake about a path, and every session would make it again.
+    prepare_context_root(state.config.context_root)
     app = web.Application(middlewares=[auth_middleware])
     app[STATE_KEY] = state
     app.router.add_get("/health", health)
     app.router.add_get("/ws", ws.websocket_handler)
+    app.on_startup.append(_start_reaper)
+    app.on_cleanup.append(_stop_reaper)
     app.on_response_prepare.append(_security_headers)
     return app
 

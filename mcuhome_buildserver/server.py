@@ -26,6 +26,7 @@ from aiohttp import web
 from mcuhome_buildserver import __version__
 from mcuhome_buildserver.app import ServerState, create_app
 from mcuhome_buildserver.config import Config, load_config
+from mcuhome_buildserver.contextstore import UnsafeContextRoot
 from mcuhome_buildserver.security import publish_pairing_token
 
 __all__ = ["main", "run", "serve"]
@@ -75,6 +76,13 @@ def run(config: Config) -> int:
     )
     try:
         asyncio.run(serve(config))
+    except UnsafeContextRoot as exc:
+        # An operator's mistake about a path, not a crash: the message
+        # says which directory and what is wrong with it, and the socket
+        # was never bound. A traceback here would bury the one sentence
+        # that fixes it.
+        logger.error("%s", exc)
+        return 2
     except KeyboardInterrupt:  # pragma: no cover - interactive
         logger.info("stopped")
     return 0

@@ -158,11 +158,21 @@ REGISTRY: dict[str, ErrorCode] = _seed(
         retryable=False,
         summary="a recomputed file hash or the context id disagrees with the received bytes",
     ),
+    # The summary was widened on 2026-08-10 to name the type collision —
+    # one path that has to be a file and a directory at once, in one
+    # archive or between an extension and the context it lands in. The
+    # code is unchanged and no new one was added: the entry has always
+    # been "extraction refused this target", a path that cannot be both
+    # is one, and a second code would have split one meaning in two. What
+    # makes amending a *summary* legitimate at all is the pre-release
+    # window this module's docstring describes — append-only starts at
+    # the first published entry, and nothing here has been published.
     ErrorCode(
         "context.unsafe-entry",
         retryable=False,
-        summary="extraction refused an entry: absolute path, .., link, device, or outside "
-        "the whitelisted subtrees",
+        summary="extraction refused an entry: absolute path, .., link, device, a name the "
+        "filesystem cannot hold, a path claimed as a file and as a directory at once, or "
+        "outside the whitelisted subtrees",
     ),
     # The two codes the explicit freeze verb exists to produce. They
     # replace `session.manifest-immutable`, whose rule — "manifest.yaml
@@ -182,6 +192,30 @@ REGISTRY: dict[str, ErrorCode] = _seed(
         retryable=False,
         summary="a working command arrived before lock-context; verify and build run only "
         "from the lock onwards",
+    ),
+    # ADR 0018's amendment requires "an attempt is a typed error" for an
+    # extension that touches `context.yaml` and names no code for it; the
+    # product owner registered this one on 2026-08-09. It is deliberately
+    # NOT `context.unsafe-entry`: that code is about extraction *shape* —
+    # an absolute path, a `..`, a symlink — while a `context.yaml` in an
+    # extension is a perfectly well-formed entry aimed at a forbidden
+    # target. Telling a client its path was unsafe would send it looking
+    # for the wrong mistake.
+    ErrorCode(
+        "context.pins-immutable",
+        retryable=False,
+        summary="an extension tried to write or remove context.yaml; it carries the pins "
+        "the session was admitted on, and changing them is a new session",
+    ),
+    # E43: a second `send-context` before the lock. Not `context.locked`
+    # (nothing is frozen yet) and not an implicit replacement: the pins
+    # were already accepted and answered, and replacing them mid-session
+    # is the one thing the format forbids for a session's lifetime.
+    ErrorCode(
+        "context.exists",
+        retryable=False,
+        summary="a base context already arrived in this session; changes go through "
+        "extend-context and a fresh start is a new session",
     ),
     # version.* — the negotiation.
     ErrorCode(

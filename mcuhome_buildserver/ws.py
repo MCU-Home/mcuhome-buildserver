@@ -37,6 +37,7 @@ from typing import Any
 from aiohttp import WSMsgType, web
 
 from mcuhome_buildserver import errors, protocol, sessions
+from mcuhome_buildserver.ingress import Upload
 from mcuhome_buildserver.protocol import Command, ProtocolError
 from mcuhome_buildserver.security import STATE_KEY, check_origin
 
@@ -60,7 +61,16 @@ MAX_FRAME_BYTES = 8 * 1024 * 1024
 
 
 class Connection:
-    """One client: its outbox and its in-flight command tasks."""
+    """One client: its outbox, its in-flight commands, and its upload.
+
+    **The upload belongs to the connection and not to the session**, and
+    the wire is what decides that: a BINARY frame carries no frame id and
+    no session id, so the only thing that can say which archive its bytes
+    belong to is *when* they arrive (E41). One announced upload at a time
+    per connection is therefore the shape of the transport rather than a
+    restriction on it, and a second concurrent announcement is refused
+    instead of interleaved into the first.
+    """
 
     def __init__(self, ws: web.WebSocketResponse) -> None:
         self._ws = ws
@@ -68,6 +78,50 @@ class Connection:
         self._tasks: set[asyncio.Task[None]] = set()
         self._closing = False
         self.dropped = 0
+        self.upload: Upload | None = None
+        self._announced = asyncio.Event()
+
+    def begin_upload(self, upload: Upload) -> None:
+        """Announce an archive on this connection, or refuse a second one."""
+        if self.upload is not None:
+            raise ProtocolError(
+                "An archive upload is already in progress on this connection. Binary "
+                "frames carry no id, so they can only belong to the upload that is "
+                "running; wait for it to be acknowledged before announcing another."
+            )
+        self.upload = upload
+        self._announced.set()
+
+    def end_upload(self, upload: Upload) -> None:
+        """Release the connection, whatever the upload's outcome was."""
+        if self.upload is upload:
+            self.upload = None
+            self._announced.clear()
+
+    async def await_announcement(self, task: asyncio.Task[None]) -> None:
+        """Hold the reader until *task* has announced its upload, or ended.
+
+        **Without this the first frames of an archive are lost, and
+        nothing about the loss is visible.** A command runs as its own
+        task, and a task does not start until the event loop gets a
+        turn; a client that sends its announcement and its first binary
+        frame back to back can have both buffered by the transport, so
+        the reader would take the second frame off a buffer without ever
+        yielding — and answer "this endpoint speaks JSON text frames
+        only" to bytes that were correctly announced.
+
+        Waiting on scheduling order instead (a bare ``sleep(0)``) would
+        happen to work today and quietly stop working the first time an
+        ``await`` appears in a verb ahead of its announcement. This waits
+        for the announcement itself, which is the thing that actually
+        has to have happened, or for the command to fail before making
+        one.
+        """
+        announced = asyncio.ensure_future(self._announced.wait())
+        try:
+            await asyncio.wait({announced, task}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            announced.cancel()
 
     async def send(self, frame: dict[str, Any]) -> None:
         """Queue a frame, waiting for room. For answers to commands."""
@@ -101,10 +155,11 @@ class Connection:
             except (ConnectionResetError, RuntimeError):
                 return
 
-    def spawn(self, coro) -> None:
+    def spawn(self, coro) -> asyncio.Task[None]:
         task = asyncio.create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        return task
 
     async def close(self) -> None:
         self._closing = True
@@ -187,22 +242,42 @@ async def websocket_handler(request: web.Request) -> web.StreamResponse:
     writer = asyncio.create_task(connection.write_loop(), name="mcuhome-build-ws-writer")
     try:
         async for message in ws:
-            if message.type is not WSMsgType.TEXT:
-                if message.type is WSMsgType.BINARY:
+            if message.type is WSMsgType.BINARY:
+                # Binary frames are the body of an announced context
+                # upload and nothing else (E41). The check is the
+                # announcement rather than the frame, because a frame
+                # cannot say what it is: outside an upload this endpoint
+                # still speaks JSON text frames only.
+                #
+                # `feed` is called here, synchronously, instead of being
+                # handed to the waiting handler through a queue. A queue
+                # would buffer whatever the client sends faster than the
+                # server unpacks it, which is the very thing the ingress
+                # caps exist to prevent; doing the work in the reader
+                # makes the socket itself the backpressure.
+                if connection.upload is None:
                     await connection.send(
                         protocol.error_frame(
                             None,
                             protocol.ERROR_BAD_REQUEST,
-                            "This endpoint speaks JSON text frames only.",
+                            "This endpoint speaks JSON text frames only, except while a "
+                            "context archive is announced. Announce it with send-context "
+                            "or extend-context first.",
                         )
                     )
+                else:
+                    connection.upload.feed(message.data)
+                continue
+            if message.type is not WSMsgType.TEXT:
                 continue
             try:
                 command = protocol.decode(message.data)
             except ProtocolError as exc:
                 await connection.send(protocol.error_frame(exc.frame_id, exc.code, exc.message))
                 continue
-            connection.spawn(_run_command(state, connection, command))
+            task = connection.spawn(_run_command(state, connection, command))
+            if command.type in sessions.UPLOAD_VERBS:
+                await connection.await_announcement(task)
     finally:
         state.connections.discard(connection)
         await connection.close()

@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from mcuhome_buildserver import errors, sessions
@@ -123,10 +125,15 @@ async def test_capabilities_answers_the_negotiation_surface(client) -> None:
     # inventory is the truthful answer, not a missing key.
     assert body["containers"] == []
     # The config is the policy: nothing configured, everything denied.
+    # Four layers, because build-container contract §1.1 defines four —
+    # `mcuboot` is one because every device build is `west build
+    # --sysbuild` with MCUboot as the second image, and leaving it out
+    # meant an operator could not allow a layer the contract names.
     assert body["patch_policy"] == {
         "sdk": {"allow": False},
         "zephyr": {"allow": False},
         "chip": {"allow": False},
+        "mcuboot": {"allow": False},
     }
     assert body["quota"]["sessions"]["max_open"] >= 1
     # Sessions and nothing else: v1.0 has no work metering and no cost
@@ -285,6 +292,41 @@ async def test_an_unknown_profile_is_rejected_typed(client) -> None:
     assert frame["error"]["details"]["profiles"] == ["oneshot", "dev", "test"]
 
 
+@pytest.mark.parametrize(
+    ("what", "payload", "code"),
+    [
+        ("context format 0", {"context_format": 0}, "version.context-format-unsupported"),
+        ("an empty profile", {"profile": ""}, "session.profile-unknown"),
+    ],
+)
+async def test_a_falsy_operand_is_a_value_and_not_an_absence(client, what, payload, code) -> None:
+    """ "Version mismatch is a typed rejection at the door" (decision 2).
+
+    Both operands were read as ``optional(...) or <default>``, which
+    cannot tell "the client did not ask" from "the client asked for a
+    falsy value": ``context_format: 0`` and ``profile: ""`` were quietly
+    turned into the defaults and answered ``result``, so a client asking
+    for a format this server does not read was admitted and would have
+    discovered it downstream — the one place the ADR says a version
+    mismatch must never surface.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        frame = await call(
+            ws,
+            "open-session",
+            {"protocol_version": sessions.SESSION_PROTOCOL_VERSION, **payload},
+        )
+    assert frame["type"] == "error", what
+    assert frame["error"]["code"] == code
+
+    # And an operand that is genuinely absent still takes the default.
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        frame = await call(
+            ws, "open-session", {"protocol_version": sessions.SESSION_PROTOCOL_VERSION}
+        )
+    assert frame["payload"]["session"]["profile"] == "oneshot"
+
+
 # --------------------------------------------------------------------------
 # The session lifecycle around the stubs
 # --------------------------------------------------------------------------
@@ -313,23 +355,24 @@ def _admit(manager: sessions.SessionManager | None = None) -> sessions.Session:
 
 
 async def test_the_stubbed_verbs_answer_typed_not_implemented(client) -> None:
-    """The two verbs a fresh session's state machine lets through.
+    """The one verb a fresh session's state machine lets through.
 
-    The list is short on purpose. ``extend-context`` and
-    ``lock-context`` need a base context, and ``verify`` and ``build``
-    need a locked one, so from a fresh session all four answer a
-    state-machine refusal instead — which is the better answer, because
-    it names what the client actually has to do next. ``cancel`` needs
-    an invocation id and is exercised with one below.
+    The list is this short because everything else is either real or
+    gated. ``send-context`` and ``extend-context`` are the context path
+    and answer for themselves; ``lock-context`` needs a base context,
+    ``verify`` and ``build`` need a locked one, so from a fresh session
+    they answer a state-machine refusal instead — which is the better
+    answer, because it names what the client has to do next. ``cancel``
+    needs an invocation id and is exercised with one below. What is left
+    is ``get-artifact``, whose backend is the container backend.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await _open(ws)
-        for index, verb in enumerate(("send-context", "get-artifact")):
-            frame = await call(ws, verb, {"session_id": session_id}, frame_id=str(index))
-            error = frame["error"]
-            assert error["code"] == "session.not-implemented", verb
-            assert error["retryable"] is False
-            assert error["details"]["verb"] == verb
+        frame = await call(ws, "get-artifact", {"session_id": session_id}, frame_id="g")
+        error = frame["error"]
+        assert error["code"] == "session.not-implemented"
+        assert error["retryable"] is False
+        assert error["details"]["verb"] == "get-artifact"
 
 
 async def test_a_stub_still_requires_a_real_session(client) -> None:
@@ -379,6 +422,25 @@ def test_the_concurrent_session_limit_is_enforced_and_retryable() -> None:
         _admit(manager)
     assert excinfo.value.code == "session.limit-exceeded"
     assert errors.REGISTRY["session.limit-exceeded"].retryable is True
+
+
+def test_a_session_past_its_lease_does_not_hold_an_admission_slot() -> None:
+    """Otherwise four clients that walked away close the server for good.
+
+    ``open_count`` counted every ``STATE_OPEN`` record regardless of its
+    lease, and nothing but a client presenting its own session id ever
+    expired one — so four abandoned sessions blocked admission until
+    somebody restarted the process, and pinned up to four times the
+    per-session disk quota while they did it. The sweep runs every
+    :data:`~mcuhome_buildserver.sessions.DEFAULT_REAP_INTERVAL` seconds
+    and the answer must not depend on where in that interval the
+    question lands, so the count asks about the lease itself.
+    """
+    manager = sessions.SessionManager(ttl=0.0, max_open=1)
+    abandoned = _admit(manager)
+    assert manager.open_count == 0
+    fresh = _admit(manager)
+    assert fresh.id != abandoned.id
 
 
 # --------------------------------------------------------------------------
@@ -470,22 +532,21 @@ async def test_lock_context_without_a_context_is_refused_typed(client) -> None:
     assert frame["error"]["details"]["session_id"] == session_id
 
 
-async def test_lock_context_stops_at_the_freeze_it_may_not_implement(client, state) -> None:
-    """With a context present, the verb reaches its seam and refuses.
+async def test_lock_context_needs_a_context_that_is_really_there(client, state) -> None:
+    """The state machine and the disk agree, and both are checked.
 
-    Writing ``manifest.yaml`` and computing the context ID belong to
-    ``mcuhome-model`` (ADR 0020 decision 4), which is not a distribution
-    yet. The rule is frozen precisely so that both sides compute the
-    same value, so a second implementation in this repository is the one
-    thing that must not happen to ship the verb sooner — hence a typed
-    refusal at the seam rather than a local hash.
+    A session whose ``context_state`` says ``unlocked`` while no
+    directory was ever created is a state only a test can build, and the
+    freeze answers it as ``context.missing`` rather than trying to hash
+    a directory that is not there. The two are set together by
+    ``send-context``; checking both is what keeps that true when a
+    second way into the state machine appears.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await _open(ws)
         state.sessions.require(session_id).context_state = sessions.CONTEXT_UNLOCKED
         frame = await call(ws, "lock-context", {"session_id": session_id}, frame_id="l")
-    assert frame["error"]["code"] == "session.not-implemented"
-    assert frame["error"]["details"]["verb"] == "lock-context"
+    assert frame["error"]["code"] == "context.missing"
 
 
 async def test_the_lock_closes_the_context_to_every_writing_command(client, state) -> None:
@@ -686,19 +747,25 @@ async def test_every_authenticated_verb_refreshes_the_idle_timer(client, state) 
     SessionManager.require(), the one door every session verb walks
     through, which is what makes the rule structural rather than a list
     to maintain.
+
+    The clock is wound back by a minute rather than to zero, because the
+    idle timeout is now *enforced* there as well: a session last heard
+    from at the epoch is not a session with a stale timer, it is one the
+    reaper would already have taken.
     """
+    backdated = time.time() - 60.0
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await _open(ws)
         session = state.sessions.require(session_id)
         session.invocations["inv-1"] = sessions.INVOCATION_RUNNING
-        session.last_command_at = 0.0
+        session.last_command_at = backdated
         await call(ws, "cancel", {"session_id": session_id, "invocation_id": "inv-1"}, frame_id="c")
         after_cancel = session.last_command_at
-        session.last_command_at = 0.0
+        session.last_command_at = backdated
         await call(ws, "lock-context", {"session_id": session_id}, frame_id="l")
         after_lock = session.last_command_at
-    assert after_cancel > 0.0
-    assert after_lock > 0.0
+    assert after_cancel > backdated
+    assert after_lock > backdated
 
 
 async def test_cancel_leaves_the_session_standing(client, state) -> None:

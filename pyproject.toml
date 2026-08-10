@@ -32,7 +32,25 @@ classifiers = [
 # packaging tests pin), so this line pulls in exactly the vocabulary and
 # nothing behind it. Not on PyPI while the repositories are private —
 # requirements-dev.txt installs it from the sibling checkout.
-dependencies = ["aiohttp>=3.10,<4", "mcuhome-model"]
+#
+# `ruamel.yaml` and `zstandard` are this server's own, and both exist
+# because `mcuhome-model` deliberately carries no dependencies: it is
+# the package that must be identical on both sides of the contract, so
+# it ships the format and the hash rule and neither a parser nor a
+# codec. `context.yaml` arrives as YAML and `manifest.yaml` is written
+# as YAML, so a parser and an emitter are needed here; the reference
+# emitter lives in `mcuhome.workbench.contextdir` and importing it is
+# what ADR 0020 decision 4 forbids. `zstandard` is the transport: the
+# context archive is tar.zst (E41), chosen for family consistency with
+# the SDK package the same contract pins, and the streaming decompressor
+# is what lets an ingress cap refuse a decompression bomb mid-stream
+# instead of after it has landed.
+dependencies = [
+  "aiohttp>=3.10,<4",
+  "mcuhome-model",
+  "ruamel.yaml>=0.18",
+  "zstandard>=0.22",
+]
 #
 # There is deliberately **no dependency on `mcuhome-dashboard`**. The two
 # are separate products with separate version numbers (ADR 0003 decision

@@ -32,39 +32,42 @@ nothing else.
 > a bearer token on a plaintext connection is a token you have given
 > away.
 
-## Status: a protocol skeleton, and it cannot build
+## Status: the context path is real; it still cannot build
 
-What is real is the **protocol surface**: the transport, the bearer
-token, the frame envelope, session admission with version negotiation,
-the lease bookkeeping, the context state machine with its typed
-refusals, the per-layer patch policy and the typed error registry. A
-client can connect, negotiate, open a session, attach to it and close
-it, and every verb it sends is answered in the order the protocol
-defines.
+What is real is the **protocol surface and the whole context path**: the
+transport, the bearer token, the frame envelope, session admission with
+version negotiation, the lease bookkeeping, the context state machine
+with its typed refusals, the per-layer patch policy, the typed error
+registry — and, since 2026-08-10, receiving a context, extending it and
+freezing it. A client can connect, negotiate, open a session, upload a
+base context as a `tar.zst`, add to it and remove from it, lock it, get
+the context ID back, and close the session.
 
-What is not here is **the container backend** — context upload and
-extraction, the overlay patch views, invoking the build program,
-progress streaming, artifact retrieval and scheduling. Every verb that
-needs it answers a typed `session.not-implemented` instead of a guess,
-so a client sees a protocol that is honest about its state rather than
-one that almost works.
+What is not here is **the container backend** — the overlay patch views,
+invoking the build program, progress streaming, artifact retrieval and
+scheduling. Every verb that needs it answers a typed
+`session.not-implemented` instead of a guess, so a client sees a
+protocol that is honest about its state rather than one that almost
+works.
 
-Two of those stubs are **seams** rather than bare refusals, and both are
-named in `sessions.py`:
+One stub is a **seam** rather than a bare refusal: **the cancellation
+signal** behind `cancel`. What it becomes is fixed by the container
+contract §8 — the backend creates the per-invocation cancel sentinel
+file, whose *existence* means "stop" — and there is no per-invocation
+directory to put one in until there is a backend. The bookkeeping around
+it is real.
 
-- **the freeze** behind `lock-context`. Writing `manifest.yaml` and
-  computing the context ID are `mcuhome-model`'s (ADR 0020 decision 4),
-  and that distribution does not exist yet. The ID rule is frozen
-  precisely so that both sides of the contract compute the same value,
-  so this repository will not re-implement it to ship the verb sooner —
-  a second implementation with no conformance vectors between them is
-  two chances to disagree about a value whose only job is to be
-  identical on both sides.
-- **the cancellation signal** behind `cancel`. What it becomes is fixed
-  by the container contract §8: the backend creates the per-invocation
-  cancel sentinel file, whose *existence* means "stop". There are no
-  invocations to address yet, so the verb refuses rather than answering
-  "cancelled" for something that was never running.
+Two things the context path does that the documents require and this
+server cannot yet do, named here rather than left to be discovered:
+build-container contract §9.1 requires the backend to check
+`container.digest` against the image it **actually pulled** and
+`mcuhome.package.sha256` against the package bytes it **actually
+fetched**. This server pulls and fetches nothing, so it checks the
+*spelling* of both (§3.3.1, refused and never normalized) and defers the
+comparison to the backend that will have something to compare against.
+For the same reason no `version.builder-unavailable` is raised: the
+container inventory is an empty placeholder, and refusing every context
+against it would be a false refusal rather than a strict one.
 
 The one-shot job protocol that used to live here — `submit_job`,
 `cancel_job`, `follow_job`, `download_artifacts`, `queue_status`, the
@@ -139,12 +142,12 @@ verbs, the complete set of dashboard ADR 0012 decision 3.
 |---|---|---|
 | `capabilities` | `{}` | **answers**: protocol version, build-container inventory (empty until the backend exists), per-layer patch policy from configuration, session quota |
 | `open-session` | `{"profile", "protocol_version", "context_format"}` | **answers**: admission — session id, lease, negotiated versions, backend profile. A version mismatch is a typed rejection at the door |
-| `send-context` | `{"session_id", …}` | typed `session.not-implemented`; `context.locked` after the lock |
-| `extend-context` | `{"session_id", …}` | typed `session.not-implemented`; `context.missing` with no base context, `context.locked` after the lock |
-| `lock-context` | `{"session_id"}` | **the state machine is real**: `context.missing` with no base context, `context.locked` on a second lock. The freeze behind it answers typed `session.not-implemented` |
+| `send-context` | `{"session_id", "archive": {"size", "sha256"}}` + BINARY frames | **answers**: the pins accepted and the context state. `context.exists` on a second base context, `context.locked` after the lock |
+| `extend-context` | `{"session_id", "archive"?, "remove"?}` + BINARY frames | **answers**: the context state, the file count and how many named paths were removed. `context.pins-immutable` for `context.yaml`, `context.missing` with no base context, `context.locked` after the lock |
+| `lock-context` | `{"session_id"}` | **answers**: `{"context_id"}` and nothing else. `context.missing` with no base context, `context.locked` on a second lock |
 | `verify` | `{"session_id"}` | `context.not-locked` before the lock; typed `session.not-implemented` after it |
 | `build` | `{"session_id", "mode"}` | `context.not-locked` before the lock; typed `session.not-implemented` after it |
-| `cancel` | `{"session_id", "invocation_id"}` | typed `session.not-implemented`; the session and its lease are untouched |
+| `cancel` | `{"session_id", "invocation_id"}` | **answers**: the stop signal is set (never "it stopped"); `already_finished` for a completed invocation, `invocation.unknown` for one this session never ran. The session, its lease and its context are untouched |
 | `get-artifact` | `{"session_id", "invocation_id", "path"}` | typed `session.not-implemented` |
 | `attach-session` | `{"session_id"}` | **answers**: the session record with its context state, and the lease (event replay is future work) |
 | `close-session` | `{"session_id"}` | **answers**: the closed session record |
@@ -211,6 +214,112 @@ leaves the compile running and the resources held. It is the deliberate
 counterpart to `attach-session` — connection loss is never abandonment,
 and the idle timeout counts absent *commands* rather than absent
 connections, so cancellation has to be something a client says.
+
+### Sending a context
+
+`send-context` and `extend-context` carry their archive **out of band**:
+the verb's JSON payload announces it, the bytes follow as WebSocket
+BINARY frames, and the verb's own result frame is the acknowledgement.
+
+```jsonc
+→ {"id": "3", "type": "send-context", "payload": {
+     "session_id": "s-…",
+     "archive": {"size": 4711, "sha256": "<64 lowercase hex digits>"}}}
+→ <binary frame> <binary frame> …                     // the tar.zst itself
+← {"id": "3", "type": "result", "payload": {
+     "session_id": "s-…",
+     "context": {"state": "unlocked", "format": 1},
+     "pins": {"mcuhome": {…}, "container": {…}, "target": {…}}}}
+```
+
+ADR 0019 §2 spells the verb `send-context(archive)`, and that one word
+is the whole wire specification the verb set gives it; everything above
+is the product owner's decision of 2026-08-09. The format is **tar.zst**
+and is not negotiated — one format, chosen for family consistency with
+the SDK package the same contract pins. Binary frames are accepted
+**only while an upload is announced**; outside one this endpoint still
+speaks JSON text frames only. One upload at a time per connection,
+because a binary frame carries no id and can only belong to the upload
+that is running.
+
+`extend-context` takes the same archive for its add/overwrite half plus
+an optional `"remove": [...]` of context paths, and both may travel in
+one call; removals are applied first, so a path named in both ends up as
+the archive's version. Removing a path that is not there is not an
+error — the client asked for a state and that state holds — and the
+answer says how many of the named paths existed. Neither half may touch
+`context.yaml`: it carries the pins the session was admitted on, and
+changing them is a new session rather than an extension
+(`context.pins-immutable`).
+
+`lock-context` takes `session_id` and nothing else and answers
+`{"context_id": "sha256:…"}` and nothing else. The comparison ADR 0019
+requires — both sides comparing values they computed independently —
+therefore happens **on the client**: the workbench computes the ID from
+the bytes it sent and closes the session on a disagreement. This server
+never sees the client's value, so it can never raise that mismatch.
+
+### The hardening floor
+
+ADR 0019 decision 8, and it is identity-independent: single-tenancy
+reduces none of it.
+
+- **Five ingress caps, enforced streaming** — compressed size,
+  cumulative decompressed size, entry count, per-file size, path depth.
+  All five are configuration (`--max-compressed-bytes` and friends,
+  defaults 64 MiB / 256 MiB / 4096 / 64 MiB / 16), because the ADR
+  requires the caps and names no number for any of them. The first three
+  count **cumulatively across the base context and every extension**: a
+  per-archive cap would bound nothing, since `extend-context` repeats.
+  A violation is `policy.ingress-limit-exceeded`.
+  The 8 MiB WebSocket `max_msg_size` is a cap on a *frame* and is
+  deliberately not this: a limit that only fires after the bytes arrived
+  is not a limit. A decompression bomb is refused after at most one
+  128 KiB output chunk over the budget.
+- **Safe extraction** — regular files and directories only; absolute
+  paths, `..`, symlinks, hardlinks and device nodes refused
+  (`context.unsafe-entry`), and so are a name longer than the filesystem
+  can hold and a path claimed as a file and a directory at once — in one
+  archive or between an extension and the context it lands in. Writes
+  are confined to `context.yaml` at the root plus `model/`, `keys/` and
+  `patches/<layer>/`, inside a per-session directory this server owns.
+  `manifest.yaml` is written here at the lock and is never an extraction
+  target. The archive's own mode bits are discarded.
+- **Never trust client-declared hashes** — the declared archive hash is
+  recomputed from the bytes that arrived (`context.integrity-mismatch`),
+  and every context file is re-hashed at the lock. `context.yaml` is
+  re-measured against what `send-context` accepted, because the pins are
+  three of the four hashed inputs and the document that declares them is
+  outside the integrity list by construction.
+- **Per-session disk quota** — `--session-quota-bytes`, default 2 GiB,
+  answered `policy.quota-exceeded` rather than by the host running out
+  of room.
+- **`context.yaml` is parsed defensively** — bounded before it is parsed
+  at all (`--max-context-yaml-bytes`, default 64 KiB: a YAML parser is
+  the one place here where a small input buys unbounded work),
+  safe-loaded so no tag can construct an object, and refused for
+  duplicate keys and for anchors. It is measured against the context
+  format the session was **admitted on**, never against whatever this
+  server's newest supported version happens to be.
+
+The per-session directory lives under `--context-root` (default: the
+XDG state directory) and is deleted at `close-session`, at lease or idle
+expiry, on any refused upload, and when the server shuts down. Expiry is
+a **periodic sweep** rather than something a client has to ask for: a
+client that crashes or simply closes its socket must not be able to
+leave a device's commissioning credentials on disk, or hold an admission
+slot, until somebody restarts the process. The one case that does leave
+a directory behind is a server killed outright, and it is deliberately
+not answered by sweeping `--context-root` at startup — two servers
+sharing one root is a misconfiguration, and a startup sweep would answer
+it by deleting the other's live sessions.
+
+The root itself is checked before the server serves out of it: every
+level it creates is created `0o700`, and every existing level up to `/`
+must be owned by this server or by root and must not be world-writable
+without the sticky bit. The default falls back to `/tmp` when a service
+manager gives the process no `HOME`, and a fixed name in a directory
+every local user can write to is a directory somebody else can own.
 
 ### The error envelope
 

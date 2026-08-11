@@ -8,7 +8,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The `subprocess` backend profile** — the second of the two profiles
+  build-container contract §1.2 defines, and the one ADR 0019 names the
+  Home Assistant App case. The build environment is the server's own
+  filesystem and the program runs as a **child process** instead of
+  through `docker exec`. `--backend-profile {container,subprocess}`
+  (env `MCUHOME_BUILDSERVER_BACKEND_PROFILE`) picks one for the process,
+  the default stays `container`, and `open-session` answers the choice
+  in `negotiated.backend_profile` — which is the field that tells a
+  client which promises are being made to it.
+  - `--program PATH` (env `MCUHOME_BUILDSERVER_PROGRAM`) names the
+    executable, invoked as `<program> <action> <request document>` —
+    §5.1's frozen argv with nothing in front of it and nothing looked up
+    on `PATH`. With none configured it is the installed MCUHome compiler
+    through this server's own interpreter, which is the same entry point
+    the build container's `/mcuhome/run` execs.
+  - The child is started with a **stated** environment rather than an
+    inherited one, and the statement is *composed*: `PATH`, `HOME`,
+    `USER`/`LOGNAME`, `TMPDIR`, `TZ`, the locale and the `ZEPHYR_*`,
+    `ZAP_*` and `CMAKE_*` namespaces — what makes this filesystem a
+    build environment — and nothing of this server's own service
+    environment, `MCUHOME_BUILDSERVER_TOKEN` above all. Contract §5.1
+    says "no environment variable carries information the program
+    needs", so nothing conforming can miss what is left out, while a
+    copied environment would put the bearer token into
+    `/proc/<pid>/environ` of every compiler child and into the raw log
+    stream of any build step that prints its environment.
+  - **The reduced promises are stated, never silently absent**: no
+    network isolation, no per-session resource limits, no trust
+    boundary — and, as a consequence of the third, no kernel-enforced
+    write protection of `context` (§9.1's "strongest means its profile
+    has" is, here, the obligation itself). The `--container-*` limits do
+    nothing in this profile and this server says so instead of
+    reinterpreting them. `limits.jobs` **is** passed through and stays
+    authoritative: it is the only budget this profile has.
+  - **One build environment, and it is the one this server runs in**
+    (§1.2). The Zephyr line it carries is *discovered from the program*
+    — `describe`'s `program.trees.zephyr.version` (§7.1.1), with west's
+    leading `v` dropped exactly as the build container's own
+    `org.mcuhome.zephyr` label does — and is deliberately not
+    configurable. A context requiring another line is
+    `version.builder-unsatisfiable` with the required line and the
+    served lines in its details, the same code and detail shape the
+    container profile answers; a program naming no usable Zephyr version
+    (a host with the compiler installed and no west workspace behind it,
+    or a third-party program that declares none) is refused at discovery
+    with `version.builder-unavailable`, because absence is never read as
+    compatible (§2.1.1).
+  - With no image to name, `capabilities` answers **one entry per served
+    line** (reference `<program id>:<version>`, `digest: null`, the
+    `org.mcuhome.contract` and `org.mcuhome.zephyr` labels and
+    deliberately no `org.mcuhome.toolchain`), and `manifest.yaml`'s
+    `container:` block records the program's id and version with
+    `digest: null`.
+  - **Writable views**: a patched `sdk` is handed over writable exactly
+    as in the container profile, because the SDK is unpacked per session
+    and dies with it. Any other patched layer gets **no `trees` entry** —
+    this backend constructs no host-side overlay and makes no copy, and
+    asserting `writable: true` for a shared persistent tree would leak
+    one session's patches into every later build. The `/trees/<layer>`
+    pointer still goes into the request's `required` list, so a
+    conforming program refuses the context with `unsupported.required`
+    (§5.2 rule 2, a parsing refusal that precedes any work) naming that
+    pointer in `error.details.required`. A program declaring a *fixed
+    path* for `sdk` is refused at discovery
+    (`version.builder-unavailable`): there is no mount namespace to give
+    concurrent sessions their own view of one path (§4).
+  - Cancellation reaches the **program and everything it started**: the
+    child is spawned in its own process group and cancel, deadline and
+    `close-session` all signal that group, so west, cmake, ninja and the
+    compilers cannot survive as orphans on a host that has no
+    per-session PID or memory ceiling. In the container profile SIGTERM
+    only ever reached the `docker exec` client. `close-session`
+    escalates over the group — SIGTERM, a bounded wait, SIGKILL — which
+    is this profile's `docker rm --force`.
+
 ### Changed
+
+- **`ContainerBackend` now stands on a shared `SessionBackend`**, which
+  owns everything contract §9 asks of a backend in *either* profile: the
+  per-invocation directories, the request document, the SDK verified
+  against its pin, one invocation at a time per `work`, liveness, the
+  event and log relay, egress hardening and the verdict. A profile
+  supplies five things — `inventory`, `resolve_image`,
+  `_session_environment`, `_materialize`, `_start`, `_release_runtime`.
+  Behaviour of the container path is unchanged; the refactor is what
+  makes "neither shape moves a duty from this list onto the program"
+  (§9.1) a property of the code rather than of two transcriptions.
+  - `ImageProfile` keeps its container-specific naming and inherits the
+    profile-independent half (`ProgramProfile`): `describe`'s block, the
+    action set, the tree paths and the `send-context` wire answer.
+  - New `processes.py` holds the child-process plumbing both profiles
+    start theirs with — the log pump, the line cap, the
+    signal-an-exited-process rule, the process group and the bounded
+    escalation over it. `container.run_docker` and `spawn_docker` stay
+    as this profile's own seam, so a suite that stubs docker out does
+    not thereby stub the other profile out. Two properties of the shared
+    spawn are new and matter in both profiles: every spawned child is a
+    session leader, so a signal addresses the child *and its
+    descendants* rather than one pid; and the exit status is answered
+    when the child exits rather than when its log pipe closes, so a
+    descendant holding the inherited stdout can no longer make an
+    invocation unfinishable (the last lines still get a bounded grace,
+    and an expired one is logged). The container profile's child is a
+    short-lived `docker exec` client with no descendants, so a group of
+    one behaves there exactly as the single pid did.
 
 - **Context format 2: the client requires a Zephyr line, this server
   chooses the container** (E61, product owner). A context no longer pins

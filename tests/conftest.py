@@ -174,6 +174,20 @@ class FakeProcess:
         self._hang = False
         self._code = -9
 
+    async def stop(self) -> None:
+        """Teardown's escalation, with the grace collapsed to nothing.
+
+        The real one (:meth:`mcuhome_buildserver.processes.ChildProcess.stop`)
+        asks the process group, waits a bounded moment and kills what is
+        left. The shape a test needs from it is the *ladder* and not the
+        clock: a child that goes away on SIGTERM is never killed, and one
+        that does not always is.
+        """
+        self.terminate()
+        await asyncio.sleep(0)
+        if self._hang:
+            self.kill()
+
 
 @dataclass
 class FakeDocker:

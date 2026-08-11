@@ -22,6 +22,14 @@ reference states about its own seam: a default bound at definition time
 cannot be replaced by monkeypatching the module, and a test that thinks
 it stubbed docker out but did not is a test that starts a real build.
 
+Both are one line each over :mod:`mcuhome_buildserver.processes`, which
+owns the child-process plumbing every profile needs — the log pump, the
+line cap, the signal-an-exited-process rule. They stay *here* as their
+own names anyway, because they are this profile's seam: a suite that
+stubs docker out must not thereby stub the ``subprocess`` profile's
+program out as well, and a shared function would be one seam for two
+things nobody ever wants replaced together.
+
 **Three refusals before anything else, because they have three
 different fixes.** No docker binary, no daemon, no image: a build that
 dies ten seconds in with somebody else's error text does not tell them
@@ -45,8 +53,6 @@ and PID 1 has to reap them.
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import json
 import logging
 import os
@@ -55,11 +61,18 @@ import shlex
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from mcuhome.model.context import ContainerResolution
 
 from mcuhome_buildserver.errors import SessionError
+from mcuhome_buildserver.processes import (
+    Completed,
+    LineSink,
+    Process,
+    run_command,
+    spawn_command,
+)
 
 __all__ = [
     "CONTRACT_LABEL",
@@ -123,45 +136,6 @@ SESSION_LABEL = "org.mcuhome.build-server.session"
 _CONTAINER_ID = re.compile(r"[0-9a-f]{12,64}\Z")
 
 
-@dataclass(frozen=True)
-class Completed:
-    """One finished docker command.
-
-    ``status`` is ``None`` when the program does not exist at all, which
-    is the one failure that has to be told apart from a non-zero exit:
-    "docker is not installed" and "docker said no" have different fixes.
-    """
-
-    status: int | None
-    output: str
-
-    @property
-    def ok(self) -> bool:
-        return self.status == 0
-
-
-class Process(Protocol):
-    """A docker command that is still running.
-
-    Three operations and no more, because three are what liveness policy
-    needs (:mod:`mcuhome_buildserver.backend`): wait for the exit status,
-    ask politely, insist.
-    """
-
-    async def wait(self) -> int: ...
-
-    def terminate(self) -> None: ...
-
-    def kill(self) -> None: ...
-
-
-#: Where a docker command's merged output goes, line by line, as it
-#: arrives. Merged rather than split because contract §8 says the two
-#: streams **are** one stream: "standard output and standard error
-#: together are one raw, opaque log stream".
-LineSink = Callable[[str], None]
-
-
 async def run_docker(argv: Sequence[str]) -> Completed:
     """Run *argv* to completion, capturing its merged output.
 
@@ -169,46 +143,14 @@ async def run_docker(argv: Sequence[str]) -> Completed:
     that is not a build — probing the daemon, inspecting an image,
     starting and removing a container — is short, bounded and wants its
     output as a value, so it comes through here.
+
+    A ``docker`` client is told nothing about its environment: it is a
+    client of a daemon, it reads ``DOCKER_HOST`` and the operator's own
+    configuration out of the environment this server was started in, and
+    stating one here would be this server deciding how an operator
+    reaches their runtime.
     """
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *argv,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-    except OSError:
-        return Completed(status=None, output="")
-    output, _ = await process.communicate()
-    return Completed(status=process.returncode, output=output.decode("utf-8", errors="replace"))
-
-
-#: What signalling a process that already exited raises. It is not news
-#: and it is the ordinary end of the liveness ladder: SIGTERM goes out
-#: on a timer, and the timer does not know the child finished a
-#: millisecond earlier.
-_ALREADY_GONE = (ProcessLookupError, OSError)
-
-
-class _Subprocess:
-    """The default :class:`Process`: one ``asyncio`` child, streamed."""
-
-    def __init__(self, process: asyncio.subprocess.Process, pump: asyncio.Task[None]) -> None:
-        self._process = process
-        self._pump = pump
-
-    async def wait(self) -> int:
-        # The pump has to finish before the status is answered, or the
-        # last lines of a build's log race the frame that says it ended.
-        await self._pump
-        return await self._process.wait()
-
-    def terminate(self) -> None:
-        with contextlib.suppress(*_ALREADY_GONE):
-            self._process.terminate()
-
-    def kill(self) -> None:
-        with contextlib.suppress(*_ALREADY_GONE):
-            self._process.kill()
+    return await run_command(argv)
 
 
 async def spawn_docker(argv: Sequence[str], *, on_line: LineSink) -> Process:
@@ -219,44 +161,8 @@ async def spawn_docker(argv: Sequence[str], *, on_line: LineSink) -> Process:
     build log, which has to reach the client while the build runs rather
     than as a value at the end, and the process has to stay addressable
     so that liveness policy can reach it.
-
-    Lines longer than :data:`_MAX_LOG_LINE` are cut rather than buffered.
-    A compiler that emits a megabyte on one line is not news worth
-    holding memory for, and the frame cap on the wire would refuse it
-    anyway.
     """
-    process = await asyncio.create_subprocess_exec(
-        *argv,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        limit=_MAX_LOG_LINE,
-    )
-    pump = asyncio.ensure_future(_pump(process, on_line))
-    return _Subprocess(process, pump)
-
-
-#: The longest log line this server carries in one frame. Not a contract
-#: number: §8 makes the log stream raw and opaque, so this is only how
-#: much of one line is worth relaying before it stops being readable.
-_MAX_LOG_LINE = 64 * 1024
-
-
-async def _pump(process: asyncio.subprocess.Process, on_line: LineSink) -> None:
-    """Read the child's merged output until it closes, line by line."""
-    stream = process.stdout
-    if stream is None:  # pragma: no cover - stdout is a PIPE above
-        return
-    while True:
-        try:
-            raw = await stream.readline()
-        except (ValueError, asyncio.LimitOverrunError):  # pragma: no cover - very long line
-            # `readline` raises rather than truncating once the buffer
-            # limit is passed. The partial line is dropped, which is what
-            # a raw opaque stream permits and what memory requires.
-            continue
-        if not raw:
-            return
-        on_line(raw.decode("utf-8", errors="replace").rstrip("\n"))
+    return await spawn_command(argv, on_line=on_line)
 
 
 @dataclass(frozen=True)

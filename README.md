@@ -14,7 +14,9 @@ environment.** It materializes paths, invokes the build program and
 reads its result — over `docker exec` into a per-session container, or
 as a subprocess in one shared filesystem where there is no container
 runtime. Both profiles are specified by
-[the build-container contract](https://github.com/mcu-home/mcuhome/blob/main/docs/design/build-container-contract.md) §1.2.
+[the build-container contract](https://github.com/mcu-home/mcuhome/blob/main/docs/design/build-container-contract.md) §1.2,
+and both are implemented here; `--backend-profile` picks one and
+`open-session` tells the client which it got.
 
 It has no user interface, no configuration tree, no secrets store and no
 signing key. It knows the one device it is currently building and
@@ -32,7 +34,7 @@ nothing else.
 > a bearer token on a plaintext connection is a token you have given
 > away.
 
-## Status: it builds
+## Status: it builds, in both profiles
 
 The whole protocol surface is real, and since 2026-08-10 so is the
 **container backend**. A client can connect, negotiate, open a session,
@@ -41,6 +43,14 @@ and `build` in a per-session container, watch the invocation's events
 and raw log as they happen, download the artifacts as a `tar.zst`, and
 close the session — which reaps the container and deletes everything it
 held.
+
+Since 2026-08-11 the **subprocess backend** is real too: the same
+session, the same verbs and the same invocation ABI, with the program
+started as a child process of this server instead of through `docker
+exec`. `--backend-profile` picks which one serves, and `open-session`
+answers it in `negotiated.backend_profile`. What the second profile does
+*not* promise is named rather than left to be discovered — see
+[Backend profiles](#backend-profiles).
 
 No verb answers `session.not-implemented` any more. The code stays in
 the registry, because the registry is append-only and a future verb will
@@ -94,14 +104,16 @@ the command line wins. `--help` lists them all.
 | `--allowed-origin` | none | accepted browser origin for the WebSocket upgrade (repeatable) |
 | `--allow-patch-layer` | none | allow build-context patches for a layer (`sdk`, `zephyr`, `chip`, `mcuboot`, or an `x-` name); repeatable; unlisted layers are denied |
 | `--sdk-source` | none | directory holding `mcuhome-sdk-<version>.tar.zst`; repeatable and searched in order. With none configured, every working action refuses `sdk.unavailable` |
-| `--docker` | `docker` | the container runtime to drive |
+| `--backend-profile` | `container` | which profile of contract §1.2 serves: `container` or `subprocess` |
+| `--program` | the installed compiler | `subprocess` profile only: the executable implementing the invocation ABI |
+| `--docker` | `docker` | `container` profile only: the container runtime to drive |
 | `--build-jobs` | `2` | `limits.jobs` for every invocation — authoritative, resolved host-side |
 | `--build-deadline-seconds` | `5400` | how long one invocation may run before this server stops it |
 | `--cancel-grace-seconds` | `60` | how long a cancelled invocation has to stop itself before the hard path |
 | `--max-artifact-bytes` | 256 MiB | egress cap: the size of one artifact this server will serve |
-| `--container-memory` | `8g` | `docker run --memory` for the session container; the empty string removes the ceiling |
-| `--container-pids` | `4096` | `docker run --pids-limit` for the session container |
-| `--container-cpus` | none | `docker run --cpus` for the session container |
+| `--container-memory` | `8g` | `container` profile only: `docker run --memory` for the session container; the empty string removes the ceiling |
+| `--container-pids` | `4096` | `container` profile only: `docker run --pids-limit` for the session container |
+| `--container-cpus` | none | `container` profile only: `docker run --cpus` for the session container |
 | `--ccache-dir` | none | shared compiler cache, offered to every invocation **read-only** |
 | `--log-level` | `INFO` | logging verbosity |
 
@@ -123,6 +135,12 @@ state a number nothing behind it keeps. `--container-cpus` is unset by
 default because `--build-jobs` already bounds the parallelism a
 conforming program asks for.
 
+**In the `subprocess` profile those three do nothing, and this server
+does not pretend otherwise**: they are `docker run` flags and there is
+no container. `--build-jobs` still applies, and there it is the *only*
+budget there is — which is exactly why §5.2 makes it authoritative
+rather than a hint.
+
 There is no writable-cache option and there will not be one. §10:
 "shared backends MUST offer a shared cache read-only for untrusted
 work; cache warming is a deliberate operator invocation with a writable
@@ -136,6 +154,154 @@ sessions, session TTL, idle timeout and the compile-lane limit — are
 **not configurable yet**: they exist as defaults on `SessionManager`
 (`sessions.py`) with no option in front of them. Inventing options for
 them now would advertise knobs that do nothing.
+
+## Backend profiles
+
+Contract §1.2 defines two shapes a build environment can have, and this
+server implements both. `--backend-profile` chooses one for the process;
+every session it serves is answered with that profile in
+`open-session`'s `negotiated.backend_profile`, because the profile
+decides which promises are being made and a client must not have to
+infer them from behaviour.
+
+| | `container` (default) | `subprocess` |
+|---|---|---|
+| Where the build runs | one container per session, started by this server | a child process of this server, in this filesystem |
+| How the program is invoked | `docker exec` | `<program> <action> <request>` |
+| Network during an invocation | `--network=none`, kernel-enforced | **not isolated** — an obligation on the program, unenforceable here |
+| Per-session CPU/memory/PID limits | `--memory`, `--cpus`, `--pids-limit` | **none** |
+| Trust boundary | the session is one | **none** — same filesystem, same user |
+| Cancellation | sentinel file; SIGTERM reaches the `docker exec` client only | sentinel file; **SIGTERM reaches the program's process group**, so the compile it started goes with it |
+| `limits.jobs` | authoritative | authoritative, and the only budget there is |
+| Build environments served | every conforming image on the host, chosen per context | exactly one: the environment this server runs in |
+
+Everything else is identical, and identical in the strong sense of being
+the same code: the per-invocation directories, the request and result
+documents, the SDK verified against its pin, the event and log relay,
+egress hardening, the verdict and the artifact download are
+`SessionBackend`'s and are shared verbatim. §9.1 says of that list that
+"neither shape moves a duty from this list onto the program".
+
+### What the `subprocess` profile does not promise
+
+Stated here rather than left to be discovered, because a promise nobody
+made is still a promise somebody assumed.
+
+- **No network isolation.** §9.1's "no network during an invocation"
+  still binds the program, and this server cannot check it. A build that
+  quietly fetched something would succeed here and fail in a container.
+- **No per-session resource limits.** A runaway link step takes the host
+  down. `--build-jobs` is the only lever, and the deadline
+  (`--build-deadline-seconds`) is enforced by this server as before.
+- **No trust boundary.** The program runs as this server's own user in
+  this server's own filesystem. §9.1 asks a backend to write-protect
+  `context` and every non-writable tree "with the strongest means its
+  profile has"; here that means is *nothing stronger than the
+  obligation*, because any mode this server could set the program could
+  also undo. A context that is read-only in this profile is §9.2 rule 1
+  being honoured, not enforced.
+- **No writable view of a patched persistent layer.** The SDK is
+  unpacked per session and dies with it, so a patched `sdk` is handed
+  over writable exactly as in the container profile. Every other layer
+  belongs to a build environment that outlives the session, and §6.2
+  makes constructing a view of it the backend's job here — an overlay or
+  a copy. This server constructs neither, so it names no `trees` entry
+  for such a layer while still demanding the `/trees/<layer>` pointer in
+  `required`, and a conforming program refuses the context with
+  `unsupported.required` — §5.2 rule 2, a parsing refusal that comes
+  before any work — naming that pointer in `error.details.required`.
+  Asserting `writable: true` for a shared tree would leak one session's
+  patches into every later build on the host, silently.
+
+What the profile *keeps* is what §1.2 says it keeps: **cancellability
+and process-level isolation**. A cancel actually reaches the build here,
+which is the one point where this profile is stronger than the other:
+the program is started in its own process group, and cancel, deadline
+and `close-session` signal that group, so west, cmake, ninja and the
+compilers go with the program instead of surviving it as orphans on a
+host with no per-session PID or memory ceiling. An out-of-memory kill or
+a segfaulting compiler takes the child and not the server; and a third
+party may still write the program in any language, because it is started
+as a process and not loaded as a library.
+
+### One build environment, and how it is identified
+
+"A `subprocess`-profile backend serves **exactly one build environment —
+the one it runs in**. It MUST reject, typed, any session whose context
+requires a Zephyr line that build environment does not carry" (§1.2).
+
+The line this environment carries is **discovered, never configured**,
+and it is discovered from the program: `describe` answers
+`program.trees.zephyr.version` (§7.1.1), west's spelling of it loses its
+leading `v` exactly as the build container's own `org.mcuhome.zephyr`
+label does, and the release is reduced to a line by the same function
+the container profile reads its labels through. A configuration knob for
+it would let an operator declare a line their filesystem does not carry,
+which is the exact claim the refusal exists against — and a constant in
+a package installed beside *this server* would be that same claim with
+the operator left out, true only while the program is the default one.
+`--program` is precisely the case where it would not be: a third party's
+binary over a build environment this server installed nothing of.
+
+A context requiring another line is `version.builder-unsatisfiable`,
+naming the line required and the lines served — the same code and the
+same details the container profile answers when no image on the host
+carries the line. A program that names **no** usable Zephyr version is
+refused at discovery instead (`version.builder-unavailable`), so
+`capabilities` answers an empty inventory and `send-context` refuses:
+absence is never read as compatible (§2.1.1). That is also what a host
+with the compiler installed and no west workspace behind it looks like,
+and refusing it here is the difference between one legible refusal and
+every build failing deep inside the program after the SDK package has
+been fetched, hashed and unpacked.
+
+Because there is no image, the two places an image would be named are
+answered out of `describe`, which §7.1 makes "the only discovery channel
+that exists in the `subprocess` profile":
+
+- `capabilities` lists **one entry per served line**, with the program's
+  `id:version` as its reference, `digest: null` (there are no bytes to
+  fetch) and the `org.mcuhome.contract` and `org.mcuhome.zephyr` labels.
+  `org.mcuhome.toolchain` is **absent** — the coupling labels are
+  properties of an image, and this server cannot state the toolchain
+  identity of a host it did not build.
+- `manifest.yaml`'s `container:` block records `image: <program id>`,
+  `tag: <program version>`, `digest: null`. §3.2 makes the block "the
+  record of which build environment answered this context's requirement",
+  and that is what it is here.
+
+### Configuring the program
+
+`--program` names the executable, invoked as `<program> <action>
+<absolute path of the request document>` — §5.1's frozen argv, with
+nothing in front of it and nothing looked up on `PATH`, because a third
+party may ship a compiled binary and an interpreter this server chose
+would make MCUHome's implementation language a requirement.
+
+With no `--program`, the program is the installed MCUHome compiler
+reached through this server's own interpreter (`sys.executable -m
+mcuhome.compiler.abi`) — the same entry point the build container's
+`/mcuhome/run` execs, which is why that launcher is three lines.
+
+The child is started with a **stated** environment rather than an
+inherited one, and the statement is composed rather than copied. What it
+carries is what makes this filesystem a build environment — `PATH`,
+`HOME`, `USER`/`LOGNAME`, `TMPDIR`, `TZ`, the locale (`LANG`, `LC_*`),
+`PYTHONPATH`, and the `ZEPHYR_*`, `ZAP_*` and `CMAKE_*` namespaces the
+toolchain is located through. What it does **not** carry is this
+server's own service environment, `MCUHOME_BUILDSERVER_TOKEN` above all:
+the container profile never had to decide this (`docker exec` passes no
+`-e`), while here the whole environment would otherwise reach west,
+ninja and every compiler child, and any build step that printed its
+environment would put the bearer token into a raw log stream a client
+can persist. Contract §5.1 says "no environment variable carries
+information the program needs", so nothing conforming can miss what is
+left out. A program that declares a *fixed path* for the
+`sdk` tree cannot be served here and is refused at discovery
+(`version.builder-unavailable`): this server has no mount namespace, so
+it cannot give each concurrent session its own view of one path, and §4
+says exactly that such a backend "cannot use that image. It learns so
+from `describe`, before it starts a session".
 
 ## The API
 
@@ -351,12 +517,17 @@ client can still read.
 **Liveness** is a ladder, and the sentinel is its first rung because it
 is the only one that lets the program write a result document. A cancel
 or a passed deadline creates the sentinel; `--cancel-grace-seconds`
-later the `docker exec` client gets SIGTERM; ten seconds after that,
-SIGKILL. It is worth saying plainly that SIGTERM does not reach the
-process inside the container — killing a `docker exec` client never has,
-which is exactly why the contract has a cooperative sentinel at all.
-What actually reaps a program that ignored both is the container going
-away at `close-session`.
+later the child gets SIGTERM; ten seconds after that, SIGKILL. It is
+worth saying plainly which child that is, because it differs by profile.
+In the `container` profile it is the `docker exec` client, and SIGTERM
+does not reach the process inside the container — killing an exec client
+never has, which is exactly why the contract has a cooperative sentinel
+at all; what actually reaps a program that ignored both is the container
+going away at `close-session`. In the `subprocess` profile the child is
+the program, started in its own process group, and both rungs signal
+that group — so the compile the program started is reached too, and
+`close-session` escalates over the same group (SIGTERM, a bounded wait,
+SIGKILL) before the session's directory is deleted.
 
 **Patched layers cost nothing to make writable.** In the `container`
 profile the container's own copy-on-write layer **is** the writable view
@@ -617,9 +788,10 @@ transfer it already paid for.
 | `GET /health` | liveness, open, says nothing about what this server holds |
 
 `/health` names this service's own version and nothing else. It used to
-also report the version of the `mcuhome` build tool this server spawned;
-there is no such subprocess any more, and the build environments it
-drives are per-session, so no single version could be named here
+also report the version of the `mcuhome` build tool this server ran
+in-process-adjacent as a job; that job protocol is gone, and the build
+environments this server drives are per-session and are somebody else's
+program in both profiles, so no single version could be named here
 truthfully. What this server can build is a question for the
 `capabilities` verb.
 
@@ -721,11 +893,22 @@ Packaging lives in the future packaging repo, not here. What this
 package expects of it: `/share` mounted so the token can be published
 for the dashboard App to find, and a build environment it can drive —
 which in an App is the `subprocess` profile of the container contract,
-since an App has no container runtime of its own. **This server does not
-implement that profile**: it is a `container`-profile backend and says
-so at `open-session`. A `subprocess`-profile backend "serves exactly one
-build environment — the one it runs in", which is a different program
-from this one.
+since an App has no container runtime of its own.
+
+Run it with `--backend-profile subprocess`. The App image then has to
+carry the build environment itself: a toolchain, a west workspace, and
+the MCUHome compiler the program is (or another conforming program named
+by `--program`). That is a requirement and not a recommendation, and the
+server checks it at the first `describe`: a program whose workspace is
+missing declares no Zephyr version for its `zephyr` tree, serves no
+line, and is refused with `version.builder-unavailable` — an empty
+`capabilities` inventory rather than builds that fail deep inside the
+program. What that image does *not* need is a container runtime, which
+is the whole reason the profile exists. Read
+[Backend profiles](#backend-profiles) before shipping one — the
+isolation an App gives up is named there, and it is given up in a
+deployment where operator, user and device owner are the same person,
+which is the reason ADR 0019 accepts it at all.
 
 ### Standalone and self-hosted
 
@@ -757,6 +940,17 @@ so a test that does not care about the container never has to know what
 one looks like, and a test that wants a non-conforming one replaces a
 single attribute.
 
+`tests/test_subprocess_backend.py` mirrors that arrangement one seam
+over: the same fake programs drive `mcuhome_buildserver/program.py`'s
+two impure functions, again by an autouse fixture, and several of its
+tests assert that the docker fake was never called at all — "no
+container runtime needed" is the profile's whole point, and looking is
+cheaper than believing. Exactly one test there starts a real child
+process, and it runs a three-line Python snippet: the argument for this
+profile being a subprocess rather than an in-process call is that a
+build can be killed without taking the server with it, and a fake that
+records `kill()` cannot show that.
+
 What that leaves under test is exactly what a backend is: the argv it
 composes, the request documents it writes, what it makes of the result
 documents that come back, and what reaches the client while it happens.
@@ -781,8 +975,11 @@ install the sibling checkout's backend (`pip install -e
 | `ws.py` | the `/ws` endpoint and the command loop |
 | `ingress.py` | the streaming ingress caps and safe extraction, for a context and for an SDK package |
 | `contextstore.py` | the per-session directory, `context.yaml`, the freeze, and the re-measurement before every invocation |
-| `backend.py` | the container backend: image discovery, the session's container, invocations, liveness and the streams |
+| `backend.py` | the backend seam every profile shares — per-invocation directories, the request document, liveness, the streams, egress, the verdict — and the container backend on it |
+| `subprocessbackend.py` | the `subprocess` profile: one build environment, this filesystem, the program as a child process |
 | `container.py` | docker, and the one seam every call to it goes through |
+| `program.py` | the program of the `subprocess` profile: its argv, its stated environment, and the one seam every start of it goes through |
+| `processes.py` | child processes: run one to completion, or spawn one and stream it. Both profiles start theirs here |
 | `abi.py` | the invocation ABI: the request document out, the result document back |
 | `events.py` | the invocation's NDJSON event stream: relay and replay |
 | `artifacts.py` | egress hardening, and the download archive |

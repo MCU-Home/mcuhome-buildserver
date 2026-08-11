@@ -873,12 +873,18 @@ async def open_session(state: Any, connection: Any, command: Command) -> dict[st
 
     ``negotiated.backend_profile`` is ``container`` or ``subprocess``
     (build-container contract §1.2), the field ADR 0019's amendment puts
-    in this response. It is ``container`` and can never be anything
-    else here: a ``subprocess``-profile backend "serves exactly one
-    build environment — the one it runs in", and this process is an
-    orchestrator that is never itself a build environment. Patch
-    *policy* is enforced against the files actually present, so it runs
-    at ``send-context``/``extend-context`` time, not here.
+    in this response. It is **this server's configured profile**
+    (``--backend-profile``) and is the one thing a client learns about
+    which promises are being made to it: the ``subprocess`` row of §1.2
+    makes none of the isolation promises the ``container`` row makes —
+    no network isolation, no per-session resource limits, no container
+    trust boundary — and a client that cannot see which profile served
+    it would have to infer that from behaviour. Both profiles are
+    orchestrators and neither is itself the build environment; what
+    differs is how much of that environment the kernel keeps apart.
+
+    Patch *policy* is enforced against the files actually present, so it
+    runs at ``send-context``/``extend-context`` time, not here.
     """
     protocol_version = command.optional_int("protocol_version")
     if protocol_version is None:

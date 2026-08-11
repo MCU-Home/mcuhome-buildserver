@@ -1,34 +1,43 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""The container backend: one session, one container, and what runs in it.
+"""The backend seam, and the container backend standing on it.
 
-This is the part of the build server that build-container contract §1.2
-calls a backend in the ``container`` profile: "the backend materializes
-one container per session and invokes the program inside it", with every
+Two things live here. :class:`SessionBackend` is everything a backend of
+build-container contract §9 does **whatever profile it serves** — the
+per-invocation directories, the request document, liveness, the event and
+log relay, egress and the verdict. :class:`ContainerBackend` is the
+``container`` profile of §1.2 on top of it: "the backend materializes one
+container per session and invokes the program inside it", with every
 isolation guarantee of ADR 0019 §8 — one session = one container
-instance = the trust boundary, no network, per-session limits.
+instance = the trust boundary, no network, per-session limits. The other
+profile is :class:`~mcuhome_buildserver.subprocessbackend.SubprocessBackend`,
+and it is a sibling rather than a special case: §5's ABI is identical in
+both, so what differs is only how the program is started and how much of
+the environment the kernel keeps apart.
 
-**It is a backend and never a build environment.** Nothing here compiles
-anything; it starts a container, writes a request document, execs a
-program and reads what came back. The build environment is the image's,
-and the one piece of MCUHome code that runs inside it arrives with the
-SDK mount rather than from this repository.
+**A backend is never a build environment.** Nothing here compiles
+anything; it starts something, writes a request document, invokes a
+program and reads what came back. That sentence holds in both profiles —
+§1.2 makes it hold — which is precisely why the split above is a base
+class and not two implementations of one interface written twice.
 
 The layering, from the outside in:
 
 * :mod:`mcuhome_buildserver.sessions` owns the verbs and the state
   machine and calls into this module through ``state.backend``;
-* this module owns the *lifecycle* — image discovery, the session's
-  container, the per-invocation directories, liveness, the event and log
-  relay, and what an invocation is worth at the end of it;
+* this module owns the *lifecycle* — build-environment discovery, the
+  session's runtime, the per-invocation directories, liveness, the event
+  and log relay, and what an invocation is worth at the end of it;
 * :mod:`mcuhome_buildserver.container` owns docker,
+  :mod:`mcuhome_buildserver.program` owns the child process the other
+  profile starts,
   :mod:`mcuhome_buildserver.abi` owns the two documents,
   :mod:`mcuhome_buildserver.events` owns the NDJSON stream,
   :mod:`mcuhome_buildserver.artifacts` owns egress, and
   :mod:`mcuhome_buildserver.sdkstore` owns the one external input.
 
-**Three things this backend deliberately does not do**, each because a
-decision took the premise away.
+**Three things the container backend deliberately does not do**, each
+because a decision took the premise away.
 
 *No host-side overlay* (E47). Contract §6.2's writable view of a patched
 layer costs nothing in this profile: the image's trees are writable
@@ -69,7 +78,16 @@ from typing import Any
 from mcuhome.model.context import ContainerResolution
 from mcuhome.model.toolchain import line_of, satisfies_line
 
-from mcuhome_buildserver import abi, artifacts, container, errors, events, protocol, sdkstore
+from mcuhome_buildserver import (
+    abi,
+    artifacts,
+    container,
+    errors,
+    events,
+    processes,
+    protocol,
+    sdkstore,
+)
 from mcuhome_buildserver.abi import Artifact, TreeEntry
 from mcuhome_buildserver.config import Config
 from mcuhome_buildserver.contextstore import ContextPins, SessionPaths, derive_patch_layers
@@ -81,10 +99,14 @@ __all__ = [
     "ACTION_BUILD",
     "ACTION_DESCRIBE",
     "ACTION_VERIFY",
+    "CONTRACT_VERSION",
     "ContainerBackend",
     "ImageProfile",
     "InvocationRecord",
+    "ProgramProfile",
+    "SessionBackend",
     "SessionRuntime",
+    "describe_problem",
 ]
 
 logger = logging.getLogger(__name__)
@@ -120,12 +142,128 @@ _PATH_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
 
 # --------------------------------------------------------------------------
-# What an image is, and what a session runs on
+# What a build environment is, and what a session runs on
 # --------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class ImageProfile:
+class ProgramProfile:
+    """One build environment, as its ``describe`` answers for it.
+
+    The profile-independent half, because ``describe`` is
+    profile-independent: §7.1 makes it "**authoritative** about what the
+    program can do" in both, and in the ``subprocess`` profile it is "the
+    only discovery channel that exists … where there is no image and
+    therefore no labels". Everything a backend has to know before it may
+    invoke anything — the contract version, the request and result
+    formats, the action set, where the trees are — is in this one block,
+    and none of it is a property of a container.
+
+    What the two profiles add on top is only how the environment is
+    *named*: :class:`ImageProfile` names it by image reference and repo
+    digest, and the subprocess profile names it by the program's own
+    identity, because that is all there is to name.
+    """
+
+    #: ``describe``'s ``program`` block, verbatim. Authoritative about
+    #: what the program can do; an image's labels are the pre-start hint.
+    program: dict[str, Any]
+
+    @property
+    def identity(self) -> str:
+        found = self.program.get("id")
+        return found if isinstance(found, str) else "unknown"
+
+    @property
+    def actions(self) -> tuple[str, ...]:
+        found = self.program.get("actions")
+        return tuple(str(name) for name in found) if isinstance(found, list) else ()
+
+    def tree_path(self, layer: str) -> Path | None:
+        """Where the environment keeps *layer*, or ``None`` if it carries none.
+
+        §7.1.1: "``null`` asks, a path requires." A concrete path is
+        where the environment keeps that tree **and**, for a tree the
+        backend supplies, the path the backend MUST supply it at;
+        ``null`` means "put it wherever you like and name it in
+        ``trees``".
+        """
+        found = self._tree(layer, "path")
+        return Path(found) if found is not None and found.startswith("/") else None
+
+    def tree_version(self, layer: str) -> str | None:
+        """What the environment says the tree at *layer* **is**, or ``None``.
+
+        §7.1.1's optional companion of ``path``: "an image that does not
+        carry a tree cannot state its version", so absence is the normal
+        answer for a tree the backend supplies and a stated value is the
+        environment describing its own filesystem. The value is a
+        *revision* rather than a release — MCUHome's own program reports
+        what west lists, which is the manifest's tag — so what may be
+        concluded from it is whatever the reader can parse out of it, and
+        nothing at all where it does not parse. Absence is never read as
+        compatible (§2.1.1).
+        """
+        found = self._tree(layer, "version")
+        return found.strip() or None if found is not None else None
+
+    def _tree(self, layer: str, field_name: str) -> str | None:
+        """One string field of one ``trees`` entry, or ``None``."""
+        trees = self.program.get("trees")
+        entry = trees.get(layer) if isinstance(trees, dict) else None
+        found = entry.get(field_name) if isinstance(entry, dict) else None
+        return found if isinstance(found, str) else None
+
+    @property
+    def resolution(self) -> ContainerResolution:
+        """This environment as ``manifest.yaml``'s ``container:`` records it.
+
+        The one thing a profile has to answer for itself, because it is
+        the one thing ``describe`` does not answer: §3.2 makes the block
+        "the record of which build environment answered this context's
+        requirement", and what an environment is *called* is exactly what
+        the two profiles do not share.
+        """
+        raise NotImplementedError
+
+    def to_wire(self) -> dict[str, Any]:
+        """What ``send-context`` answers about the serving environment.
+
+        Since E61 this is a **resolution and not an echo**: the context
+        named no container, so every field here is something this server
+        decided. ``image`` and ``tag`` joined for exactly that reason —
+        under the digest-pinned format the client already knew them
+        because it had sent them, and now it does not. They are the same
+        three names ``manifest.yaml`` carries, so what a client reads off
+        this answer and what it reads off the manifest it gets back are
+        the same fields with the same values.
+
+        ``digest`` may be ``null``, for an image built on this host and
+        never pushed — and is ``null`` always in the ``subprocess``
+        profile, where there is no image at all. That is a fact about the
+        environment rather than a gap: it names no bytes a client could
+        fetch, and saying so is the honest half of E60's promise that
+        these field names mean something.
+
+        The four fields after the resolution come out of ``describe``,
+        which is authoritative, rather than out of an image's labels,
+        which are a pre-start hint that is cross-checked against it — so
+        they are answered here once, for both profiles.
+        """
+        resolution = self.resolution
+        return {
+            "image": resolution.image,
+            "tag": resolution.tag,
+            "digest": resolution.digest,
+            "contract": self.program.get("contract"),
+            "program": self.identity,
+            "version": self.program.get("version"),
+            "actions": list(self.actions),
+        }
+
+
+@dataclass(frozen=True)
+class ImageProfile(ProgramProfile):
     """One image, as ``describe`` and its labels jointly answer for it.
 
     Cached for the life of the server process under a key that names
@@ -146,32 +284,6 @@ class ImageProfile:
     """
 
     facts: container.ImageFacts
-    #: ``describe``'s ``program`` block, verbatim. Authoritative about
-    #: what the program can do; the labels are the pre-start hint.
-    program: dict[str, Any]
-
-    @property
-    def identity(self) -> str:
-        found = self.program.get("id")
-        return found if isinstance(found, str) else "unknown"
-
-    @property
-    def actions(self) -> tuple[str, ...]:
-        found = self.program.get("actions")
-        return tuple(str(name) for name in found) if isinstance(found, list) else ()
-
-    def tree_path(self, layer: str) -> Path | None:
-        """Where the image keeps *layer*, or ``None`` if it carries none.
-
-        §7.1.1: "``null`` asks, a path requires." A concrete path is
-        where the image keeps that tree **and**, for a tree the backend
-        supplies, the path the backend MUST supply it at; ``null`` means
-        "put it wherever you like and name it in ``trees``".
-        """
-        trees = self.program.get("trees")
-        entry = trees.get(layer) if isinstance(trees, dict) else None
-        path = entry.get("path") if isinstance(entry, dict) else None
-        return Path(path) if isinstance(path, str) and path.startswith("/") else None
 
     @property
     def resolution(self) -> ContainerResolution:
@@ -184,43 +296,24 @@ class ImageProfile:
         """
         return ContainerResolution.from_reference(self.facts.reference, digest=self.facts.digest)
 
-    def to_wire(self) -> dict[str, Any]:
-        """What ``send-context`` answers about the serving container.
-
-        Since E61 this is a **resolution and not an echo**: the context
-        named no container, so every field here is something this server
-        decided. ``image`` and ``tag`` joined for exactly that reason —
-        under the digest-pinned format the client already knew them
-        because it had sent them, and now it does not. They are the same
-        three names ``manifest.yaml`` carries, so what a client reads off
-        this answer and what it reads off the manifest it gets back are
-        the same fields with the same values.
-
-        ``digest`` may be ``null``, for an image built on this host and
-        never pushed. That is a fact about the image rather than a gap:
-        such an image names no bytes a client could fetch, and saying so
-        is the honest half of E60's promise that these field names mean
-        something.
-        """
-        resolution = self.resolution
-        return {
-            "image": resolution.image,
-            "tag": resolution.tag,
-            "digest": resolution.digest,
-            "contract": self.program.get("contract"),
-            "program": self.identity,
-            "version": self.program.get("version"),
-            "actions": list(self.actions),
-        }
-
 
 @dataclass
 class SessionRuntime:
-    """The container one session builds in, and everything mounted in it."""
+    """The build environment one session works in, and what it was given.
+
+    One record for both profiles, because everything in it is something
+    §4 and §5 make a property of the *session* rather than of a container:
+    the trees the request document will name, the patch set of the locked
+    context, the shared cache, and the one-invocation-at-a-time flag §9.1
+    requires. :attr:`container_id` is the single container-profile field
+    and it is ``None`` in the other, where there is no container to
+    address and the running child is addressed by its process handle.
+    """
 
     session_id: str
-    image: ImageProfile
-    container_id: str
+    #: What ``describe`` answered for the environment serving this
+    #: session — an :class:`ImageProfile` in the ``container`` profile.
+    image: ProgramProfile
     paths: SessionPaths
     #: The ``trees`` block every invocation of this session writes. Fixed
     #: for the session because the patch set of a locked context cannot
@@ -228,10 +321,18 @@ class SessionRuntime:
     #: container.
     trees: dict[str, TreeEntry]
     patched_layers: tuple[str, ...]
+    container_id: str | None = None
     ccache: TreeEntry | None = None
     #: One invocation at a time per ``work`` (§9.1). The program cannot
     #: check it, so it is a backend duty; this flag is the whole of it.
     busy: bool = False
+    #: The handle of this session's most recent invocation, where the
+    #: profile has to reach it at teardown. The ``container`` profile leaves it
+    #: ``None`` and reaps the container instead — removing that is what
+    #: actually stops a program there, because killing a ``docker exec``
+    #: client never did. The ``subprocess`` profile has no container and
+    #: the child *is* the build, so this is its only address for it.
+    child: processes.Process | None = None
 
 
 @dataclass
@@ -279,31 +380,45 @@ class InvocationRecord:
 
 
 # --------------------------------------------------------------------------
-# The backend
+# The backend seam: everything §9 asks of a backend in either profile
 # --------------------------------------------------------------------------
 
 
-class ContainerBackend:
-    """Everything one build-server process knows about containers.
+class SessionBackend:
+    """What a backend does, minus how its build environment is started.
 
     One instance per :class:`~mcuhome_buildserver.app.ServerState`. It
-    holds no session state of its own beyond what a container needs —
-    the session record stays in
-    :class:`~mcuhome_buildserver.sessions.Session` — because the two
-    have different lifetimes: a session exists from ``open-session``,
-    and its container exists from the first command that needs one.
+    holds no session state of its own beyond what a build environment
+    needs — the session record stays in
+    :class:`~mcuhome_buildserver.sessions.Session` — because the two have
+    different lifetimes: a session exists from ``open-session``, and its
+    build environment exists from the first command that needs one.
+
+    **Everything here is profile-independent by construction**, and the
+    list is contract §9.1's own: the per-invocation directory, an empty
+    ``out``, an empty ``tmp``, the session's ``work``, the events file,
+    the request document written atomically, one invocation at a time per
+    ``work``, the SDK verified against the pin, the result document read
+    whenever it exists, egress hardened, the verdict published. §9.1 says
+    of exactly this list that "neither shape moves a duty from this list
+    onto the program", and the two duties that *are* profile-dependent —
+    network isolation and per-session resource limits — are not on it.
+
+    A subclass supplies five things and nothing else: what it can serve
+    (:meth:`inventory`), which environment answers a context's
+    requirement (:meth:`resolve_image`), how the session's environment is
+    materialized (:meth:`_materialize`), how one invocation of the
+    program is started (:meth:`_start`), and how the environment is
+    reaped (:meth:`_release_runtime`).
     """
 
     #: The backend profile this server declares at ``open-session``
-    #: (contract §1.2). ``container``, and never ``subprocess``: this
-    #: process is an orchestrator, and a subprocess-profile backend
-    #: would be the build environment itself.
-    profile = "container"
+    #: (contract §1.2). Set by the subclass, because it is the one thing
+    #: about a backend that the wire promises a client.
+    profile = ""
 
-    def __init__(self, config: Config, *, docker: container.Docker | None = None) -> None:
+    def __init__(self, config: Config) -> None:
         self.config = config
-        self.docker = container.Docker(config.docker) if docker is None else docker
-        self._images: dict[str, ImageProfile] = {}
         self._runtimes: dict[str, SessionRuntime] = {}
         self._records: dict[tuple[str, str], InvocationRecord] = {}
         self._tasks: set[asyncio.Task[None]] = set()
@@ -317,281 +432,79 @@ class ContainerBackend:
         self._audience: dict[str, dict[Any, tuple[str, int] | None]] = {}
 
     # ----------------------------------------------------------------
-    # Discovery
+    # What a subclass owns
     # ----------------------------------------------------------------
 
     async def inventory(self) -> list[dict[str, Any]]:
-        """The build-container images this host can serve, for ``capabilities``.
+        """The build environments this server can serve, for ``capabilities``."""
+        raise NotImplementedError
 
-        ADR 0019 §2 wants "available builder images (tag + digest +
-        contract labels)" from a verb that is "pre-session, cheap,
-        unmetered", and that is exactly what a label-filtered
-        ``docker image ls`` plus one ``inspect`` costs. No ``describe``
-        is run here: ``describe`` costs a container start, and a client
-        asking what this server has is not yet asking any image to prove
-        it.
+    async def resolve_image(self, pins: ContextPins) -> ProgramProfile:
+        """The environment that serves a context's Zephyr line, or a refusal."""
+        raise NotImplementedError
 
-        A runtime that cannot be reached answers an empty list rather
-        than a refusal. The question is "which images can this server
-        serve", the answer when there is no runtime is "none", and that
-        is a fact rather than an error — the refusal belongs to the verb
-        that actually needs a container, where it can be acted on.
-        """
-        try:
-            found = await self.docker.inventory()
-        except SessionError:
-            return []
-        return [facts.to_wire() for facts in found]
+    async def _session_environment(self, session: Any) -> ProgramProfile:
+        """The environment this session was answered with, still available."""
+        raise NotImplementedError
 
-    async def resolve_image(self, pins: ContextPins) -> ImageProfile:
-        """The image that serves a context's Zephyr line, described and gated.
+    async def _materialize(
+        self,
+        session: Any,
+        profile: ProgramProfile,
+        paths: SessionPaths,
+        package: sdkstore.SdkPackage,
+        patched: tuple[str, ...],
+    ) -> SessionRuntime:
+        """Arrange the trees, start whatever has to be started, and record it."""
+        raise NotImplementedError
 
-        Called from ``send-context``, which is where ADR 0019's
-        amendment puts container discovery: "``send-context`` answers
-        what the context determines — the serving build container's
-        contract version and its command set", because only with the
-        pins in hand does the backend know *which* container serves the
-        session.
+    async def _start(self, runtime: SessionRuntime, record: InvocationRecord) -> processes.Process:
+        """Invoke the program for one invocation (§5.1) and hand back its handle."""
+        raise NotImplementedError
 
-        **This server chooses; the context only requires** (E61). The
-        requirement is ``pins.zephyr``, a Zephyr release line; the
-        candidates are the images of :meth:`~container.Docker.inventory`
-        — the same set ``capabilities`` announces, so a client that read
-        that answer and a server that acts on it are looking at one list
-        — and the choice among them is :func:`_select_image`. Nothing is
-        pulled, so an unsatisfiable line is a final answer and not a
-        deferred fetch.
-
-        Four gates, in the order that makes each one's refusal legible:
-        the runtime is there; some image on this host carries the
-        required line; ``describe`` answers and answers conformingly; and
-        what ``describe`` said is something this server can actually
-        drive.
-        """
-        await self.docker.require_runtime()
-        facts = _select_image(await self.docker.inventory(), line=pins.zephyr)
-        # Memoized per image, because `describe` costs a container start
-        # and its answer is a property of the image — so the key has to
-        # name bytes, or the memo starts answering for an image that no
-        # longer exists. The repo digest does; the local image ID does
-        # too, and is what an image that was never pushed has instead
-        # (docker's `Id`, content-addressed and new on every rebuild).
-        # The reference is last and is a tag, which names bytes only
-        # until somebody rebuilds it — kept solely so that an inspect
-        # answer without either id is memoized under *something* rather
-        # than crashing, which is a defensive branch and not a case.
-        key = facts.digest or facts.image_id or facts.reference
-        cached = self._images.get(key)
-        if cached is not None:
-            return cached
-        profile = await self._describe(facts)
-        self._images[key] = profile
-        return profile
-
-    async def _describe(self, facts: container.ImageFacts) -> ImageProfile:
-        """Ask the image what it is, and check the labels against it.
-
-        ``describe`` "is **authoritative** about what the program can do.
-        The image labels are a pre-start hint; a backend MUST verify
-        them against ``describe`` and MUST NOT rely on a label
-        ``describe`` contradicts." It also "doubles as the first
-        conformance test: a program that cannot answer ``describe``
-        cannot be trusted with a build" — which is why every failure
-        below is the same refusal, ``version.builder-unavailable``, and
-        why none of them is retryable: nothing about this image will be
-        different in a second.
-
-        **The probe directory is per call and not per image.** It is the
-        same rule §5.1 step 1 states for an invocation — a
-        backend-owned per-invocation directory, which "removes the data
-        race the fixed path ``/ctx/.mcuhome/command.json`` had, where two
-        concurrent ``docker exec`` invocations overwrote each other's
-        document" — and ``describe`` is an invocation. Nothing
-        serializes two of them: the memo in ``self._images`` is written
-        only after this returns, and ``send-context`` runs under a
-        per-session guard, so two sessions pinning the same image
-        describe it concurrently. Sharing one directory would have the
-        second call's ``result.unlink`` delete the first call's answer,
-        which reads back as "no result document was written" and
-        disqualifies a perfectly good image.
-        """
-        static = await self._read_static_description(facts)
-        if static is not None:
-            program = static
-            problem = _program_problem(program, facts)
-            if problem is not None:
-                raise _not_conforming(facts, problem)
-            return ImageProfile(facts=facts, program=program)
-
-        probe = self.config.context_root / ".probe" / f"describe-{uuid.uuid4().hex}"
-        probe.mkdir(mode=0o700, parents=True, exist_ok=False)
-        request = probe / "request.json"
-        result = probe / "result.json"
-        result.unlink(missing_ok=True)
-        try:
-            # The preamble alone: `describe` "needs only `request` and
-            # `result`, never touches the context, writes nothing but the
-            # result document". A backend that sent more would be
-            # inviting a program to echo a field it was never promised.
-            abi.write_request({"request": abi.REQUEST_VERSION, "result": str(result)}, request)
-            completed = await self.docker.describe(
-                image=_pinned(facts),
-                mounts=[container.Mount(source=probe, target=probe)],
-                request=request,
-                user=container.current_user(),
-            )
-            outcome = abi.read_result(
-                path=result,
-                action=ACTION_DESCRIBE,
-                exit_code=completed.status,
-                # `describe` gets no session, so the echo rule says it
-                # must not answer one — and passing `None` here is how
-                # that expectation is stated rather than assumed.
-                session=None,
-                context_id=None,
-            )
-        finally:
-            with contextlib.suppress(OSError):
-                request.unlink(missing_ok=True)
-                result.unlink(missing_ok=True)
-                probe.rmdir()
-        if not outcome.successful or outcome.result is None:
-            raise _not_conforming(facts, "; ".join(outcome.problems) or "describe failed")
-        program = outcome.result.program
-        problem = _program_problem(program, facts)
-        if problem is not None:
-            raise _not_conforming(facts, problem)
-        return ImageProfile(facts=facts, program=program)
-
-    async def _read_static_description(self, facts: container.ImageFacts) -> dict[str, Any] | None:
-        """``/mcuhome/describe.json``, where the image carries one (§2.2.1).
-
-        The contract's answer to the chicken-and-egg the SDK split
-        creates: the program body arrives with a mounted tree, but where
-        that tree must be mounted is what discovery would have supplied —
-        so an image MAY ship its ``describe`` answer as a static file,
-        and this backend reads it in place of invoking ``describe``
-        pre-mount. §2.2.1 binds the file by §2.1's rule ("a disagreement
-        is a violation against the image"), and it is exactly a
-        ``describe`` result document, so it goes through the same §5.4
-        reading as a live answer.
-
-        ``None`` means "no file" — absent, unreadable, or not parseable
-        as a result document — and the caller then invokes ``describe``
-        exactly as it always did: "there is no new failure mode in
-        either direction, because the fallback is the thing that was
-        already mandatory."
-        """
-        completed = await self.docker.read_file(image=_pinned(facts), path="/mcuhome/describe.json")
-        if completed is None:
-            return None
-        outcome = abi.read_static_describe(completed)
-        if outcome is None:
-            _LOGGER.warning(
-                "image %s carries an unreadable /mcuhome/describe.json; falling back "
-                "to invoking describe",
-                facts.reference,
-            )
-        return outcome
+    async def _release_runtime(self, runtime: SessionRuntime) -> None:
+        """Reap the session's build environment. Never raises."""
+        raise NotImplementedError
 
     # ----------------------------------------------------------------
-    # The session's container
+    # The session's build environment
     # ----------------------------------------------------------------
-
-    async def _session_image(self, session: Any) -> ImageProfile:
-        """The image this session was answered with, still on this host.
-
-        The whole of "one session, one build environment": the profile
-        is the one :meth:`resolve_image` produced at ``send-context`` and
-        :func:`~mcuhome_buildserver.sessions.lock_context` froze into
-        ``manifest.yaml``, taken off the session rather than chosen
-        again. Nothing here compares releases or reads labels — the
-        choice was made, and re-making it is what would make the manifest
-        lie.
-
-        What is checked is that the choice is still there. An operator
-        may remove an image while a session sits locked, and the pinned
-        name is looked up rather than assumed because that name is what
-        ``docker run`` will be handed a moment later: a refusal here says
-        which image went away, where the same absence at container start
-        would surface as a docker error about a name the client never
-        chose. ``version.builder-unavailable`` is that refusal's code by
-        its own registry entry — "the image is not on this host" — and it
-        is deliberately not the retryable ``builder.runtime-unavailable``:
-        this server pulls nothing, so a missing image is a final answer,
-        while a missing *runtime* is not and is asked about first.
-        """
-        profile: ImageProfile | None = session.image
-        if profile is None:  # pragma: no cover - set with the pins at send-context
-            raise SessionError(
-                "context.missing",
-                f'Session "{session.id}" holds no build container to work in.',
-                session_id=session.id,
-            )
-        await self.docker.require_runtime()
-        pinned = _pinned(profile.facts)
-        if await self.docker.image(pinned) is None:
-            raise SessionError(
-                "version.builder-unavailable",
-                f"The build container {pinned} this session was answered with is no longer "
-                "on this host. It is the image send-context chose for this context's Zephyr "
-                "line and the one lock-context recorded as what built it, so the session "
-                "refuses rather than building in another image and recording this one.",
-                image=profile.resolution.image,
-                tag=profile.resolution.tag,
-                digest=profile.facts.digest,
-            )
-        return profile
 
     async def ensure_runtime(
         self, session: Any, pins: ContextPins, *, context_id: str
     ) -> SessionRuntime:
-        """The session's container, started on first use.
+        """The session's build environment, materialized on first use.
 
         "Container materialization is **lazy** — the backend may defer
         creating the container until the first command that needs one"
-        (ADR 0019 §2). The first such command is ``verify`` or
-        ``build``, so everything expensive happens here: the SDK is
-        fetched and hash-verified, the trees are resolved against what
-        ``describe`` reported, the mounts are composed and the container
-        is started.
+        (ADR 0019 §2), and the same laziness is right where there is no
+        container: the SDK package is an expensive fetch and a session
+        that never builds should not pay for it. The first such command
+        is ``verify`` or ``build``, so everything expensive happens here.
 
-        The pins are cross-checked one last time on the way (§9.1): the
-        SDK package really hashes to ``mcuhome.package.sha256``. The
-        other two, ``zephyr`` and ``target.board``, are compared against
-        the pins the session was admitted on by
+        The pins are cross-checked on the way (§9.1): the SDK package
+        really hashes to ``mcuhome.package.sha256``. The other two,
+        ``zephyr`` and ``target.board``, are compared against the pins the
+        session was admitted on by
         :func:`~mcuhome_buildserver.contextstore.recheck_locked_context`
         before every invocation, which is the only place a board can be
         compared to anything on this side.
 
-        **One session, one build environment.** The image is *not*
-        re-selected here, and :meth:`resolve_image` is a
-        ``send-context``-time call only. That is where the choice
-        belongs — it is the moment the pins arrive, and ``lock-context``
-        writes the chosen image into ``manifest.yaml``, which §3.2 makes
-        "the record of which build environment answered this context's
-        requirement … the requirement says what was needed, this says
-        what actually ran". A second selection here would re-open exactly
-        that: an operator pulling a newer release of the same line
-        between the lock and the first ``build`` would have the build run
-        in an image the manifest does not name, silently, with no
-        downstream check able to notice — the recorded resolution is
-        outside the ID by design and outside the per-invocation
-        re-check's pin list.
-
-        So what happens here is a **presence check and never a choice**:
-        the image the session already holds is looked up under the same
-        pinned name every docker call about it uses, and an image that
-        has gone from this host since ``send-context`` is
-        ``version.builder-unavailable`` naming it. That is the window the
-        deleted digest comparison covered, refused the way it refused,
-        in E61's vocabulary.
+        **One session, one build environment.** The environment is *not*
+        re-selected here — :meth:`resolve_image` is a
+        ``send-context``-time call only. That is where the choice belongs:
+        it is the moment the pins arrive, and ``lock-context`` writes the
+        chosen environment into ``manifest.yaml``, which §3.2 makes "the
+        record of which build environment answered this context's
+        requirement … the requirement says what was needed, this says what
+        actually ran". What happens here is a **presence check and never a
+        choice** (:meth:`_session_environment`).
         """
         existing = self._runtimes.get(session.id)
         if existing is not None:
             return existing
         paths: SessionPaths = session.paths
-        profile = await self._session_image(session)
+        profile = await self._session_environment(session)
         paths.prepare_backend()
         patched = derive_patch_layers(paths.context)
         # Off the event loop: this hashes a multi-gigabyte package,
@@ -615,129 +528,18 @@ class ContainerBackend:
             caps=sdkstore.SDK_CAPS,
             max_bytes=sdkstore.SDK_MAX_BYTES,
         )
-        trees, mounts = self._arrange_trees(profile, paths, package, patched)
-        ccache, cache_mount = self._arrange_ccache(profile)
-        if cache_mount is not None:
-            mounts.append(cache_mount)
-        container_id = await self.docker.start(
-            image=_pinned(profile.facts),
-            mounts=container.mounts_for(mounts),
-            session_id=session.id,
-            user=container.current_user(),
-            limits=container.ResourceLimits(
-                memory=self.config.container_memory,
-                cpus=self.config.container_cpus,
-                pids=self.config.container_pids,
-            ),
-        )
-        runtime = SessionRuntime(
-            session_id=session.id,
-            image=profile,
-            container_id=container_id,
-            paths=paths,
-            trees=trees,
-            patched_layers=patched,
-            ccache=ccache,
-        )
+        runtime = await self._materialize(session, profile, paths, package, patched)
         self._runtimes[session.id] = runtime
         logger.info(
-            "session %s: container %s from %s (context %s)",
+            "session %s: %s build environment %s (context %s)",
             session.id,
-            container_id[:12],
-            profile.facts.reference,
+            self.profile,
+            profile.resolution.reference(),
             context_id,
         )
         return runtime
 
-    def _arrange_trees(
-        self,
-        profile: ImageProfile,
-        paths: SessionPaths,
-        package: sdkstore.SdkPackage,
-        patched: tuple[str, ...],
-    ) -> tuple[dict[str, TreeEntry], list[container.Mount]]:
-        """Decide every ``trees`` entry and the mounts behind them (§4.1).
-
-        **The session tree is mounted piece by piece and never
-        wholesale.** One bind mount of the session root would be shorter
-        and it is wrong, for a reason that only shows up when a tree has
-        two paths: the SDK is unpacked into ``<root>/sdk`` and mounted
-        read-only at the path ``describe`` asked for, so a root mount
-        exposes the very same directory writable at ``<root>/sdk`` —
-        and §4.1's ``writable: false`` is "asserted by the backend,
-        never probed by the program", which makes it a claim this server
-        would be making falsely. §9.1 asks for the strongest write
-        protection the profile has, and in this profile that is a
-        read-only bind mount with nothing shadowing it.
-
-        So the container sees exactly what the request document names,
-        each at its own host path: ``context`` read-only, ``work``
-        writable, the per-invocation directories writable (mounted as
-        their parent, because bind mounts are fixed when the container
-        is created and an invocation directory does not exist yet — the
-        parent is a mount, so every ``out``, ``tmp``, request and result
-        created in it later is inside it), the SDK at its target, and
-        the shared cache read-only when there is one. What is *not*
-        visible any more is everything else the session directory holds:
-        the upload spool, ``staging`` and — worth naming — ``downloads``,
-        where ``get-artifact`` builds the archive it is about to stream.
-
-        Three rules and one non-rule.
-
-        **``sdk`` is always supplied**, at the path ``describe``
-        declared for it or at one of this server's choosing when it
-        declared ``null``. It is mounted read-only unless the ``sdk``
-        layer carries patches, in which case the per-session unpacked
-        tree *is* the writable view §6.2 asks for — it dies with the
-        session, so no overlay and no copy is needed to keep it from
-        outliving one.
-
-        **Every patched in-image layer is supplied writable at the path
-        the image reported** (E47). The container's own copy-on-write
-        layer is the view; asserting ``writable: true`` for it is
-        truthful rather than optimistic, because the layer makes it so
-        and the container is discarded at ``close-session``. No mount is
-        involved at all — the tree is already in the image.
-
-        **An unpatched in-image tree is omitted**, which §4.1 explicitly
-        permits: "the program then uses its own".
-
-        And the non-rule: a patched layer the image reports **no** path
-        for gets no entry, because there is nothing to name one at. That
-        is not this backend giving up on §4.1's duty — it is the only
-        honest move, and the contract has an answer for exactly it: a
-        program that finds ``patches/<layer>/`` with no ``trees`` entry
-        "MUST NOT proceed: ``status: "failure"``, ``reason:
-        "error.layer.unknown"``". The pointer goes into ``required``
-        anyway (:meth:`_document`), so a conforming program refuses
-        legibly before it does any work.
-        """
-        mounts = [
-            # §9.1: write-protected "with the strongest means its
-            # profile has", which in this profile is the kernel rather
-            # than a promise — and nothing else is mounted over it.
-            container.Mount(source=paths.context, target=paths.context, read_only=True),
-            container.Mount(source=paths.work, target=paths.work),
-            container.Mount(source=paths.invocations, target=paths.invocations),
-        ]
-        sdk_writable = "sdk" in patched
-        sdk_target = profile.tree_path("sdk") or package.tree
-        mounts.append(
-            container.Mount(source=package.tree, target=sdk_target, read_only=not sdk_writable)
-        )
-        trees: dict[str, TreeEntry] = {"sdk": TreeEntry(path=sdk_target, writable=sdk_writable)}
-        for layer in patched:
-            if layer == "sdk":
-                continue
-            declared = profile.tree_path(layer)
-            if declared is None:
-                continue
-            trees[layer] = TreeEntry(path=declared, writable=True)
-        return trees, mounts
-
-    def _arrange_ccache(
-        self, profile: ImageProfile
-    ) -> tuple[TreeEntry | None, container.Mount | None]:
+    def _shared_cache(self, profile: ProgramProfile) -> TreeEntry | None:
         """The shared cache, offered read-only or not at all (§10).
 
         "Shared backends MUST offer a shared cache read-only for
@@ -755,24 +557,25 @@ class ContainerBackend:
         cache: a third-party program is free to call itself anything,
         and a backend that sanitized the name would be inventing an
         identity the program did not claim.
+
+        It is profile-independent because §10 is: a cache is a directory,
+        and only the ``container`` profile has to also make it *reachable*
+        by mounting it.
         """
         root = self.config.ccache_dir
         if root is None:
-            return None, None
+            return None
         identity = profile.identity
         if not _PATH_SEGMENT.fullmatch(identity):
             logger.warning("no shared cache for program id %r: not a path segment", identity)
-            return None, None
+            return None
         store = root / identity
         try:
             store.mkdir(mode=0o700, parents=True, exist_ok=True)
         except OSError as exc:  # pragma: no cover - an operator's directory
             logger.warning("no shared cache at %s: %s", store, exc)
-            return None, None
-        return (
-            TreeEntry(path=store, writable=False),
-            container.Mount(source=store, target=store, read_only=True),
-        )
+            return None
+        return TreeEntry(path=store, writable=False)
 
     # ----------------------------------------------------------------
     # Invocations
@@ -825,23 +628,23 @@ class ContainerBackend:
         ``tmp``, the session's ``work``, the ``events`` file, the
         request document written atomically, and write protection of
         ``context`` and of every non-writable tree — the last of which
-        was arranged when the container started, because a mount cannot
-        be added to a running one.
+        the profile arranges when it materializes the environment, since
+        a mount cannot be added to a running container.
         """
         runtime = await self.ensure_runtime(session, pins, context_id=context_id)
         if action not in runtime.image.actions:
             # §7.1.1: "A backend MUST NOT invoke an action absent from
-            # the list." The image would answer `unsupported.action`
+            # the list." The program would answer `unsupported.action`
             # legibly, which is precisely why there is no reason to make
             # it: the refusal is already knowable.
             raise SessionError(
                 "version.builder-unavailable",
-                f'The build container serving this session does not implement "{action}". '
+                f'The build environment serving this session does not implement "{action}". '
                 f"It announced {sorted(runtime.image.actions)}, and describe is the only "
                 "declaration of an action set there is.",
                 action=action,
                 actions=sorted(runtime.image.actions),
-                digest=runtime.image.facts.digest,
+                digest=runtime.image.resolution.digest,
             )
         if runtime.busy:
             # One invocation at a time per `work` (§9.1). Pre-registry,
@@ -958,7 +761,7 @@ class ContainerBackend:
         """
         exit_code: int | None = None
         try:
-            exit_code = await self._supervise(record)
+            exit_code = await self._supervise(runtime, record)
         except Exception:
             logger.exception("invocation %s failed to run", record.id)
         finally:
@@ -979,25 +782,31 @@ class ContainerBackend:
             protocol.event_frame("invocation.verdict", self._verdict(outcome, record)),
         )
 
-    async def _supervise(self, record: InvocationRecord) -> int | None:
-        """Exec the program, relay what it says, and enforce liveness.
+    async def _supervise(self, runtime: SessionRuntime, record: InvocationRecord) -> int | None:
+        """Invoke the program, relay what it says, and enforce liveness.
 
         The ladder, in order and with the reason for each rung:
 
         1. **The cancel sentinel.** Its *existence* means stop. It is
            first because it is the only rung that lets the program write
            a result document — ``status: "cancelled"``, with ``reason``
-           and ``error`` both null, because nothing was diagnosed.
-        2. **SIGTERM at ``cancel_grace_seconds``**, to the ``docker
-           exec`` client. It is worth saying plainly that this does *not*
-           reach the process inside the container — killing a ``docker
-           exec`` client never has, which is exactly why the contract
-           has a sentinel at all — so what this rung buys is the
-           server's own file descriptors back.
-        3. **SIGKILL**, and then the container itself at
-           ``close-session``, which is the only thing that actually
-           reaps a program that ignored both. One session is one
-           container, so there is always that hammer.
+           and ``error`` both null, because nothing was diagnosed. It is
+           also the only rung that works identically in both profiles,
+           which is why the contract has it: "a cooperative sentinel is
+           used rather than a signal because killing a ``docker exec``
+           client does not kill the process inside the container, and
+           because the same mechanism works unchanged in the
+           ``subprocess`` profile" (§8).
+        2. **SIGTERM at ``cancel_grace_seconds``**, to whatever
+           :meth:`_start` handed back. **What that reaches is the one
+           thing the two profiles do not share.** In the ``container``
+           profile it is the ``docker exec`` client and *not* the process
+           inside the container — killing an exec client never has been —
+           so the rung buys the server's own file descriptors back. In
+           the ``subprocess`` profile it is the program itself, which is
+           what §1.2 means by "cancellability … remain[s]".
+        3. **SIGKILL**, and then whatever :meth:`_release_runtime` can
+           still reach at ``close-session``.
 
         The deadline enters the same ladder at the top rather than
         beside it: ``limits.deadline_seconds`` is advisory to the
@@ -1005,13 +814,7 @@ class ContainerBackend:
         itself and says ``error.deadline.exceeded``.
         """
         reader = events.EventReader(path=record.events)
-        process = await self.docker.invoke(
-            container=self._container_of(record),
-            action=record.action,
-            request=record.request,
-            on_line=lambda line: self._log(record, line),
-            user=container.current_user(),
-        )
+        process = await self._start(runtime, record)
         waiter = asyncio.ensure_future(process.wait())
         stopping_at: float | None = None
         terminated_at: float | None = None
@@ -1049,10 +852,6 @@ class ContainerBackend:
         if reader.dropped:
             logger.warning("invocation %s: discarded %d event line(s)", record.id, reader.dropped)
         return waiter.result()
-
-    def _container_of(self, record: InvocationRecord) -> str:
-        runtime = self._runtimes[record.session_id]
-        return runtime.container_id
 
     async def _collect(
         self, record: InvocationRecord, *, exit_code: int | None
@@ -1305,14 +1104,16 @@ class ContainerBackend:
     # ----------------------------------------------------------------
 
     async def release(self, session_id: str) -> None:
-        """Reap the session's container, if it had one. Never raises.
+        """Reap the session's build environment, if it had one. Never raises.
 
         Called from ``close-session``, from the reaper's sweep and from
         process shutdown — the same three exits the per-session
-        directory has, because the container and the directory are one
-        thing: the directory is the container's mounts, and a container
-        left running against a deleted mount source is the one state
-        neither half can recover from.
+        directory has, because the environment and the directory are one
+        thing: in the ``container`` profile the directory *is* the
+        container's mounts, and in the ``subprocess`` profile it is the
+        working area of a child of this process. Either way, something
+        still running against a deleted tree is the one state neither
+        half can recover from.
         """
         runtime = self._runtimes.pop(session_id, None)
         self._audience.pop(session_id, None)
@@ -1320,11 +1121,427 @@ class ContainerBackend:
             self._records.pop(key, None)
         if runtime is None:
             return
-        await self.docker.remove(runtime.container_id)
+        await self._release_runtime(runtime)
 
     async def release_all(self) -> None:
         for session_id in list(self._runtimes):
             await self.release(session_id)
+
+
+# --------------------------------------------------------------------------
+# The container backend
+# --------------------------------------------------------------------------
+
+
+class ContainerBackend(SessionBackend):
+    """Everything one build-server process knows about containers."""
+
+    #: ``container``, and never ``subprocess``: this backend starts a
+    #: container per session and is an orchestrator of it.
+    profile = "container"
+
+    def __init__(self, config: Config, *, docker: container.Docker | None = None) -> None:
+        super().__init__(config)
+        self.docker = container.Docker(config.docker) if docker is None else docker
+        self._images: dict[str, ImageProfile] = {}
+
+    # ----------------------------------------------------------------
+    # Discovery
+    # ----------------------------------------------------------------
+
+    async def inventory(self) -> list[dict[str, Any]]:
+        """The build-container images this host can serve, for ``capabilities``.
+
+        ADR 0019 §2 wants "available builder images (tag + digest +
+        contract labels)" from a verb that is "pre-session, cheap,
+        unmetered", and that is exactly what a label-filtered
+        ``docker image ls`` plus one ``inspect`` costs. No ``describe``
+        is run here: ``describe`` costs a container start, and a client
+        asking what this server has is not yet asking any image to prove
+        it.
+
+        A runtime that cannot be reached answers an empty list rather
+        than a refusal. The question is "which images can this server
+        serve", the answer when there is no runtime is "none", and that
+        is a fact rather than an error — the refusal belongs to the verb
+        that actually needs a container, where it can be acted on.
+        """
+        try:
+            found = await self.docker.inventory()
+        except SessionError:
+            return []
+        return [facts.to_wire() for facts in found]
+
+    async def resolve_image(self, pins: ContextPins) -> ImageProfile:
+        """The image that serves a context's Zephyr line, described and gated.
+
+        Called from ``send-context``, which is where ADR 0019's
+        amendment puts container discovery: "``send-context`` answers
+        what the context determines — the serving build container's
+        contract version and its command set", because only with the
+        pins in hand does the backend know *which* container serves the
+        session.
+
+        **This server chooses; the context only requires** (E61). The
+        requirement is ``pins.zephyr``, a Zephyr release line; the
+        candidates are the images of :meth:`~container.Docker.inventory`
+        — the same set ``capabilities`` announces, so a client that read
+        that answer and a server that acts on it are looking at one list
+        — and the choice among them is :func:`_select_image`. Nothing is
+        pulled, so an unsatisfiable line is a final answer and not a
+        deferred fetch.
+
+        Four gates, in the order that makes each one's refusal legible:
+        the runtime is there; some image on this host carries the
+        required line; ``describe`` answers and answers conformingly; and
+        what ``describe`` said is something this server can actually
+        drive.
+        """
+        await self.docker.require_runtime()
+        facts = _select_image(await self.docker.inventory(), line=pins.zephyr)
+        # Memoized per image, because `describe` costs a container start
+        # and its answer is a property of the image — so the key has to
+        # name bytes, or the memo starts answering for an image that no
+        # longer exists. The repo digest does; the local image ID does
+        # too, and is what an image that was never pushed has instead
+        # (docker's `Id`, content-addressed and new on every rebuild).
+        # The reference is last and is a tag, which names bytes only
+        # until somebody rebuilds it — kept solely so that an inspect
+        # answer without either id is memoized under *something* rather
+        # than crashing, which is a defensive branch and not a case.
+        key = facts.digest or facts.image_id or facts.reference
+        cached = self._images.get(key)
+        if cached is not None:
+            return cached
+        profile = await self._describe(facts)
+        self._images[key] = profile
+        return profile
+
+    async def _describe(self, facts: container.ImageFacts) -> ImageProfile:
+        """Ask the image what it is, and check the labels against it.
+
+        ``describe`` "is **authoritative** about what the program can do.
+        The image labels are a pre-start hint; a backend MUST verify
+        them against ``describe`` and MUST NOT rely on a label
+        ``describe`` contradicts." It also "doubles as the first
+        conformance test: a program that cannot answer ``describe``
+        cannot be trusted with a build" — which is why every failure
+        below is the same refusal, ``version.builder-unavailable``, and
+        why none of them is retryable: nothing about this image will be
+        different in a second.
+
+        **The probe directory is per call and not per image.** It is the
+        same rule §5.1 step 1 states for an invocation — a
+        backend-owned per-invocation directory, which "removes the data
+        race the fixed path ``/ctx/.mcuhome/command.json`` had, where two
+        concurrent ``docker exec`` invocations overwrote each other's
+        document" — and ``describe`` is an invocation. Nothing
+        serializes two of them: the memo in ``self._images`` is written
+        only after this returns, and ``send-context`` runs under a
+        per-session guard, so two sessions pinning the same image
+        describe it concurrently. Sharing one directory would have the
+        second call's ``result.unlink`` delete the first call's answer,
+        which reads back as "no result document was written" and
+        disqualifies a perfectly good image.
+        """
+        static = await self._read_static_description(facts)
+        if static is not None:
+            program = static
+            problem = describe_problem(program) or _label_problem(program, facts)
+            if problem is not None:
+                raise _not_conforming(facts, problem)
+            return ImageProfile(facts=facts, program=program)
+
+        probe = self.config.context_root / ".probe" / f"describe-{uuid.uuid4().hex}"
+        probe.mkdir(mode=0o700, parents=True, exist_ok=False)
+        request = probe / "request.json"
+        result = probe / "result.json"
+        result.unlink(missing_ok=True)
+        try:
+            # The preamble alone: `describe` "needs only `request` and
+            # `result`, never touches the context, writes nothing but the
+            # result document". A backend that sent more would be
+            # inviting a program to echo a field it was never promised.
+            abi.write_request({"request": abi.REQUEST_VERSION, "result": str(result)}, request)
+            completed = await self.docker.describe(
+                image=_pinned(facts),
+                mounts=[container.Mount(source=probe, target=probe)],
+                request=request,
+                user=container.current_user(),
+            )
+            outcome = abi.read_result(
+                path=result,
+                action=ACTION_DESCRIBE,
+                exit_code=completed.status,
+                # `describe` gets no session, so the echo rule says it
+                # must not answer one — and passing `None` here is how
+                # that expectation is stated rather than assumed.
+                session=None,
+                context_id=None,
+            )
+        finally:
+            with contextlib.suppress(OSError):
+                request.unlink(missing_ok=True)
+                result.unlink(missing_ok=True)
+                probe.rmdir()
+        if not outcome.successful or outcome.result is None:
+            raise _not_conforming(facts, "; ".join(outcome.problems) or "describe failed")
+        program = outcome.result.program
+        problem = describe_problem(program) or _label_problem(program, facts)
+        if problem is not None:
+            raise _not_conforming(facts, problem)
+        return ImageProfile(facts=facts, program=program)
+
+    async def _read_static_description(self, facts: container.ImageFacts) -> dict[str, Any] | None:
+        """``/mcuhome/describe.json``, where the image carries one (§2.2.1).
+
+        The contract's answer to the chicken-and-egg the SDK split
+        creates: the program body arrives with a mounted tree, but where
+        that tree must be mounted is what discovery would have supplied —
+        so an image MAY ship its ``describe`` answer as a static file,
+        and this backend reads it in place of invoking ``describe``
+        pre-mount. §2.2.1 binds the file by §2.1's rule ("a disagreement
+        is a violation against the image"), and it is exactly a
+        ``describe`` result document, so it goes through the same §5.4
+        reading as a live answer.
+
+        ``None`` means "no file" — absent, unreadable, or not parseable
+        as a result document — and the caller then invokes ``describe``
+        exactly as it always did: "there is no new failure mode in
+        either direction, because the fallback is the thing that was
+        already mandatory."
+        """
+        completed = await self.docker.read_file(image=_pinned(facts), path="/mcuhome/describe.json")
+        if completed is None:
+            return None
+        outcome = abi.read_static_describe(completed)
+        if outcome is None:
+            _LOGGER.warning(
+                "image %s carries an unreadable /mcuhome/describe.json; falling back "
+                "to invoking describe",
+                facts.reference,
+            )
+        return outcome
+
+    # ----------------------------------------------------------------
+    # The session's container
+    # ----------------------------------------------------------------
+
+    async def _session_environment(self, session: Any) -> ImageProfile:
+        """The image this session was answered with, still on this host.
+
+        The whole of "one session, one build environment": the profile
+        is the one :meth:`resolve_image` produced at ``send-context`` and
+        :func:`~mcuhome_buildserver.sessions.lock_context` froze into
+        ``manifest.yaml``, taken off the session rather than chosen
+        again. Nothing here compares releases or reads labels — the
+        choice was made, and re-making it is what would make the manifest
+        lie.
+
+        What is checked is that the choice is still there. An operator
+        may remove an image while a session sits locked, and the pinned
+        name is looked up rather than assumed because that name is what
+        ``docker run`` will be handed a moment later: a refusal here says
+        which image went away, where the same absence at container start
+        would surface as a docker error about a name the client never
+        chose. ``version.builder-unavailable`` is that refusal's code by
+        its own registry entry — "the image is not on this host" — and it
+        is deliberately not the retryable ``builder.runtime-unavailable``:
+        this server pulls nothing, so a missing image is a final answer,
+        while a missing *runtime* is not and is asked about first.
+        """
+        profile: ImageProfile | None = session.image
+        if profile is None:  # pragma: no cover - set with the pins at send-context
+            raise SessionError(
+                "context.missing",
+                f'Session "{session.id}" holds no build container to work in.',
+                session_id=session.id,
+            )
+        await self.docker.require_runtime()
+        pinned = _pinned(profile.facts)
+        if await self.docker.image(pinned) is None:
+            raise SessionError(
+                "version.builder-unavailable",
+                f"The build container {pinned} this session was answered with is no longer "
+                "on this host. It is the image send-context chose for this context's Zephyr "
+                "line and the one lock-context recorded as what built it, so the session "
+                "refuses rather than building in another image and recording this one.",
+                image=profile.resolution.image,
+                tag=profile.resolution.tag,
+                digest=profile.facts.digest,
+            )
+        return profile
+
+    async def _materialize(
+        self,
+        session: Any,
+        profile: ProgramProfile,
+        paths: SessionPaths,
+        package: sdkstore.SdkPackage,
+        patched: tuple[str, ...],
+    ) -> SessionRuntime:
+        """Compose the mounts and start the session's container.
+
+        The container-profile half of :meth:`SessionBackend.ensure_runtime`:
+        the trees are resolved against what ``describe`` reported, the
+        mounts are composed, and the container is started with the
+        resource limits §1.2 promises for this profile.
+
+        The image is not re-selected here — :meth:`_session_environment`
+        has already turned the session's own choice into a presence check
+        — because a second selection would re-open exactly what
+        ``manifest.yaml`` records: an operator pulling a newer release of
+        the same line between the lock and the first ``build`` would have
+        the build run in an image the manifest does not name, silently,
+        with no downstream check able to notice. The recorded resolution
+        is outside the ID by design and outside the per-invocation
+        re-check's pin list.
+        """
+        assert isinstance(profile, ImageProfile)  # noqa: S101 - resolve_image's own type
+        trees, mounts = self._arrange_trees(profile, paths, package, patched)
+        ccache = self._shared_cache(profile)
+        if ccache is not None:
+            mounts.append(container.Mount(source=ccache.path, target=ccache.path, read_only=True))
+        container_id = await self.docker.start(
+            image=_pinned(profile.facts),
+            mounts=container.mounts_for(mounts),
+            session_id=session.id,
+            user=container.current_user(),
+            limits=container.ResourceLimits(
+                memory=self.config.container_memory,
+                cpus=self.config.container_cpus,
+                pids=self.config.container_pids,
+            ),
+        )
+        logger.info(
+            "session %s: container %s from %s",
+            session.id,
+            container_id[:12],
+            profile.facts.reference,
+        )
+        return SessionRuntime(
+            session_id=session.id,
+            image=profile,
+            container_id=container_id,
+            paths=paths,
+            trees=trees,
+            patched_layers=patched,
+            ccache=ccache,
+        )
+
+    def _arrange_trees(
+        self,
+        profile: ImageProfile,
+        paths: SessionPaths,
+        package: sdkstore.SdkPackage,
+        patched: tuple[str, ...],
+    ) -> tuple[dict[str, TreeEntry], list[container.Mount]]:
+        """Decide every ``trees`` entry and the mounts behind them (§4.1).
+
+        **The session tree is mounted piece by piece and never
+        wholesale.** One bind mount of the session root would be shorter
+        and it is wrong, for a reason that only shows up when a tree has
+        two paths: the SDK is unpacked into ``<root>/sdk`` and mounted
+        read-only at the path ``describe`` asked for, so a root mount
+        exposes the very same directory writable at ``<root>/sdk`` —
+        and §4.1's ``writable: false`` is "asserted by the backend,
+        never probed by the program", which makes it a claim this server
+        would be making falsely. §9.1 asks for the strongest write
+        protection the profile has, and in this profile that is a
+        read-only bind mount with nothing shadowing it.
+
+        So the container sees exactly what the request document names,
+        each at its own host path: ``context`` read-only, ``work``
+        writable, the per-invocation directories writable (mounted as
+        their parent, because bind mounts are fixed when the container
+        is created and an invocation directory does not exist yet — the
+        parent is a mount, so every ``out``, ``tmp``, request and result
+        created in it later is inside it), the SDK at its target, and
+        the shared cache read-only when there is one. What is *not*
+        visible any more is everything else the session directory holds:
+        the upload spool, ``staging`` and — worth naming — ``downloads``,
+        where ``get-artifact`` builds the archive it is about to stream.
+
+        Three rules and one non-rule.
+
+        **``sdk`` is always supplied**, at the path ``describe``
+        declared for it or at one of this server's choosing when it
+        declared ``null``. It is mounted read-only unless the ``sdk``
+        layer carries patches, in which case the per-session unpacked
+        tree *is* the writable view §6.2 asks for — it dies with the
+        session, so no overlay and no copy is needed to keep it from
+        outliving one.
+
+        **Every patched in-image layer is supplied writable at the path
+        the image reported** (E47). The container's own copy-on-write
+        layer is the view; asserting ``writable: true`` for it is
+        truthful rather than optimistic, because the layer makes it so
+        and the container is discarded at ``close-session``. No mount is
+        involved at all — the tree is already in the image.
+
+        **An unpatched in-image tree is omitted**, which §4.1 explicitly
+        permits: "the program then uses its own".
+
+        And the non-rule: a patched layer the image reports **no** path
+        for gets no entry, because there is nothing to name one at. That
+        is not this backend giving up on §4.1's duty — it is the only
+        honest move, and the contract has an answer for exactly it: a
+        program that finds ``patches/<layer>/`` with no ``trees`` entry
+        "MUST NOT proceed: ``status: "failure"``, ``reason:
+        "error.layer.unknown"``". The pointer goes into ``required``
+        anyway (:meth:`_document`), so a conforming program refuses
+        legibly before it does any work.
+        """
+        mounts = [
+            # §9.1: write-protected "with the strongest means its
+            # profile has", which in this profile is the kernel rather
+            # than a promise — and nothing else is mounted over it.
+            container.Mount(source=paths.context, target=paths.context, read_only=True),
+            container.Mount(source=paths.work, target=paths.work),
+            container.Mount(source=paths.invocations, target=paths.invocations),
+        ]
+        sdk_writable = "sdk" in patched
+        sdk_target = profile.tree_path("sdk") or package.tree
+        mounts.append(
+            container.Mount(source=package.tree, target=sdk_target, read_only=not sdk_writable)
+        )
+        trees: dict[str, TreeEntry] = {"sdk": TreeEntry(path=sdk_target, writable=sdk_writable)}
+        for layer in patched:
+            if layer == "sdk":
+                continue
+            declared = profile.tree_path(layer)
+            if declared is None:
+                continue
+            trees[layer] = TreeEntry(path=declared, writable=True)
+        return trees, mounts
+
+    async def _start(self, runtime: SessionRuntime, record: InvocationRecord) -> processes.Process:
+        """``docker exec`` the program: the contract's whole invocation.
+
+        Two positional operands after the program's fixed absolute path,
+        and never a flag (§5.1). It runs in the session's own container,
+        which is the trust boundary this profile promises, and as this
+        server's own user so that everything the program writes comes
+        back readable to egress (§9.3).
+        """
+        return await self.docker.invoke(
+            container=str(runtime.container_id),
+            action=record.action,
+            request=record.request,
+            on_line=lambda line: self._log(record, line),
+            user=container.current_user(),
+        )
+
+    async def _release_runtime(self, runtime: SessionRuntime) -> None:
+        """Reap the session's container. Never raises.
+
+        It is also the only thing that actually reaps a program that
+        ignored both the cancel sentinel and SIGTERM: killing a ``docker
+        exec`` client never reached the process inside the container, and
+        removing the container does. One session is one container, so
+        there is always that hammer.
+        """
+        await self.docker.remove(str(runtime.container_id))
 
 
 #: The ``reason`` values that end a session rather than an invocation.
@@ -1550,15 +1767,21 @@ def _not_conforming(facts: container.ImageFacts, problem: str) -> SessionError:
     )
 
 
-def _program_problem(program: dict[str, Any], facts: container.ImageFacts) -> str | None:
+def describe_problem(program: dict[str, Any]) -> str | None:
     """Everything that has to hold about a ``describe`` before it is used.
 
     §7.1.1 makes every field of the block mandatory in a ``describe``
     result, ``trees`` included, and the gates that follow are the ones a
     backend has to pass before it may invoke anything: a contract
-    version it implements, a request version the program parses, a
-    result version it writes, and — §2.1 — labels that do not contradict
-    what the block just said.
+    version it implements, a request version the program parses and a
+    result version it writes.
+
+    **Profile-independent, and that is why the label cross-check is not
+    here.** Every gate below is asked of the ``program`` block alone,
+    which is the only discovery channel the ``subprocess`` profile has
+    (§7.1); §2.1's "labels that do not contradict what the block just
+    said" is asked separately, by :func:`_label_problem`, because there
+    are no labels where there is no image.
     """
     missing = [name for name in (*abi.PROGRAM_FIELDS, "trees") if name not in program]
     if missing:
@@ -1578,7 +1801,7 @@ def _program_problem(program: dict[str, Any], facts: container.ImageFacts) -> st
             f"it writes result format versions {program.get('result')!r} and this server "
             f"reads {abi.RESULT_VERSION}"
         )
-    return _label_problem(program, facts)
+    return None
 
 
 def _label_problem(program: dict[str, Any], facts: container.ImageFacts) -> str | None:

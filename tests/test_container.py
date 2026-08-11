@@ -13,6 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from mcuhome.model.context import ContainerResolution
 
 from mcuhome_buildserver import container
 from mcuhome_buildserver.container import Completed, Docker, Mount
@@ -242,7 +243,7 @@ async def test_an_image_this_host_has_not_is_absent_rather_than_an_error() -> No
 
 
 async def test_the_repo_digest_is_read_and_never_the_image_id() -> None:
-    """A context's ``container.digest`` pin names the repo digest.
+    """A manifest's ``container.digest`` records the repo digest.
 
     ``Id`` is the local image ID, which never compares equal to one — so
     reading it instead would make every pinned context fail a
@@ -260,6 +261,57 @@ async def test_the_repo_digest_is_read_and_never_the_image_id() -> None:
     assert facts is not None
     assert facts.digest == "sha256:" + "d" * 64
     assert facts.image_id == "sha256:" + "c" * 64
+
+
+async def test_the_digest_taken_is_the_one_of_this_references_own_repository() -> None:
+    """One image, several repositories, one digest that is *its* name.
+
+    A build container pulled from ghcr.io and also pushed to a local
+    mirror carries one ``RepoDigests`` entry per repository, each with
+    that registry's own digest. Taking the first entry regardless of
+    repository would compose ``mirror/build-container@<the ghcr digest>``
+    — a reference docker resolves nowhere, handed to ``docker run`` on a
+    server that pulls nothing, and written into ``manifest.yaml`` as the
+    record of what built the artifacts.
+    """
+    inspected = (
+        '{"Id": "sha256:' + "c" * 64 + '", '
+        '"RepoTags": ["ghcr.io/mcu-home/build-container:r6", "registry.local/bc:mirror"], '
+        '"RepoDigests": ["registry.local/bc@sha256:' + "b" * 64 + '", '
+        '"ghcr.io/mcu-home/build-container@sha256:' + "a" * 64 + '"], '
+        '"Config": {"Labels": {"org.mcuhome.contract": "1"}}}'
+    )
+    docker = Docker("docker", runner=_runner([Completed(status=0, output=inspected)] * 2))
+    ghcr = await docker.image("ghcr.io/mcu-home/build-container:r6")
+    mirror = await docker.image("registry.local/bc:mirror")
+    assert ghcr is not None and mirror is not None
+    assert ghcr.digest == "sha256:" + "a" * 64, "not the first entry — the ghcr one"
+    assert mirror.digest == "sha256:" + "b" * 64
+
+
+async def test_a_repository_with_no_pushed_digest_reports_none() -> None:
+    """A local alias of a pulled image names no fetchable bytes.
+
+    ``docker tag ghcr.io/…:r6 build-container:local`` adds a repository
+    that was never pushed, so no ``RepoDigests`` entry belongs to it.
+    ``None`` is the honest answer — the same one a never-pushed image
+    gets — and it makes
+    :meth:`~mcuhome.model.context.ContainerResolution.reference` fall
+    back to the tag this host actually lists, which does resolve.
+    """
+    inspected = (
+        '{"Id": "sha256:' + "c" * 64 + '", '
+        '"RepoTags": ["build-container:local"], '
+        '"RepoDigests": ["ghcr.io/mcu-home/build-container@sha256:' + "a" * 64 + '"], '
+        '"Config": {"Labels": {"org.mcuhome.contract": "1"}}}'
+    )
+    docker = Docker("docker", runner=_runner([Completed(status=0, output=inspected)]))
+    facts = await docker.image("build-container:local")
+    assert facts is not None
+    assert facts.digest is None
+    assert ContainerResolution.from_reference(facts.reference, digest=facts.digest).reference() == (
+        "build-container:local"
+    )
 
 
 async def test_the_inventory_reports_only_the_three_contract_labels() -> None:
@@ -312,9 +364,13 @@ async def test_a_partial_inspect_answer_never_mis_attributes_an_image() -> None:
     """
 
     def _object(name: str, letter: str) -> str:
+        # The repo digest belongs to the same repository as the tag, which
+        # is what makes it *this* image's digest — see
+        # `test_a_digest_of_another_repository_is_not_this_references_digest`.
+        repository = name.partition(":")[0]
         return (
             '{"Id": "sha256:' + letter * 4 + '", "RepoTags": ["' + name + '"], '
-            '"RepoDigests": ["ghcr.io/x@sha256:' + letter * 64 + '"], '
+            '"RepoDigests": ["' + repository + "@sha256:" + letter * 64 + '"], '
             '"Config": {"Labels": {"org.mcuhome.contract": "1"}}}'
         )
 

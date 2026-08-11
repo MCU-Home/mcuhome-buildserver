@@ -20,6 +20,7 @@ import pytest
 from mcuhome.model.context import (
     CONTEXT_ID_VECTORS,
     ContextFile,
+    canonical_json,
     context_id,
     vector_id,
 )
@@ -27,10 +28,20 @@ from ruamel.yaml import YAML
 
 from mcuhome_buildserver import sessions
 from mcuhome_buildserver.errors import SessionError
-from tests.conftest import CONTEXT_YAML, auth, base_context, call, make_archive, send_archive
+from tests.conftest import (
+    CONTEXT_YAML,
+    IMAGE,
+    IMAGE_DIGEST,
+    ZEPHYR_LINE,
+    auth,
+    base_context,
+    call,
+    device_model,
+    make_archive,
+    send_archive,
+)
 from tests.test_context import MODEL, PATCH, open_session, serve
 
-CONTAINER_DIGEST = "sha256:" + "b" * 64
 SDK_SHA256 = "a" * 64
 BOARD = "nrf7002dk/nrf5340/cpuapp"
 
@@ -85,7 +96,6 @@ async def test_the_id_is_the_models_rule_over_the_bytes_received(client) -> None
     """
     files = {"model/device-model.json": MODEL, "keys/signing.pub": b"public key"}
     expected = context_id(
-        container_digest=CONTAINER_DIGEST,
         sdk_sha256=SDK_SHA256,
         board=BOARD,
         files=[
@@ -134,14 +144,61 @@ async def test_an_empty_context_has_an_identity_and_may_be_locked(client) -> Non
     beyond existence, ``keys/signing.pub`` above all, are checked by
     ``build``, which is where the contract scopes them.
     """
-    expected = context_id(
-        container_digest=CONTAINER_DIGEST, sdk_sha256=SDK_SHA256, board=BOARD, files=()
-    )
+    expected = context_id(sdk_sha256=SDK_SHA256, board=BOARD, files=())
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         frame = await send_and_lock(ws, session_id, base_context())
 
     assert frame["payload"]["context_id"] == expected
+
+
+async def test_a_model_of_another_line_than_the_context_requires_is_refused(client) -> None:
+    """The invariant §3.3's exclusion of ``zephyr`` from the ID rests on.
+
+    The line is left out of the hash as "redundancy, not identity",
+    because it is provably inside the hashed device model. Nothing made
+    that provable: ``context.yaml`` is outside the integrity list by
+    construction, so a context requiring 4.5 beside a model resolved
+    against 4.4 has **the same ID** as the honest one — same files, same
+    SDK hash, same board. On a server holding images of both lines the
+    two would build in different containers, and both artifacts would be
+    attributed to that one ID, and both would pass ``verify``.
+
+    Refused at the freeze, which is the moment the identity is issued.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        frame = await send_and_lock(
+            ws, session_id, base_context(**{"model/device-model.json": device_model("4.5")})
+        )
+
+    error = frame["error"]
+    assert error["code"] == "context.integrity-mismatch"
+    assert error["details"]["paths"] == ["zephyr vs model/device-model.json"]
+    assert error["details"]["required"] == ZEPHYR_LINE
+    assert error["details"]["stated"] == "4.5"
+
+
+async def test_a_model_stating_the_required_line_locks_normally(client) -> None:
+    """The other side of the check, so it cannot be a blanket refusal.
+
+    A readable model agreeing with ``context.yaml`` is the ordinary case
+    and locks like any other context. Worth its own test because the
+    comparison is the only place this server reads the device model at
+    all: a mistake in it would refuse every honest context, and the
+    suite's other models are stubs that state no line and are passed
+    over.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        frame = await send_and_lock(
+            ws,
+            session_id,
+            base_context(**{"model/device-model.json": device_model(ZEPHYR_LINE)}),
+        )
+
+    assert frame["type"] == "result", frame
+    assert frame["payload"]["context_id"].startswith("sha256:")
 
 
 # --------------------------------------------------------------------------
@@ -154,7 +211,12 @@ async def test_the_manifest_repeats_the_pins_and_adds_the_list_and_the_id(client
     its own: the document that carries an identity carries the inputs
     that identity was computed from" (ADR 0018's amendment).
 
-    Six keys, exactly as build-container contract §3.2 draws them.
+    Seven keys, exactly as build-container contract §3.2 draws them. The
+    seventh is ``zephyr``, the requirement the context stated; the
+    ``container`` block beside it is no longer a repeat of anything the
+    client sent but this server's own answer to it (E61), and the two
+    stand side by side for the same reason intent and resolution always
+    have in this document.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
@@ -165,10 +227,24 @@ async def test_the_manifest_repeats_the_pins_and_adds_the_list_and_the_id(client
 
     assert paths is not None
     manifest = read_manifest(paths.context / "manifest.yaml")
-    assert set(manifest) == {"context", "mcuhome", "container", "target", "files", "id"}
-    assert manifest["context"] == 1
-    assert manifest["container"]["digest"] == CONTAINER_DIGEST
-    assert manifest["container"]["tag"] == "zephyr-4.4.0-r4"
+    assert set(manifest) == {
+        "context",
+        "mcuhome",
+        "zephyr",
+        "container",
+        "target",
+        "files",
+        "id",
+    }
+    assert manifest["context"] == sessions.CONTEXT_FORMAT_MAX
+    # The requirement, repeated verbatim from context.yaml…
+    assert manifest["zephyr"] == ZEPHYR_LINE
+    # …and this server's answer to it, which no client sent.
+    assert manifest["container"] == {
+        "image": IMAGE,
+        "tag": "zephyr-4.4.0-r4",
+        "digest": IMAGE_DIGEST,
+    }
     assert manifest["mcuhome"]["constraint"] == "^2.3.6"
     assert manifest["target"] == {"board": BOARD}
     assert manifest["id"] == frame["payload"]["context_id"]
@@ -210,7 +286,7 @@ async def test_no_hash_in_the_manifest_is_wrapped_across_two_lines(client, state
 
     assert paths is not None
     text = (paths.context / "manifest.yaml").read_text(encoding="utf-8")
-    assert f"digest: {CONTAINER_DIGEST}" in text
+    assert f"digest: {IMAGE_DIGEST}" in text
     assert f"id: {frame['payload']['context_id']}" in text
     assert f"sha256: {SDK_SHA256}" in text
     assert all(len(line) < 200 for line in text.splitlines()), "no runaway line either"
@@ -272,7 +348,7 @@ async def test_a_patch_is_an_ordinary_entry_of_the_list(aiohttp_client, config) 
 async def test_a_context_yaml_that_changed_after_acceptance_is_refused(client, state) -> None:
     """Defence in depth on top of the extension refusal.
 
-    The pins are three of the four hashed inputs and the document that
+    The pins are two of the three hashed inputs and the document that
     declares them is outside the integrity list by construction, so
     nothing else in the freeze would notice if it had changed. The
     refusal is ``context.integrity-mismatch`` — a recomputed value
@@ -351,7 +427,9 @@ def test_an_expired_lease_takes_the_context_with_it(tmp_path) -> None:
     """
     manager = sessions.SessionManager(ttl=0.0)
     session = manager.open(
-        profile="oneshot", protocol_version=sessions.SESSION_PROTOCOL_VERSION, context_format=1
+        profile="oneshot",
+        protocol_version=sessions.SESSION_PROTOCOL_VERSION,
+        context_format=sessions.CONTEXT_FORMAT_MAX,
     )
     from mcuhome_buildserver.contextstore import SessionPaths
 
@@ -416,9 +494,44 @@ def test_the_context_id_vectors_hold_on_this_side() -> None:
     different sort, a field entering the hash — would break attribution
     here long before anyone noticed a document had changed.
     """
-    assert len(CONTEXT_ID_VECTORS) >= 5
+    assert len(CONTEXT_ID_VECTORS) >= 6
     for vector in CONTEXT_ID_VECTORS:
         assert vector_id(vector) == vector["id"], vector["name"]
+
+
+def test_a_utf16_ordering_of_the_files_array_is_caught_by_the_vectors() -> None:
+    """The suite's own coverage, checked where the second party runs it.
+
+    The document under the hash *is* RFC 8785, and RFC 8785 orders object
+    keys by UTF-16 code units — so a second implementation reaching for
+    its JCS library's comparator for the ``files`` array is the plausible
+    mistake rather than an exotic one. The two orders agree across the
+    whole BMP and disagree the moment an astral path meets a BMP one, so
+    a suite in which no vector holds both would pass such an
+    implementation and let it compute a different context ID forever.
+
+    This server is one of the two parties that must agree, so it checks
+    the property here rather than trusting that the table has it: replay
+    every vector with the wrong sort, and some vector must come out
+    wrong.
+    """
+
+    def utf16_id(vector: dict) -> str:
+        inputs = vector["inputs"]
+        document = {
+            "files": [
+                {"path": path, "sha256": sha256}
+                for path, sha256 in sorted(
+                    inputs["files"], key=lambda entry: entry[0].encode("utf-16-be")
+                )
+            ],
+            "sdk": {"sha256": inputs["sdk_sha256"]},
+            "target": {"board": inputs["board"]},
+        }
+        return "sha256:" + hashlib.sha256(canonical_json(document).encode("utf-8")).hexdigest()
+
+    wrong = [vector["name"] for vector in CONTEXT_ID_VECTORS if utf16_id(vector) != vector["id"]]
+    assert wrong, "no vector distinguishes code-point order from UTF-16 code-unit order"
 
 
 def test_the_model_keeps_both_context_documents_out_of_the_hash() -> None:
@@ -434,7 +547,6 @@ def test_the_model_keeps_both_context_documents_out_of_the_hash() -> None:
     for path in ("context.yaml", "manifest.yaml"):
         try:
             context_id(
-                container_digest=CONTAINER_DIGEST,
                 sdk_sha256=SDK_SHA256,
                 board=BOARD,
                 files=[ContextFile(path=path, sha256="c" * 64)],
@@ -558,7 +670,9 @@ def _abandoned(manager: sessions.SessionManager, tmp_path) -> sessions.Session:
     from mcuhome_buildserver.contextstore import SessionPaths
 
     session = manager.open(
-        profile="oneshot", protocol_version=sessions.SESSION_PROTOCOL_VERSION, context_format=1
+        profile="oneshot",
+        protocol_version=sessions.SESSION_PROTOCOL_VERSION,
+        context_format=sessions.CONTEXT_FORMAT_MAX,
     )
     session.paths = SessionPaths.create(tmp_path, session.id)
     session.context_state = sessions.CONTEXT_UNLOCKED

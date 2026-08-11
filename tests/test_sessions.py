@@ -119,7 +119,10 @@ async def test_capabilities_answers_the_negotiation_surface(client, config) -> N
     assert frame["type"] == "result"
     body = frame["payload"]
     assert body["protocol"]["version"] == sessions.SESSION_PROTOCOL_VERSION
-    assert body["protocol"]["context_format"] == {"min": 1, "max": 1}
+    assert body["protocol"]["context_format"] == {
+        "min": sessions.CONTEXT_FORMAT_MIN,
+        "max": sessions.CONTEXT_FORMAT_MAX,
+    }
     assert set(body["protocol"]["profiles"]) == {"oneshot", "dev", "test"}
     # Real since the container backend landed: every local image
     # carrying the org.mcuhome.contract label, with the tag, the digest
@@ -296,7 +299,7 @@ async def test_open_session_admits_with_id_lease_and_negotiation(client) -> None
             {
                 "profile": "dev",
                 "protocol_version": sessions.SESSION_PROTOCOL_VERSION,
-                "context_format": 1,
+                "context_format": sessions.CONTEXT_FORMAT_MAX,
             },
         )
 
@@ -313,7 +316,10 @@ async def test_open_session_admits_with_id_lease_and_negotiation(client) -> None
     assert lease["expires_at"] > body["session"]["created_at"]
     negotiated = body["negotiated"]
     assert negotiated["protocol_version"] == sessions.SESSION_PROTOCOL_VERSION
-    assert negotiated["context_format"] == {"min": 1, "max": 1}
+    assert negotiated["context_format"] == {
+        "min": sessions.CONTEXT_FORMAT_MIN,
+        "max": sessions.CONTEXT_FORMAT_MAX,
+    }
     # What admission alone decides, and no more. The serving container's
     # contract version is send-context's answer, because at this point
     # the backend does not yet know which container serves the session.
@@ -421,7 +427,7 @@ def _admit(manager: sessions.SessionManager | None = None) -> sessions.Session:
     return manager.open(
         profile="oneshot",
         protocol_version=sessions.SESSION_PROTOCOL_VERSION,
-        context_format=1,
+        context_format=sessions.CONTEXT_FORMAT_MAX,
     )
 
 

@@ -24,6 +24,9 @@ from mcuhome_buildserver.app import ServerState, create_app
 from mcuhome_buildserver.config import Config
 from tests.conftest import (
     CONTEXT_YAML,
+    IMAGE,
+    IMAGE_DIGEST,
+    ZEPHYR_LINE,
     auth,
     base_context,
     call,
@@ -73,23 +76,31 @@ async def test_send_context_accepts_a_base_context_and_answers_its_pins(client) 
     assert frame["type"] == "result", frame
     body = frame["payload"]
     assert body["session_id"] == session_id
-    assert body["context"] == {"state": sessions.CONTEXT_UNLOCKED, "format": 1}
-    assert body["pins"]["container"]["digest"] == "sha256:" + "b" * 64
+    assert body["context"] == {
+        "state": sessions.CONTEXT_UNLOCKED,
+        "format": sessions.CONTEXT_FORMAT_MAX,
+    }
     assert body["pins"]["mcuhome"]["package"]["sha256"] == "a" * 64
+    assert body["pins"]["zephyr"] == ZEPHYR_LINE
     assert body["pins"]["target"] == {"board": "nrf7002dk/nrf5340/cpuapp"}
+    # The pins are what the client sent, and it sent no container (E61).
+    assert "container" not in body["pins"]
 
 
 async def test_send_context_answers_the_serving_container(client) -> None:
     """ADR 0019's amendment gives ``send-context`` the container half of
     the discovery payload — the serving build container's contract
     version and its command set — because only the context determines
-    it: the digest arrives with the pins, and ``open-session`` therefore
-    cannot answer it truthfully.
+    it: the requirement arrives with the pins, and ``open-session``
+    therefore cannot answer it truthfully.
 
-    Every value in the answer comes from ``describe`` rather than from
-    the image labels. ``describe`` is authoritative about what a program
-    can do; the labels are a pre-start hint the backend cross-checks
-    against it and must not rely on where the two disagree.
+    Since E61 the block is a **resolution**: the context named no image,
+    so ``image``, ``tag`` and ``digest`` are what this server chose for
+    the Zephyr line it was asked for, and they are the same three names
+    ``manifest.yaml`` will carry. The rest comes from ``describe`` rather
+    than from the image labels — ``describe`` is authoritative about what
+    a program can do; the labels are a pre-start hint the backend
+    cross-checks against it and must not rely on where the two disagree.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
@@ -97,32 +108,89 @@ async def test_send_context_answers_the_serving_container(client) -> None:
 
     assert set(frame["payload"]) == {"session_id", "context", "pins", "container"}
     serving = frame["payload"]["container"]
-    assert serving["digest"] == "sha256:" + "b" * 64
+    assert serving["image"] == IMAGE
+    assert serving["tag"] == "zephyr-4.4.0-r4"
+    assert serving["digest"] == IMAGE_DIGEST
     assert serving["contract"] == 1
     assert serving["program"] == "org.mcuhome.build-container"
     assert serving["actions"] == ["describe", "verify", "build"]
 
 
-async def test_a_context_pinning_an_image_this_host_has_not_is_refused(client, docker) -> None:
-    """``version.builder-unavailable``, at the moment the pins arrive.
+async def test_a_context_requiring_a_line_this_host_lacks_is_refused(client, docker) -> None:
+    """``version.builder-unsatisfiable``, at the moment the pins arrive.
 
-    The digest is resolved against this host's **local** image inventory
-    and nothing is pulled, so an image that is not here is a final
-    answer rather than a fetch this server declined to make. Refusing at
-    ``send-context`` is the useful moment: the client can open a new
-    session against an image this server has, without having paid for a
-    lock — and the context is discarded, so nothing of it is left in a
-    session that could never have built it.
+    The line is answered out of this host's **local** image inventory and
+    nothing is pulled, so a line that is not here is a final answer
+    rather than a fetch this server declined to make. Refusing at
+    ``send-context`` is the useful moment: the client can go to a server
+    that serves the line, without having paid for a lock — and the
+    context is discarded, so nothing of it is left in a session that
+    could never have built it.
+
+    The details name both sides, which is what makes the refusal
+    actionable without an operator: the line required, and the lines this
+    server actually offers.
     """
     docker.images.clear()
+    docker.listed = []
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         frame = await send_archive(ws, "send-context", session_id, base_context())
 
     error = frame["error"]
-    assert error["code"] == "version.builder-unavailable"
+    assert error["code"] == "version.builder-unsatisfiable"
     assert error["retryable"] is False
-    assert error["details"]["digest"] == "sha256:" + "b" * 64
+    assert error["details"]["required"] == ZEPHYR_LINE
+    assert error["details"]["available"] == []
+
+
+async def test_a_context_requiring_another_line_than_the_inventory_serves(client, docker) -> None:
+    """The same refusal when this host has images, of the wrong line.
+
+    "A container that does not carry a named label does not qualify —
+    absence is never read as compatible" (§2.1.1), and neither is a
+    label of another line. The offered lines travel in the details so the
+    client can see what it *could* have asked for.
+
+    **Lines, and not the label values they were read off.** The image
+    carries the release ``4.5.0``; what is reported is ``4.5``, which is
+    what a client would put in a context's ``zephyr``. Echoing the label
+    back would offer a frozen point release — the thing ADR 0013's "a
+    line, never a frozen point release" forbids — under a field name
+    both ADR 0019 and the error registry spell "the lines available".
+    """
+    for facts in docker.images.values():
+        facts["Config"]["Labels"]["org.mcuhome.zephyr"] = "4.5.0"
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        frame = await send_archive(ws, "send-context", session_id, base_context())
+
+    error = frame["error"]
+    assert error["code"] == "version.builder-unsatisfiable"
+    assert error["details"]["required"] == ZEPHYR_LINE
+    assert error["details"]["available"] == ["4.5"]
+
+
+async def test_a_prerelease_label_is_not_reported_as_a_line_available(client, docker) -> None:
+    """A suffixed release serves no line, so it offers the client nothing.
+
+    ``4.5.0-rc1`` is a legal ``org.mcuhome.zephyr`` value (§2.1.1) and
+    :func:`~mcuhome.model.toolchain.satisfies_line` matches it against no
+    line at all, its own included. Reporting it as "available" would hand
+    the client a value it cannot use in any spelling: ``4.5.0-rc1`` fails
+    ``validate_zephyr_line`` on the way in, and ``4.5``/``4.5.0`` fail the
+    match against the label. So it is simply not among the lines served,
+    and an inventory of nothing but pre-releases serves nothing.
+    """
+    for facts in docker.images.values():
+        facts["Config"]["Labels"]["org.mcuhome.zephyr"] = "4.5.0-rc1"
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        frame = await send_archive(ws, "send-context", session_id, base_context())
+
+    error = frame["error"]
+    assert error["code"] == "version.builder-unsatisfiable"
+    assert error["details"]["available"] == []
 
 
 async def test_a_container_runtime_that_is_down_is_retryable(client, docker) -> None:
@@ -185,7 +253,7 @@ async def test_a_second_base_context_is_refused_rather_than_replacing_the_pins(c
 async def test_a_base_context_without_context_yaml_is_refused(client, state) -> None:
     """The pin document is required even for an empty context.
 
-    Three of the four inputs of the context ID live in it, so a context
+    Two of the three inputs of the context ID live in it, so a context
     without one has no identity to freeze. "Empty" in ADR 0019's "a
     context that was sent but is empty may be locked" means no *content*
     files, which is a different thing.
@@ -804,14 +872,14 @@ def test_the_context_root_falls_back_to_state_and_then_to_the_temporary_dir() ->
     ("what", "document"),
     [
         ("duplicate keys", CONTEXT_YAML + "target:\n  board: other\n"),
-        ("an anchor", CONTEXT_YAML.replace("context: 1", "context: &c 1\nalias: *c")),
-        ("no pins at all", "context: 1\n"),
-        ("a second document", CONTEXT_YAML + "---\ncontext: 1\n"),
+        ("an anchor", CONTEXT_YAML.replace("context: 2", "context: &c 2\nalias: *c")),
+        ("no pins at all", "context: 2\n"),
+        ("a second document", CONTEXT_YAML + "---\ncontext: 2\n"),
         ("a python tag", CONTEXT_YAML + "extra: !!python/object/apply:os.system ['id']\n"),
-        ("a wrong format version", CONTEXT_YAML.replace("context: 1", "context: 9")),
+        ("a wrong format version", CONTEXT_YAML.replace("context: 2", "context: 9")),
         (
-            "an uppercase digest",
-            CONTEXT_YAML.replace("sha256:" + "b" * 64, "sha256:" + "B" * 64),
+            "a zephyr line that is not one",
+            CONTEXT_YAML.replace(f"zephyr: '{ZEPHYR_LINE}'", "zephyr: v4.4.0"),
         ),
         (
             "a prefixed package hash",
@@ -898,35 +966,46 @@ async def test_the_context_format_is_the_one_the_session_was_admitted_on(
     while the accepted range holds one, and the range exists precisely so
     it can widen — which is what this test does to it.
     """
-    monkeypatch.setattr(sessions, "CONTEXT_FORMAT_MAX", 2)
+    current = sessions.CONTEXT_FORMAT_MAX
+    ahead = current + 1
+    monkeypatch.setattr(sessions, "CONTEXT_FORMAT_MAX", ahead)
     client, _ = await serve(aiohttp_client, config)
-    document = CONTEXT_YAML.replace("context: 1", "context: 2").encode()
+    # The body is this format's; only the declared number moves. What is
+    # under test is which number the document is measured against, and a
+    # hypothetical next format's body would only add a second variable.
+    document = CONTEXT_YAML.replace(f"context: {current}", f"context: {ahead}").encode()
     version = sessions.SESSION_PROTOCOL_VERSION
 
     async with client.ws_connect("/ws", headers=auth()) as ws:
         frame = await call(
-            ws, "open-session", {"protocol_version": version, "context_format": 1}, frame_id="o1"
+            ws,
+            "open-session",
+            {"protocol_version": version, "context_format": current},
+            frame_id="o1",
         )
         older = frame["payload"]["session"]["id"]
         refused = await send_archive(
             ws, "send-context", older, make_archive({"context.yaml": document})
         )
         assert refused["error"]["code"] == "bad_request"
-        assert "admitted on 1" in refused["error"]["message"], refused["error"]["message"]
+        assert f"admitted on {current}" in refused["error"]["message"], refused["error"]["message"]
 
         frame = await call(
-            ws, "open-session", {"protocol_version": version, "context_format": 2}, frame_id="o2"
+            ws,
+            "open-session",
+            {"protocol_version": version, "context_format": ahead},
+            frame_id="o2",
         )
         newer = frame["payload"]["session"]["id"]
         accepted = await send_archive(
             ws, "send-context", newer, make_archive({"context.yaml": document})
         )
         assert accepted["type"] == "result", accepted
-        assert accepted["payload"]["context"]["format"] == 2
+        assert accepted["payload"]["context"]["format"] == ahead
         extended = await send_archive(
             ws, "extend-context", newer, make_archive({"keys/signing.pub": b"key"})
         )
-        assert extended["payload"]["context"]["format"] == 2, "reported, not assumed"
+        assert extended["payload"]["context"]["format"] == ahead, "reported, not assumed"
 
 
 # --------------------------------------------------------------------------

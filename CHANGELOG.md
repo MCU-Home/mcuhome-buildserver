@@ -8,6 +8,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Context format 2: the client requires a Zephyr line, this server
+  chooses the container** (E61, product owner). A context no longer pins
+  a build container by digest — it carries `zephyr: "<line>"`, the
+  Zephyr release line its model was resolved against, and this server
+  answers it with an image of that line out of the ones it already has.
+  What it chose is written into `manifest.yaml` (`container:` with
+  `image`, `tag` and `digest`, the last `null` for an image that was
+  never pushed) and is hashed nowhere, so two servers serving one line
+  with two different images freeze the same bytes to the same context
+  ID. The ID now hashes `sdk.sha256`, `target.board` and the file list.
+  - `send-context`'s answer keeps its E60 field names with new
+    meanings: `pins` loses `container` and gains `zephyr`, and the
+    answer's own `container` object is the resolution — `image` and
+    `tag` joined it, because a client no longer knows them from having
+    sent them.
+  - New typed error **`version.builder-unsatisfiable`**: no container
+    this server serves carries the required line. `details` name the
+    line required and the lines available, which is what lets a client
+    act without the operator. `version.builder-unavailable` stays for
+    the image-level refusals it always meant.
+  - `CONTEXT_FORMAT_MIN`/`MAX` are both `2`. Format 1 is gone rather
+    than accepted alongside: nothing was published against it, and
+    `mcuhome-model` no longer implements its hashing rule.
+  - The pre-invocation re-check compares `zephyr` where it compared
+    `container.digest`; the digest left because it is this server's own
+    record now, and the line took its place because it is hashed nowhere
+    and no other check would notice it moving. `context`, the manifest's
+    own format version, is compared alongside it for the same reason.
+  - **One session, one build environment.** The image is chosen once, at
+    `send-context`, and held: the first `verify`/`build` starts the
+    container the frozen `manifest.yaml` names rather than re-running the
+    selection, so an image pulled into the host mid-session can never
+    build a context whose record says otherwise. An image that has gone
+    from the host by then is `version.builder-unavailable` naming it.
+  - The freeze and the pre-invocation re-check compare `context.yaml`'s
+    `zephyr` against the device model's own `toolchain.zephyr_line`.
+    That is the invariant the ID rule rests on — the line is left out of
+    the hash because it is provably inside the hashed model — and
+    without the check two contexts differing only in their required line
+    had one identity.
+
 ### Added
 
 - **`capabilities` announces the ingress caps** (E57). The answer gains
@@ -34,16 +77,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   list (E46, E58) — a build is minutes to hours, and a command frame that
   waited for it would make every client's socket a build timer.
   `session.not-implemented` is now raised by nothing.
-- **Container discovery at `send-context`**, which is where ADR 0019's
-  amendment puts it: the digest arrives with the pins, so only then does
-  the backend know which container serves the session. The image is
-  resolved against this host's **local** docker inventory (nothing is
-  pulled — product-owner decision), `describe` is asked once per image
-  digest per server start and cached, the §2.1 labels are cross-checked
-  against it, and the answer carries the serving container's contract
-  version, program identity and command set. An image this host does not
-  have is `version.builder-unavailable`, at the moment the pins arrive
-  rather than minutes into a build.
+- **Container selection at `send-context`**, which is where ADR 0019's
+  amendment puts discovery: the requirement arrives with the pins, so
+  only then does the backend know which container serves the session.
+  The context's Zephyr line is answered out of this host's **local**
+  docker inventory (nothing is pulled — product-owner decision) by
+  matching it against each image's `org.mcuhome.zephyr` label, newest
+  release of the line wins; `describe` is asked once per image per
+  server start and cached, the §2.1 labels are cross-checked against it,
+  and the answer carries the chosen image, its tag and digest, its
+  contract version, program identity and command set. A line this host
+  does not serve is `version.builder-unsatisfiable`, at the moment the
+  pins arrive rather than minutes into a build.
 - **Events, logs and replay** (E46). The program's contract §8 events are
   relayed verbatim — unknown names included, "never dropped, never
   rewritten, never treated as an error" — with this server's
@@ -78,14 +123,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a context is a hint and is never fetched. A pin no source holds is the
   new `sdk.unavailable`, naming the version, the hash and every
   directory searched.
-- **The three pin cross-checks of §9.1 are discharged.**
-  `container.digest` against the image actually resolved,
-  `mcuhome.package.sha256` against the package bytes actually unpacked,
-  and `target.board` against the pins the session was admitted on — the
-  last as part of a full re-measurement of the locked context that runs
-  before **every** working invocation (product-owner decision: contexts
-  are small). A disagreement is `context.integrity-mismatch` naming
-  every offending path, and it does not poison the session.
+- **The pin cross-checks of §9.1 are discharged.** The serving
+  container is *selected* to carry the context's Zephyr line rather than
+  compared after the fact, `mcuhome.package.sha256` is checked against
+  the package bytes actually unpacked, and `target.board` and `zephyr`
+  against the pins the session was admitted on — the last two as part of
+  a full re-measurement of the locked context that runs before **every**
+  working invocation (product-owner decision: contexts are small). A
+  disagreement is `context.integrity-mismatch` naming every offending
+  path, and it does not poison the session.
 - **A liveness ladder, and a real cancel sentinel.** `cancel` and
   `close-session` now create the per-invocation `cancel` file the
   request document named — the seam left in place when E38 landed. The

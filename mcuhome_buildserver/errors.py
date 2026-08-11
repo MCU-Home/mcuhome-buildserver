@@ -259,13 +259,39 @@ REGISTRY: dict[str, ErrorCode] = _seed(
         summary="the frame named a verb outside this server's vocabulary; details list "
         "the known ones",
     ),
-    # The pin lives in `context.yaml` and arrives with `send-context`;
-    # `manifest.yaml` only exists once `lock-context` has written it and
-    # merely repeats the pin (ADR 0018's amendment).
+    # The requirement lives in `context.yaml` and arrives with
+    # `send-context`; `manifest.yaml` only exists once `lock-context` has
+    # written it (ADR 0018's amendment) and repeats the requirement
+    # beside the resolution this server chose for it.
+    #
+    # The summary was widened by E61, which took the `container.digest`
+    # pin out of the context format: this code never meant the pin
+    # specifically, it meant "the image this session would build in is
+    # not one this server can invoke a build on", and both of its raisers
+    # still say exactly that — an image the runtime cannot produce facts
+    # for, and an image whose `describe` contradicts its own labels.
     ErrorCode(
         "version.builder-unavailable",
         retryable=False,
-        summary="no build container on this server satisfies the context's container.digest pin",
+        summary="the build container this session would use cannot serve it: the image is "
+        "not on this host, or its describe answer contradicts its labels",
+    ),
+    # E61's refusal, and a sibling of the entry above rather than a
+    # rename of it. The two answer different questions and a client can
+    # act on exactly one of them: `builder-unavailable` is about ONE
+    # image — named in the details, actionable only by this server's
+    # operator — while this one is about this server's whole inventory,
+    # and its details name the line the context requires against the
+    # lines actually served. A client reading it can pick another build
+    # server, or set `zephyr_version` to a line that is offered, without
+    # anyone touching this host. Folding the two would put those two
+    # detail shapes under one code and lose the distinction that makes
+    # either useful.
+    ErrorCode(
+        "version.builder-unsatisfiable",
+        retryable=False,
+        summary="no build container this server serves carries the Zephyr line the context "
+        "requires; details name the required line and the lines available",
     ),
     # invocation.* — one invocation of the build container's program,
     # addressed by the server-assigned invocation id (ADR 0019 decision

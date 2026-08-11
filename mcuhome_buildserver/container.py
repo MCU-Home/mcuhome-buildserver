@@ -57,6 +57,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from mcuhome.model.context import ContainerResolution
+
 from mcuhome_buildserver.errors import SessionError
 
 __all__ = [
@@ -281,12 +283,17 @@ class Mount:
 class ImageFacts:
     """What ``docker image inspect`` says about one image.
 
-    ``digest`` is the **repo digest** — the value a context's
-    ``container.digest`` pin names — and not the image ID: contract
-    §3.3.1 fixes the spelling and ADR 0018 makes it the identity a
-    context is resolved against. It is ``None`` for an image that was
-    built locally and never pushed, which is a perfectly ordinary image
-    and simply not one a pinned context can name.
+    ``digest`` is the **repo digest** — the value a backend names a
+    chosen image by, and records in ``manifest.yaml``'s ``container``
+    block — and not the image ID: contract §3.3.1 fixes the spelling and
+    ADR 0018 makes it the one name for an image that cannot be moved to
+    other bytes. It is ``None`` for an image that was built locally and
+    never pushed, which is a perfectly ordinary image; such an image is
+    served and recorded with ``digest: null``, because it names no bytes
+    anybody could fetch. It is ``None`` for the same reason when
+    :attr:`reference`'s repository is not one of the repositories the
+    image was pushed to — a digest belongs to its repository and to no
+    other, so there is nothing here to borrow.
     """
 
     reference: str
@@ -624,17 +631,38 @@ def _facts_from(reference: str, data: dict[str, Any]) -> ImageFacts:
 
     The repo digest is picked out of ``RepoDigests`` rather than read
     from ``Id``: ``Id`` is the local image ID, which is not the value a
-    context's ``container.digest`` pin names and never compares equal to
+    manifest's ``container.digest`` records and never compares equal to
     one.
+
+    **The entry taken is the one belonging to this reference's own
+    repository**, and there is no fallback to another. One image is
+    routinely tagged into several repositories — pulled from ghcr.io and
+    also pushed to a local mirror, or simply retagged for a private name
+    — and ``RepoDigests`` then holds one entry per repository, each with
+    that registry's own digest. A digest is only a name *within* its
+    repository: ``mirror/build-container@sha256:<the ghcr digest>``
+    resolves nowhere, so pairing across repositories would compose a
+    reference this host cannot answer and hand it to ``docker run`` on a
+    server whose whole invariant is that it pulls nothing — and would
+    write that same non-existent pair into ``manifest.yaml`` as the
+    record of what built the artifacts.
+
+    A repository with a tag but no pushed digest therefore gets
+    ``digest=None``, which is the honest answer for it and the same one
+    a never-pushed image gets:
+    :meth:`~mcuhome.model.context.ContainerResolution.reference` then
+    names it by the tag this host lists it under, which is a name that
+    does resolve.
     """
     config = data.get("Config")
     labels = config.get("Labels") if isinstance(config, dict) else None
     digests = data.get("RepoDigests")
+    repository = ContainerResolution.from_reference(reference, digest=None).image
     digest = None
     if isinstance(digests, list):
         for entry in digests:
-            _, _, candidate = str(entry).partition("@")
-            if candidate:
+            listed, at_sign, candidate = str(entry).partition("@")
+            if at_sign and candidate and listed == repository:
                 digest = candidate
                 break
     return ImageFacts(

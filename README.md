@@ -46,20 +46,22 @@ No verb answers `session.not-implemented` any more. The code stays in
 the registry, because the registry is append-only and a future verb will
 want it.
 
-What a build costs before it starts: the image the context pins has to
-be **on this host** (this server resolves the digest against the local
-docker inventory and pulls nothing), and the SDK package the context
-pins has to be in a directory named by `--sdk-source`. Neither is
-fetched from the network — build-container contract §9.1 makes external
-inputs "the backend's to fetch and to hand over as paths", and ADR 0019
-§8 makes the url in a context a hint that is never followed.
+What a build costs before it starts: a build container of the Zephyr
+line the context requires has to be **on this host** (this server
+answers that line out of the local docker inventory and pulls nothing),
+and the SDK package the context pins has to be in a directory named by
+`--sdk-source`. Neither is fetched from the network — build-container contract §9.1 makes
+external inputs "the backend's to fetch and to hand over as paths", and
+ADR 0019 §8 makes the url in a context a hint that is never followed.
 
-Three duties of §9.1 that used to be deferred are now discharged:
-`container.digest` is checked against the image actually resolved,
-`mcuhome.package.sha256` against the package bytes actually unpacked,
-and `target.board` against the pins the session was admitted on — the
-last one as part of a full re-measurement of the locked context that
-runs before **every** working invocation.
+Three duties of §9.1 that used to be deferred are now discharged: the
+serving container is *selected* to carry the context's `zephyr` line and
+recorded in `manifest.yaml` (E61 — so a container of the wrong line
+cannot be reached rather than being detected afterwards),
+`mcuhome.package.sha256` is checked against the package bytes actually
+unpacked, and `target.board` and `zephyr` against the pins the session
+was admitted on — the last two as part of a full re-measurement of the
+locked context that runs before **every** working invocation.
 
 What is deliberately not here: no image is pulled, no registry is
 configured, and no cache is ever offered writable. Each is a decision
@@ -172,7 +174,7 @@ verbs, the complete set of dashboard ADR 0012 decision 3.
 |---|---|---|
 | `capabilities` | `{}` | **answers**: protocol version, the local build-container inventory (reference, digest and the three §2.1 labels), per-layer patch policy from configuration, session quota, and the **ingress caps** — the five of ADR 0019 decision 8 out of this server's own configuration plus the maximum WebSocket frame, so that a client can size an upload instead of discovering a limit by hitting it (E57) |
 | `open-session` | `{"profile", "protocol_version", "context_format"}` | **answers**: admission — session id, lease, negotiated versions, backend profile (`container`). A version mismatch is a typed rejection at the door |
-| `send-context` | `{"session_id", "archive": {"size", "sha256"}}` + BINARY frames | **answers**: the pins accepted, the context state and **the serving build container** — its digest, contract version, program id and command set, all out of `describe`. `version.builder-unavailable` if this host has no such image, `context.exists` on a second base context |
+| `send-context` | `{"session_id", "archive": {"size", "sha256"}}` + BINARY frames | **answers**: the pins accepted, the context state and **the serving build container** — the image, tag and digest this server selected for the context's `zephyr` line, plus its contract version, program id and command set out of `describe`. `version.builder-unsatisfiable` if this host serves no container of that line, `context.exists` on a second base context |
 | `extend-context` | `{"session_id", "archive"?, "remove"?}` + BINARY frames | **answers**: the context state, the file count and how many named paths were removed. `context.pins-immutable` for `context.yaml`, `context.missing` with no base context, `context.locked` after the lock |
 | `lock-context` | `{"session_id"}` | **answers**: `{"context_id"}` and nothing else. `context.missing` with no base context, `context.locked` on a second lock |
 | `verify` | `{"session_id"}` | **answers immediately**: `{"invocation_id", "action", "context_id"}`. The outcome arrives as an `invocation.verdict` event. `context.not-locked` before the lock |
@@ -258,8 +260,10 @@ BINARY frames, and the verb's own result frame is the acknowledgement.
 → <binary frame> <binary frame> …                     // the tar.zst itself
 ← {"id": "3", "type": "result", "payload": {
      "session_id": "s-…",
-     "context": {"state": "unlocked", "format": 1},
-     "pins": {"mcuhome": {…}, "container": {…}, "target": {…}}}}
+     "context": {"state": "unlocked", "format": 2},
+     "pins": {"mcuhome": {…}, "zephyr": "4.4", "target": {…}},
+     "container": {"image": …, "tag": …, "digest": …,   // THIS server's choice
+                   "contract": 1, "program": …, "version": …, "actions": […]}}}
 ```
 
 ADR 0019 §2 spells the verb `send-context(archive)`, and that one word
@@ -299,15 +303,17 @@ somebody wrote down.
    context must be locked, or the verb refuses before doing anything.
 2. **The context is re-measured.** Every file is re-hashed against the
    `files` list in the `manifest.yaml` this server wrote, and the three
-   pins in that manifest are compared against the ones `send-context`
+   pins in that manifest — `zephyr`, `mcuhome.package.sha256`,
+   `target.board` — are compared against the ones `send-context`
    accepted. A disagreement is `context.integrity-mismatch` naming every
    offending path, and it does **not** poison the session: nothing was
    applied to any tree. Contexts are small, so this runs before every
    invocation rather than once at the lock.
 3. **The container, lazily.** On the first working command of a session:
-   the image is resolved by digest, `describe` is asked (once per image
-   digest per server start, then cached) and cross-checked against the
-   §2.1 labels, the SDK package is found by `(version, sha256)` and
+   the context's Zephyr line is answered out of the inventory again and
+   the chosen image is named by digest from there on, `describe` is
+   asked (once per image per server start, then cached) and cross-checked
+   against the §2.1 labels, the SDK package is found by `(version, sha256)` and
    unpacked into the session's own directory, the mounts are composed
    and one container is started. One session is one container is the
    trust boundary.
@@ -510,8 +516,10 @@ reduces none of it.
   recomputed from the bytes that arrived (`context.integrity-mismatch`),
   and every context file is re-hashed at the lock. `context.yaml` is
   re-measured against what `send-context` accepted, because the pins are
-  three of the four hashed inputs and the document that declares them is
-  outside the integrity list by construction.
+  two of the three hashed inputs and the document that declares them is
+  outside the integrity list by construction — as is `zephyr`, which is
+  hashed nowhere and would otherwise be the one accepted value a rewrite
+  could move unnoticed.
 - **Per-session disk quota** — `--session-quota-bytes`, default 2 GiB,
   answered `policy.quota-exceeded` rather than by the host running out
   of room.

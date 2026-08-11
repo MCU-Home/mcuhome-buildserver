@@ -13,9 +13,12 @@ goes through :meth:`SessionPaths.discard`.
 
 **What it declares** is :func:`parse_context_yaml`. ``context.yaml`` is
 the request document of ADR 0018's amendment: the format version, the
-resolved pins — container digest, SDK package hash, target board — and
-the constraint they were resolved from. It is what carries the pins into
-a session, and it is the one file an extension may not touch.
+resolved pins — SDK package hash, target board — the Zephyr line the
+build container has to carry, and the constraint the SDK pin was
+resolved from. It is what carries the pins into a session, and it is the
+one file an extension may not touch. It does **not** name a container:
+choosing one of the required line, out of the images this server serves,
+is this server's job (E61).
 
 **The freeze** is :func:`freeze_context`, the body of ``lock-context``.
 It hashes every content file, builds the ``files`` integrity list,
@@ -55,14 +58,17 @@ from typing import Any
 from mcuhome.model.context import (
     CONTEXT_FILE,
     MANIFEST_FILE,
-    ContainerPin,
+    MODEL_FILE,
+    ContainerResolution,
     ContextFile,
     ContextManifest,
     SdkPin,
     context_id,
+    validate_zephyr_line,
 )
 from mcuhome.model.errors import BuildError
 from mcuhome.model.hashes import sha256_file
+from mcuhome.model.modelfile import read_model
 from ruamel.yaml import YAML, YAMLError
 from ruamel.yaml.events import AliasEvent
 
@@ -336,16 +342,24 @@ class ContextPins:
     """``context.yaml``, parsed — the pins a session was sent.
 
     Held on the session because the freeze needs them: ``manifest.yaml``
-    "repeats the pin blocks — ``mcuhome``, ``container``, ``target`` —
-    exactly as ``context.yaml`` states them" (ADR 0018's amendment), so
-    every field of them travels, hashed or not. The one field that does
-    not travel is ``created``: it dates the request, and the manifest's
-    own moment is the lock.
+    "repeats the pin blocks — ``mcuhome``, ``target`` — exactly as
+    ``context.yaml`` states them" (ADR 0018's amendment), and so it does
+    with ``zephyr``, so every field of them travels, hashed or not. The
+    one field that does not travel is ``created``: it dates the request,
+    and the manifest's own moment is the lock.
+
+    There is no container here, and that is E61: a context states the
+    Zephyr line it needs and this server answers it with an image of its
+    own choosing. What it chose is a
+    :class:`~mcuhome.model.context.ContainerResolution` written into the
+    manifest at the freeze, not a pin read out of a client's document.
     """
 
     context_version: int
     sdk: SdkPin
-    container: ContainerPin
+    #: The Zephyr release line a build container must carry to serve this
+    #: context. A **requirement**, not a choice — see the class docstring.
+    zephyr: str
     board: str
     #: What ``context.yaml`` said, kept only to be able to say what was
     #: accepted. It never reaches ``manifest.yaml`` and never the hash.
@@ -356,7 +370,11 @@ class ContextPins:
 
         Shaped like ``context.yaml``'s own blocks so that a client can
         compare what it sent against what was accepted without a mapping
-        table in between.
+        table in between. The shape is normative since E60; E61 changed
+        its content and not its rule — the ``container`` block moved out
+        of here, because a client's pins no longer carry one, and the
+        answer's own ``container`` key now carries this server's
+        resolution instead.
         """
         return {
             "mcuhome": {
@@ -364,11 +382,7 @@ class ContextPins:
                 "version": self.sdk.version,
                 "package": {"url": self.sdk.url, "sha256": self.sdk.sha256},
             },
-            "container": {
-                "image": self.container.image,
-                "tag": self.container.tag,
-                "digest": self.container.digest,
-            },
+            "zephyr": self.zephyr,
             "target": {"board": self.board},
         }
 
@@ -483,11 +497,7 @@ def parse_context_yaml(path: Path, *, expected_version: int, max_bytes: int) -> 
             url=_string(data, "mcuhome", "package", "url"),
             sha256=_string(data, "mcuhome", "package", "sha256"),
         ),
-        container=ContainerPin(
-            image=_string(data, "container", "image"),
-            tag=_string(data, "container", "tag"),
-            digest=_string(data, "container", "digest"),
-        ),
+        zephyr=_string(data, "zephyr"),
         board=_string(data, "target", "board"),
         created=created if isinstance(created, str) else None,
     )
@@ -508,22 +518,29 @@ def _check_pin_spelling(pins: ContextPins) -> None:
     The check is :func:`~mcuhome.model.context.context_id` itself, run
     over an empty file list and its result thrown away. That looks
     indirect and is deliberate: ``context_id`` validates exactly these
-    three values strictly before it hashes anything, and it is the only
+    two values strictly before it hashes anything, and it is the only
     **public** entry point in ``mcuhome-model`` that does — the strict
     checkers behind it are private, and ``validate_manifest`` needs a
-    whole manifest, which a server holding three freshly parsed pins does
-    not have. Re-spelling the rules here instead would be a second
+    whole manifest, which a server holding freshly parsed pins does not
+    have. Re-spelling the rules here instead would be a second
     implementation of §3.3.1 in the repository that must not have one.
     The ID it returns is discarded because the ID has exactly one moment,
     and this is not it.
+
+    The Zephyr line is checked alongside them by the same borrowing
+    argument, through the one public checker ``mcuhome-model`` exposes
+    for it. It is not a §3.3.1 value — it never enters the hash — but it
+    is what this server matches an image against a few lines later, and a
+    line no matcher could ever satisfy is better refused where it
+    arrived than as "no container serves this".
     """
     try:
         context_id(
-            container_digest=pins.container.digest,
             sdk_sha256=pins.sdk.sha256,
             board=pins.board,
             files=(),
         )
+        validate_zephyr_line(pins.zephyr)
     except BuildError as exc:
         raise _malformed(str(exc).rstrip(".")) from exc
 
@@ -629,7 +646,13 @@ def recheck_patch_policy(root: Path, allowed_layers: frozenset[str]) -> tuple[st
 # --------------------------------------------------------------------------
 
 
-def freeze_context(paths: SessionPaths, pins: ContextPins, *, context_yaml_sha256: str) -> str:
+def freeze_context(
+    paths: SessionPaths,
+    pins: ContextPins,
+    *,
+    container: ContainerResolution,
+    context_yaml_sha256: str,
+) -> str:
     """Freeze the context: hash it, identify it, write ``manifest.yaml``.
 
     The data flow, and the ``mcuhome-model`` symbol behind each step:
@@ -638,22 +661,37 @@ def freeze_context(paths: SessionPaths, pins: ContextPins, *, context_yaml_sha25
        :func:`mcuhome.model.hashes.sha256_file`;
     2. each becomes an integrity entry —
        :class:`mcuhome.model.context.ContextFile`;
-    3. the four hashed inputs become the ID —
+    3. the three hashed inputs become the ID —
        :func:`mcuhome.model.context.context_id`;
-    4. the pins, the list and the ID become the document —
+    4. the pins, *container*, the list and the ID become the document —
        :meth:`mcuhome.model.context.ContextManifest.to_dict`;
     5. this module's ``ruamel.yaml`` renders it, and the file is
        replaced atomically and fsynced.
 
+    *container* is this server's own answer to the context's ``zephyr``
+    requirement — the image ``send-context`` selected out of the ones it
+    serves (E61). It is written into the manifest and stays **outside**
+    the ID, which is what lets two servers with two different images of
+    one Zephyr line freeze the same bytes to the same identity while each
+    manifest still records, exactly, what actually built it.
+
     Before any of it, ``context.yaml`` is re-hashed and compared against
     the hash ``send-context`` recorded when it accepted the pins. That
     is defence in depth on top of the extension refusal rather than a
-    duplicate of it: the pins are three of the four hashed inputs and
+    duplicate of it: the pins are two of the three hashed inputs and
     the document that declares them is outside the integrity list by
     construction, so nothing else in the freeze would notice if it had
     changed. A disagreement is ``context.integrity-mismatch`` — a
     recomputed value disagreeing with the bytes received, which is
-    exactly what that code means.
+    exactly what that code means. It also covers ``zephyr``, which is
+    hashed nowhere and would otherwise be the one accepted value a
+    rewrite could move silently between the acceptance and the freeze.
+
+    That closes the *temporal* gap around ``zephyr``; the *semantic* one
+    is closed by :func:`_require_model_agrees` on the next line. See its
+    docstring: the reason the ID may leave ``zephyr`` out is that the
+    line is provably inside the hashed model, and nothing made that
+    provable until this check existed.
 
     The ID is **not** compared against a client's value, and never can
     be: ``lock-context``'s request carries ``session_id`` and nothing
@@ -667,24 +705,25 @@ def freeze_context(paths: SessionPaths, pins: ContextPins, *, context_yaml_sha25
         raise SessionError(
             "context.integrity-mismatch",
             "context.yaml no longer hashes to what this server accepted at send-context. "
-            "It carries the pins the session was admitted on, and three of the four inputs "
+            "It carries the pins the session was admitted on, and two of the three inputs "
             "of the context id come from it, so the freeze refuses rather than identifying "
             "a context by pins nobody sent.",
             paths=[CONTEXT_FILE],
             accepted=context_yaml_sha256,
             computed=actual,
         )
+    _require_model_agrees(context, pins)
 
     files = collect_context_files(context)
     identity = context_id(
-        container_digest=pins.container.digest,
         sdk_sha256=pins.sdk.sha256,
         board=pins.board,
         files=files,
     )
     manifest = ContextManifest(
         sdk=pins.sdk,
-        container=pins.container,
+        zephyr=pins.zephyr,
+        container=container,
         board=pins.board,
         files=files,
         id=identity,
@@ -707,14 +746,31 @@ def recheck_locked_context(paths: SessionPaths, pins: ContextPins, *, expected_i
     defines for ``verify``, checked here on the *backend's* side of the
     boundary, where it does not depend on the container being honest.
 
-    **The pins, cross-checked.** §9.1 makes the backend compare
-    ``container.digest``, ``mcuhome.package.sha256`` and ``target.board``
-    "against the header the session was admitted on", and ADR 0018's
-    amendment states the duty normatively because ``verify_context``
-    cannot establish it: a self-consistently forged manifest verifies
-    clean. This server wrote the manifest itself, so what this catches
-    is a manifest that changed *after* it was written — which is exactly
-    the gap the duty names.
+    **The pins, cross-checked.** §9.1 makes the backend compare the
+    manifest's declared values "against the header the session was
+    admitted on", and ADR 0018's amendment states the duty normatively
+    because ``verify_context`` cannot establish it: a self-consistently
+    forged manifest verifies clean. This server wrote the manifest
+    itself, so what this catches is a manifest that changed *after* it
+    was written — which is exactly the gap the duty names.
+
+    Under context format 2 the compared values are ``context``,
+    ``zephyr``, ``mcuhome.package.sha256`` and ``target.board``.
+    ``container.digest`` dropped out of the list and was not replaced: it
+    is no longer a pin a client sent and this server verified, it is this
+    server's own record of what it chose, so comparing it against the
+    pins would be comparing this server to itself. ``zephyr`` took its
+    place in the list and earns it — it is what the choice was *made
+    against*, and unlike the other two it is hashed nowhere, so a rewrite
+    of it is invisible to every other check here. ``context`` is in the
+    list for that same reason; :func:`_pin_disagreements` argues it.
+
+    **The model, cross-checked** — the same equality the freeze makes
+    (:func:`_require_model_agrees`), repeated here for the same reason
+    every other value in this pass is repeated: the freeze establishes
+    it once and this is the pass that says it still holds. Its own
+    refusal rather than an entry in ``offending``, because it names two
+    documents that disagree rather than a path whose bytes moved.
 
     **The identity, recomputed.** Attribution always uses the id this
     server computed itself; the one recomputed here is compared against
@@ -733,6 +789,7 @@ def recheck_locked_context(paths: SessionPaths, pins: ContextPins, *, expected_i
     context = paths.context
     manifest_path = context / MANIFEST_FILE
     recorded = _read_manifest(manifest_path)
+    _require_model_agrees(context, pins)
     offending = _pin_disagreements(recorded, pins)
 
     listed = {entry.path: entry.sha256 for entry in recorded.files}
@@ -788,23 +845,119 @@ def _read_manifest(path: Path) -> ContextManifest:
 
 
 def _pin_disagreements(recorded: ContextManifest, pins: ContextPins) -> list[str]:
-    """Which of the three pins moved since ``send-context`` accepted them.
+    """Which of the recorded values moved since ``send-context``.
 
-    Named as pseudo-paths (``container.digest`` and friends) so that one
+    Named as pseudo-paths (``target.board`` and friends) so that one
     ``paths`` list in the refusal can carry both kinds of disagreement.
     A client fixing either does the same thing — send the context again
     — and splitting the answer in two would only make it guess which
     half it got.
+
+    ``context`` is here for the same reason ``zephyr`` is: it is a value
+    the manifest declares and nothing else measures. It is not in the
+    hash — :meth:`~mcuhome.model.context.ContextManifest.compute_id`
+    takes three inputs and this is not one — and it is not in the
+    integrity list, because ``manifest.yaml`` carries that list and
+    cannot be in it. ``context.yaml`` gets a hard version gate on every
+    read (:func:`parse_context_yaml`) and the freeze can only ever have
+    written the version the session was admitted on, so a manifest
+    stating another one is by construction a manifest that changed after
+    it was written — which is exactly what this pass exists to catch.
+    Without this entry the rewrite travelled all the way into the
+    container and came back as ``unsupported.context``, telling the
+    operator the *image* was wrong.
     """
     return [
         name
         for name, expected, found in (
-            ("container.digest", pins.container.digest, recorded.container.digest),
+            ("context", pins.context_version, recorded.context_version),
+            ("zephyr", pins.zephyr, recorded.zephyr),
             ("mcuhome.package.sha256", pins.sdk.sha256, recorded.sdk.sha256),
             ("target.board", pins.board, recorded.board),
         )
         if expected != found
     ]
+
+
+#: How the model cross-check names itself in a refusal's ``paths``. Not a
+#: file that changed but two documents that disagree, so it names both.
+MODEL_LINE_PATH = f"zephyr vs {MODEL_FILE}"
+
+
+def _model_zephyr_line(context: Path) -> str | None:
+    """The Zephyr line the context's device model states, or ``None``.
+
+    ``None`` where there is nothing to compare against: no model file, a
+    model this server's ``mcuhome-model`` cannot read (a model version it
+    does not implement, a truncated file), or one stating no line. None
+    of those is this check's business — a context whose model cannot be
+    read does not build, and the program inside the container refuses it
+    with a far better message than a build server guessing at a document
+    it deliberately does not interpret.
+
+    Interpreting is exactly what is *not* happening here: one field of
+    one file is read, compared for equality and used for nothing else.
+    ``mcuhome.model``'s reader is used rather than a JSON dig of this
+    module's own because the field's spelling then has one owner —
+    :mod:`mcuhome.model.model` — instead of a second, silent copy on this
+    side that a model change could leave behind.
+    """
+    path = context / MODEL_FILE
+    if not path.is_file():
+        return None
+    try:
+        stated = read_model(path).toolchain.zephyr_line
+    except BuildError:
+        return None
+    return stated if isinstance(stated, str) and stated else None
+
+
+def _require_model_agrees(context: Path, pins: ContextPins) -> None:
+    """``context.yaml``'s ``zephyr`` against the model's own line.
+
+    **The one thing that makes leaving ``zephyr`` out of the ID
+    legitimate.** §3.3 excludes the field as "redundancy, not identity",
+    on the grounds that the line is provably inside two things the ID
+    already hashes — the SDK package and the canonical device model. The
+    model half is the one that can be checked here, and until it is
+    checked the argument is circular: ``context.yaml`` is outside the
+    integrity list by construction, so two contexts with byte-identical
+    files and two different required lines freeze to **one** ID, get
+    built in containers of two different Zephyr lines, and both pass
+    ``verify``. The document ADR 0018 calls the identity of a build would
+    then name two builds.
+
+    Server-side because it is the only side that helps: a client-side
+    check is worthless against a hand-edited ``context.yaml``, which is
+    the whole scenario. Run at the freeze — the moment the identity is
+    issued — and again before every working invocation, alongside the
+    other values a locked manifest is re-measured against.
+
+    A **scoped deviation** from "the build server never parses the device
+    model" (E61), and deliberately the smallest one available: the file
+    is one this server already hashes into the integrity list, the read
+    is one field, and the field is used for one equality. §9.1's
+    cross-checked-pins duty gains it as an erratum, since §3.3's
+    exclusion rationale depends on the invariant holding.
+
+    Not fixed by hashing ``zephyr`` instead: the rule is frozen with
+    ``context`` format version 2, so that would be a format bump for what
+    is really a missing consistency check.
+    """
+    stated = _model_zephyr_line(context)
+    if stated is None or stated == pins.zephyr:
+        return
+    raise SessionError(
+        "context.integrity-mismatch",
+        f"This context requires Zephyr {pins.zephyr} and its device model was resolved "
+        f"against {stated}. The context id does not hash the required line — it is left "
+        "out because the model already carries it — so a context whose two documents "
+        "disagree about it would be identified as, and built differently from, the "
+        "context that agrees.",
+        paths=[MODEL_LINE_PATH],
+        required=pins.zephyr,
+        stated=stated,
+    )
 
 
 def _write_manifest(manifest: ContextManifest, path: Path) -> None:

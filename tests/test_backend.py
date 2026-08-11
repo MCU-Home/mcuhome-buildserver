@@ -25,17 +25,23 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from ruamel.yaml import YAML
 
 from mcuhome_buildserver import sessions
 from tests.conftest import (
     BUILD_REPORT,
+    IMAGE,
+    IMAGE_DIGEST,
+    IMAGE_LABELS,
     IMAGE_REFERENCE,
+    ZEPHYR_LINE,
     FakeProcess,
     auth,
     base_context,
     buildable_context,
     call,
     collect,
+    device_model,
     emit,
     manifest_id,
     send_archive,
@@ -2165,6 +2171,14 @@ async def test_an_image_missing_a_coupling_label_does_not_qualify(client, config
 
     "An image that does not say what it builds against has not made the
     declaration the constraint is written against."
+
+    Since E61 that has teeth earlier and a different code: the label is
+    what a context's Zephyr line is matched against, so an image without
+    one is not a candidate at all and this host ends up serving no line —
+    ``version.builder-unsatisfiable``, with an empty ``available`` list
+    saying exactly that. Under the digest-pinned format the same image
+    was selected by digest first and only then failed the describe gate,
+    which is why the refusal used to be the other code.
     """
     del docker.images[IMAGE_REFERENCE]["Config"]["Labels"]["org.mcuhome.zephyr"]
     async with client.ws_connect("/ws", headers=auth()) as ws:
@@ -2173,8 +2187,198 @@ async def test_an_image_missing_a_coupling_label_does_not_qualify(client, config
             ws, "send-context", session_id, buildable_context("a" * 63 + "0")
         )
 
-    assert frame["error"]["code"] == "version.builder-unavailable"
-    assert "org.mcuhome.zephyr" in frame["error"]["details"]["problem"]
+    assert frame["error"]["code"] == "version.builder-unsatisfiable"
+    assert frame["error"]["details"]["required"] == ZEPHYR_LINE
+    assert frame["error"]["details"]["available"] == []
+
+
+async def test_the_newest_release_of_the_required_line_is_the_one_selected(
+    client, config, docker
+) -> None:
+    """Several candidates, one deterministic choice (E61).
+
+    It has to be deterministic — two sessions sending one context to one
+    server must build in one image, or the manifests they get back
+    describe different builds — and of the deterministic rules available
+    it is the one ADR 0013 already argues for: "a line, never a frozen
+    point release — patch releases with security backports are always
+    taken".
+
+    The image of another line is in the inventory throughout, and is
+    never a candidate: this is a choice among the images that serve the
+    requirement, not among the images that exist.
+    """
+    other = f"{IMAGE}:zephyr-4.4.2-r1"
+    newer_digest = "sha256:" + "e" * 64
+    docker.images[other] = {
+        "Id": "sha256:" + "d" * 64,
+        "RepoTags": [other],
+        "RepoDigests": [f"{IMAGE}@{newer_digest}"],
+        "Config": {"Labels": {**IMAGE_LABELS, "org.mcuhome.zephyr": "4.4.2"}},
+    }
+    wrong_line = f"{IMAGE}:zephyr-4.5.0-r1"
+    docker.images[wrong_line] = {
+        "Id": "sha256:" + "9" * 64,
+        "RepoTags": [wrong_line],
+        "RepoDigests": [f"{IMAGE}@{'9' * 64}"],
+        "Config": {"Labels": {**IMAGE_LABELS, "org.mcuhome.zephyr": "4.5.0"}},
+    }
+    docker.listed = [wrong_line, f"{IMAGE}:zephyr-4.4.0-r4", other]
+
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        frame = await send_archive(ws, "send-context", session_id, base_context())
+
+    serving = frame["payload"]["container"]
+    assert serving["digest"] == newer_digest
+    assert serving["tag"] == "zephyr-4.4.2-r1"
+
+
+async def test_the_chosen_image_is_invoked_by_digest_and_not_by_tag(client, config, docker) -> None:
+    """A tag can be made to point at other bytes; a digest cannot.
+
+    The selection reads a tag off ``docker image ls`` because that is
+    what ``ls`` reports, and everything after it names the image the one
+    way that cannot move underneath the session (ADR 0018 §7). The tag
+    survives in the manifest's record beside the digest, which is where
+    a human wants it.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, _ = await locked(ws, config, **{"model/device-model.json": MODEL})
+        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
+        await collect(ws, until="invocation.verdict")
+
+    started = next(
+        argv for argv in docker.calls if argv[:2] == ["docker", "run"] and "--detach" in argv
+    )
+    assert IMAGE_REFERENCE in started
+    assert f"{IMAGE}:zephyr-4.4.0-r4" not in started
+
+
+def _extra_image(docker, tag: str, *, release: str, digest: str, identity: str) -> str:
+    """Put one more conforming build container on the fake host."""
+    reference = f"{IMAGE}:{tag}"
+    docker.images[reference] = {
+        "Id": "sha256:" + identity * 64,
+        "RepoTags": [reference],
+        "RepoDigests": [f"{IMAGE}@sha256:{digest * 64}"],
+        "Config": {"Labels": {**IMAGE_LABELS, "org.mcuhome.zephyr": release}},
+    }
+    docker.images[f"{IMAGE}@sha256:{digest * 64}"] = docker.images[reference]
+    docker.listed = [*docker.listed, reference]
+    return reference
+
+
+async def test_an_image_pulled_after_the_lock_does_not_take_over_the_session(
+    client, config, docker, state
+) -> None:
+    """One session, one build environment — the manifest is not a guess.
+
+    ``send-context`` chooses the image and ``lock-context`` writes it
+    into ``manifest.yaml``, where §3.2 makes it "the record of which
+    build environment answered this context's requirement … the
+    requirement says what was needed, this says what actually ran". An
+    operator pulling a newer release of the same line into a running
+    server is routine, and if the first ``build`` re-ran the selection it
+    would win — ``max`` by release — and the artifacts would come out of
+    an image the manifest does not name, with nothing able to notice: the
+    recorded resolution is outside the ID by design and outside the
+    per-invocation re-check's pin list.
+
+    So the assertion is in two halves: the container starts from the
+    image the manifest records, and the inventory is never even asked
+    again. The second half is what makes the first one a rule rather than
+    a coincidence of this fake's ordering.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, _ = await locked(ws, config, **{"model/device-model.json": MODEL})
+        listings = len([argv for argv in docker.calls if argv[1:3] == ["image", "ls"]])
+        newer = _extra_image(docker, "zephyr-4.4.2-r1", release="4.4.2", digest="e", identity="d")
+        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
+        await collect(ws, until="invocation.verdict")
+        context = state.sessions.require(session_id).paths.context
+
+    started = next(
+        argv for argv in docker.calls if argv[:2] == ["docker", "run"] and "--detach" in argv
+    )
+    assert IMAGE_REFERENCE in started, "the image the manifest names"
+    assert newer not in started and f"{IMAGE}@sha256:{'e' * 64}" not in started
+    recorded = YAML(typ="safe", pure=True).load((context / "manifest.yaml").read_text())
+    assert recorded["container"]["digest"] == IMAGE_DIGEST
+    after = len([argv for argv in docker.calls if argv[1:3] == ["image", "ls"]])
+    assert after == listings, "no second selection: the choice was made at send-context"
+
+
+async def test_an_image_that_went_away_after_the_lock_is_a_typed_refusal(
+    client, config, docker
+) -> None:
+    """The other half of holding the choice: it can be gone, not swapped.
+
+    An operator may remove an image while a session sits locked. Another
+    image of the same line then serves the requirement — and substituting
+    it is exactly what must not happen, because ``manifest.yaml`` has
+    already been answered and names the one that went. So the refusal is
+    typed and names the missing image: ``version.builder-unavailable``,
+    whose registry entry is "the image is not on this host", and which is
+    not the retryable ``builder.runtime-unavailable`` because this server
+    pulls nothing and "gone" is a final answer.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, _ = await locked(ws, config, **{"model/device-model.json": MODEL})
+        _extra_image(docker, "zephyr-4.4.2-r1", release="4.4.2", digest="e", identity="d")
+        del docker.images[IMAGE_REFERENCE]
+        frame = await call(ws, "build", {"session_id": session_id}, frame_id="b")
+
+    error = frame["error"]
+    assert error["code"] == "version.builder-unavailable"
+    assert error["retryable"] is False
+    assert error["details"]["digest"] == IMAGE_DIGEST
+    assert error["details"]["image"] == IMAGE
+    detached = [
+        argv for argv in docker.calls if argv[:2] == ["docker", "run"] and "--detach" in argv
+    ]
+    assert detached == [], "no container was started in the substitute either"
+
+
+async def test_a_rebuilt_tag_without_a_digest_is_described_again(client, config, docker) -> None:
+    """The ``describe`` memo is keyed by bytes, never by a movable tag.
+
+    An image built on this host and never pushed carries no repo digest —
+    the case E61 made first-class with ``digest: null`` — and developing
+    the build container itself means rebuilding one tag against a
+    long-lived server. Keyed by the tag, every later session would be
+    served the previous build's action set, tree paths and program
+    version while ``docker exec`` ran against the new bytes. Docker's own
+    image ID is content-addressed and changes on every rebuild, which is
+    what makes it the honest stand-in.
+    """
+    reference = "localhost/build-container:dev"
+    docker.images.clear()
+    docker.images[reference] = {
+        "Id": "sha256:" + "1" * 64,
+        "RepoTags": [reference],
+        "RepoDigests": [],
+        "Config": {"Labels": dict(IMAGE_LABELS)},
+    }
+    docker.listed = [reference]
+
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+        first = await open_session(ws)
+        await send_archive(ws, "send-context", first, buildable_context(sha256))
+        # The same tag, rebuilt: new bytes, new image id, same name.
+        docker.images[reference] = {
+            **docker.images[reference],
+            "Id": "sha256:" + "2" * 64,
+        }
+        second = await open_session(ws)
+        await send_archive(ws, "send-context", second, buildable_context(sha256))
+        # And once more without a rebuild, which the memo must absorb.
+        third = await open_session(ws)
+        await send_archive(ws, "send-context", third, buildable_context(sha256))
+
+    described = [argv for argv in docker.calls if argv[-2:-1] == ["describe"]]
+    assert len(described) == 2, "once per set of bytes, not once per session"
 
 
 async def test_capabilities_lists_the_local_build_container_inventory(client) -> None:
@@ -2253,6 +2457,89 @@ async def test_a_rewritten_pin_is_caught_by_the_same_re_measurement(client, conf
 
     assert frame["error"]["code"] == "context.integrity-mismatch"
     assert "target.board" in frame["error"]["details"]["paths"]
+
+
+async def test_a_rewritten_zephyr_line_is_caught_by_the_same_re_measurement(
+    client, config, state
+) -> None:
+    """The requirement joined the cross-checked three, and earns its place.
+
+    E61 took ``container.digest`` out of that list — it is this server's
+    own record now, so comparing it to the pins would be comparing this
+    server to itself — and put ``zephyr`` in. Unlike the other two,
+    ``zephyr`` is hashed nowhere: the integrity list would not notice it
+    moving, and neither would the recomputed ID. This comparison is the
+    only thing that does.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, _ = await locked(ws, config)
+        manifest = state.sessions.require(session_id).paths.context / "manifest.yaml"
+        manifest.write_text(
+            manifest.read_text().replace(f"zephyr: '{ZEPHYR_LINE}'", "zephyr: '9.9'")
+        )
+        frame = await call(ws, "verify", {"session_id": session_id}, frame_id="v")
+
+    assert frame["error"]["code"] == "context.integrity-mismatch"
+    assert "zephyr" in frame["error"]["details"]["paths"]
+
+
+async def test_a_rewritten_context_format_version_is_caught_too(client, config, state) -> None:
+    """``manifest.yaml``'s own format version is read back and compared.
+
+    It is the last value in the document that nothing else measures: not
+    an input of the ID, and not in the integrity list, because
+    ``manifest.yaml`` carries that list and cannot be in it.
+    ``context.yaml`` gets a hard version gate on every read and the
+    session can only have been admitted on one number, so a manifest
+    stating another is by construction a manifest that changed after it
+    was written.
+
+    Without the comparison the rewrite travelled all the way into the
+    build container and came back as ``unsupported.context`` — mapped to
+    ``version.context-format-unsupported``, whose own advice is "the
+    client's move is a different container". The operator would be told
+    the image was wrong.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, _ = await locked(ws, config)
+        manifest = state.sessions.require(session_id).paths.context / "manifest.yaml"
+        assert "context: 2" in manifest.read_text()
+        manifest.write_text(manifest.read_text().replace("context: 2", "context: 1"))
+        frame = await call(ws, "verify", {"session_id": session_id}, frame_id="v")
+
+    assert frame["error"]["code"] == "context.integrity-mismatch"
+    assert "context" in frame["error"]["details"]["paths"]
+
+
+async def test_a_model_moved_to_another_line_after_the_lock_is_caught(
+    client, config, state
+) -> None:
+    """The freeze's model cross-check, repeated before every invocation.
+
+    ``zephyr`` may stay out of the context ID only because the line is
+    "provably inside" the hashed device model (§3.3), and the check that
+    makes that provable runs here as well as at the freeze — the same
+    reason every other value in this pass is re-compared rather than
+    trusted from the lock.
+
+    It answers before the file-hash comparison it would also trip, and
+    that ordering is deliberate: both fire, and "your two documents
+    disagree about the Zephyr line" is the more specific news than "a
+    file changed".
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, _ = await locked(
+            ws, config, **{"model/device-model.json": device_model(ZEPHYR_LINE)}
+        )
+        model = state.sessions.require(session_id).paths.context / "model/device-model.json"
+        model.write_bytes(device_model("4.5"))
+        frame = await call(ws, "verify", {"session_id": session_id}, frame_id="v")
+
+    error = frame["error"]
+    assert error["code"] == "context.integrity-mismatch"
+    assert error["details"]["paths"] == ["zephyr vs model/device-model.json"]
+    assert error["details"]["required"] == ZEPHYR_LINE
+    assert error["details"]["stated"] == "4.5"
 
 
 async def test_a_static_description_replaces_the_probe(client, config, docker, state) -> None:

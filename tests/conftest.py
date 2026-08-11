@@ -50,11 +50,18 @@ from mcuhome_buildserver.config import Config
 
 TOKEN = "test-token-000000000000000000000000"
 
-#: A context.yaml that parses: the format version, the three pin blocks
-#: spelled the one legal way (build-container contract §3.3.1), and the
-#: informational fields that travel into manifest.yaml with them.
+#: The Zephyr line the shared ``context.yaml`` requires — satisfied by
+#: the image below, whose ``org.mcuhome.zephyr`` label says ``4.4.0``.
+#: A *requirement*, not a pin: a context names no container since E61,
+#: and the server answers this line out of its own inventory.
+ZEPHYR_LINE = "4.4"
+
+#: A context.yaml that parses: the format version, the pin blocks spelled
+#: the one legal way (build-container contract §3.3.1), the Zephyr line
+#: the build container has to carry, and the informational fields that
+#: travel into manifest.yaml with them.
 CONTEXT_YAML = f"""\
-context: 1
+context: 2
 created: 2026-08-09T10:00:00Z
 mcuhome:
   constraint: ^2.3.6
@@ -62,10 +69,7 @@ mcuhome:
   package:
     url: https://packages.mcuhome.org/mcuhome-sdk-2.4.0.tar.zst
     sha256: {"a" * 64}
-container:
-  image: ghcr.io/mcu-home/build-container
-  tag: zephyr-4.4.0-r4
-  digest: sha256:{"b" * 64}
+zephyr: '{ZEPHYR_LINE}'
 target:
   board: nrf7002dk/nrf5340/cpuapp
 """
@@ -95,9 +99,11 @@ def config(tmp_path: Path) -> Config:
     )
 
 
-#: The image the shared ``context.yaml`` pins, and the labels contract
-#: §2.1 requires of it. Spelled here so that a test that changes one can
-#: see what a conforming image looks like beside it.
+#: The image this server selects for the shared ``context.yaml``, and the
+#: labels contract §2.1 requires of it. Spelled here so that a test that
+#: changes one can see what a conforming image looks like beside it —
+#: the ``org.mcuhome.zephyr`` label above all, which is what makes this
+#: image the answer to :data:`ZEPHYR_LINE`.
 IMAGE = "ghcr.io/mcu-home/build-container"
 IMAGE_DIGEST = "sha256:" + "b" * 64
 IMAGE_REFERENCE = f"{IMAGE}@{IMAGE_DIGEST}"
@@ -460,6 +466,38 @@ def context_yaml(*, sdk_sha256: str, version: str = "2.4.0") -> bytes:
         .replace("version: 2.4.0", f"version: {version}")
         .encode()
     )
+
+
+def device_model(
+    zephyr_line: str = ZEPHYR_LINE, *, board: str = "nrf7002dk/nrf5340/cpuapp"
+) -> bytes:
+    """A ``model/device-model.json`` this server's model reader accepts.
+
+    Most tests here send a stub under that name, because to this server a
+    context file is bytes to hash and nothing else. The freeze makes one
+    exception and it is the reason this exists: ``zephyr`` is left out of
+    the context ID on the grounds that the line is provably inside the
+    hashed model, so the freeze reads exactly that one field back and
+    compares it. A stub states no line and is passed over; a readable
+    model is what puts the check in play.
+    """
+    return json.dumps(
+        {
+            "model_version": 1,
+            "device": {
+                "name": "test-device",
+                "friendly_name": "Test Device",
+                "board": board,
+                "power_source": "mains",
+            },
+            "network": {"transport": "thread", "matter_enabled": True},
+            "toolchain": {"zephyr_line": zephyr_line, "blob_usage": "auto", "blobs": {}},
+            "hardware": {"buses": [], "peripherals": []},
+            "endpoints": [],
+            "channels": [],
+            "build": {"snippets": [], "kconfig": []},
+        }
+    ).encode()
 
 
 def buildable_context(sdk_sha256: str, **files: bytes) -> bytes:

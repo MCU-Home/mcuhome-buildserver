@@ -151,8 +151,16 @@ SESSION_PROTOCOL_VERSION = 2
 #: at `lock-context` and is never an input. Two constants for the same
 #: reason as the model version range: accepting an older format later is
 #: a change here, not a protocol change.
-CONTEXT_FORMAT_MIN = 1
-CONTEXT_FORMAT_MAX = 1
+#:
+#: Both moved to 2 with E61, and the minimum moved with the maximum
+#: rather than staying behind: format 1 pinned a container digest and
+#: hashed it, nothing is published, and a server that still accepted a
+#: format-1 context would have to carry that hashing rule — and the
+#: pin-shaped `container` block it needs — for documents no client
+#: writes. `mcuhome-model` dropped the format outright, so accepting it
+#: here is not even possible any more.
+CONTEXT_FORMAT_MIN = 2
+CONTEXT_FORMAT_MAX = 2
 
 #: The session profiles. The profile drives admission, TTL, idle
 #: timeout and the per-profile resource budget; commands outside the
@@ -1053,39 +1061,44 @@ async def send_context(state: Any, connection: Any, command: Command) -> dict[st
     parsed.
 
     The base context carries ``context.yaml``: the format version, the
-    resolved pins — container digest, SDK package sha256, target board —
-    and the constraint they were resolved from. It is **required**, even
-    for the empty context ADR 0019's amendment says may be locked: three
-    of the four inputs of the context ID live in it, so a context
-    without it has no identity to freeze. "Empty" means no *content*
-    files, and that is allowed here — what a ``build`` needs beyond
-    existence, ``keys/signing.pub`` above all, is checked by ``build``.
+    resolved pins — SDK package sha256, target board — the Zephyr line a
+    build container must carry, and the constraint the SDK pin was
+    resolved from. It is **required**, even for the empty context
+    ADR 0019's amendment says may be locked: two of the three inputs of
+    the context ID live in it, so a context without it has no identity to
+    freeze. "Empty" means no *content* files, and that is allowed here —
+    what a ``build`` needs beyond existence, ``keys/signing.pub`` above
+    all, is checked by ``build``.
 
     **The response carries the serving container**, which is the half of
     the discovery payload ADR 0019's amendment moved here: with no
     context at ``open-session`` the backend does not yet know *which*
-    container serves the session, and the digest arrives with the pins.
-    ``container`` therefore answers the image's contract version, its
-    program identity and its command set — all of them out of
+    container serves the session, and the requirement it answers arrives
+    with the pins. Since E61 the answer is this server's **choice** and
+    not an echo — the context named no image — so ``container`` carries
+    the image, tag and digest it selected, plus that image's contract
+    version, program identity and command set, all of them out of
     ``describe``, which is authoritative, rather than out of the labels,
     which are a pre-start hint that is cross-checked against it.
 
-    That is also where ``version.builder-unavailable`` becomes real. The
-    pin is resolved against this host's **local** image inventory and
-    nothing is pulled, so a context naming an image that is not here is
-    refused at the moment the pins arrive rather than minutes into a
-    build. And it is refused before the context is frozen, which is the
-    useful moment: the client can open a new session against an image
-    this server has, without having paid for a lock.
+    That is also where ``version.builder-unsatisfiable`` becomes real.
+    The line is answered out of this host's **local** image inventory and
+    nothing is pulled, so a context requiring a line this server does not
+    serve is refused at the moment the pins arrive rather than minutes
+    into a build. And it is refused before the context is frozen, which
+    is the useful moment: the client can go to a server that serves the
+    line, without having paid for a lock.
 
-    **Two of §9.1's three pin cross-checks happen from here, and the
-    third has no other place.** ``container.digest`` is checked against
-    the image this host actually resolved — that is the lookup itself.
-    ``mcuhome.package.sha256`` is checked against the package bytes when
-    they are fetched and unpacked, which is the first working command,
-    because the pin to fetch against is the one the *lock* wrote.
-    ``target.board`` is compared against the pins the session was
-    admitted on by the pre-invocation re-check
+    **The §9.1 cross-checks, as context format 2 leaves them.** The
+    container check is gone as a *comparison* and survives as a
+    *construction*: this server picks the image itself, so there is
+    nothing left to disagree with, and what used to be checked is now
+    true by the way the choice is made. ``mcuhome.package.sha256`` is
+    checked against the package bytes when they are fetched and
+    unpacked, which is the first working command, because the pin to
+    fetch against is the one the *lock* wrote. ``target.board`` and
+    ``zephyr`` are compared against the pins the session was admitted on
+    by the pre-invocation re-check
     (:func:`~mcuhome_buildserver.contextstore.recheck_locked_context`):
     admission carries no pins since ADR 0019's amendment took the
     manifest header away from ``open-session``, so the pins this
@@ -1116,9 +1129,9 @@ async def send_context(state: Any, connection: Any, command: Command) -> dict[st
             if not entry.is_file():
                 raise ProtocolError(
                     "This base context carries no context.yaml. It is what carries the "
-                    "pins into a session — the container digest, the SDK package hash "
-                    "and the target board — and a context without it has no identity "
-                    "to freeze."
+                    "pins into a session — the SDK package hash, the target board and "
+                    "the Zephyr line a build container has to carry — and a context "
+                    "without it has no identity to freeze."
                 )
             pins = parse_context_yaml(
                 entry,
@@ -1127,10 +1140,10 @@ async def send_context(state: Any, connection: Any, command: Command) -> dict[st
             )
             recheck_patch_policy(paths.context, frozenset(state.config.allowed_patch_layers))
             context_yaml_sha256 = sha256_file(entry)
-            # Discovery last, and inside the same guard: an image this
-            # host does not have makes the whole send-context a refusal,
-            # so the context goes with it rather than sitting in a
-            # session that can never build against it.
+            # Selection last, and inside the same guard: a Zephyr line
+            # this host cannot serve makes the whole send-context a
+            # refusal, so the context goes with it rather than sitting in
+            # a session that can never build against it.
             image = await state.backend.resolve_image(pins)
         except BaseException:
             session.discard_context()
@@ -1497,8 +1510,13 @@ async def lock_context(state: Any, connection: Any, command: Command) -> dict[st
     different depending on what ran before it.
 
     It does exactly four things and unlocks a fifth: freeze the context,
-    write ``manifest.yaml``, compute the context ID, return it — and
-    from here ``verify`` and ``build`` are permitted.
+    write ``manifest.yaml`` — including the build container this server
+    selected for the context's Zephyr line at ``send-context`` (E61) —
+    compute the context ID, return it, and from here ``verify`` and
+    ``build`` are permitted. The selected image is written into the
+    manifest and stays out of the ID, so the identity this verb answers
+    is a property of the bytes the client sent and of nothing this
+    server chose.
 
     A second ``lock-context`` is ``context.locked``, because the lock is
     one-way: adding a patch after a ``verify`` is a new session, not an
@@ -1551,14 +1569,21 @@ async def lock_context(state: Any, connection: Any, command: Command) -> dict[st
     session.require_writable_context()
     with _context_work(session):
         paths = _require_paths(session)
-        if session.pins is None or session.context_yaml_sha256 is None:  # pragma: no cover
+        if (
+            session.pins is None or session.context_yaml_sha256 is None or session.image is None
+        ):  # pragma: no cover
             raise SessionError(
                 "context.missing",
                 f'Session "{session.id}" holds no pins to freeze against.',
                 session_id=session.id,
             )
         identity = freeze_context(
-            paths, session.pins, context_yaml_sha256=session.context_yaml_sha256
+            paths,
+            session.pins,
+            # What `send-context` selected for this context's zephyr
+            # line. The freeze records the choice; it never makes one.
+            container=session.image.resolution,
+            context_yaml_sha256=session.context_yaml_sha256,
         )
         # Kept, because attribution always uses the id this server
         # computed itself: every working invocation is measured against

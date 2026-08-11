@@ -108,7 +108,8 @@ ARTIFACT_ROLES = (
     "log",
 )
 
-#: The twelve ``reason`` values contract v1 defines. Listed so that the
+#: The ``reason`` values contract v1 defines (twelve, plus
+#: ``error.internal`` from the 2026-08-11 erratum). Listed so that the
 #: envelope mapping in :mod:`mcuhome_buildserver.errors` can be checked
 #: against the contract by a test rather than by reading; unknown values
 #: are handled as their status class and passed through verbatim, so
@@ -126,6 +127,7 @@ REASONS = (
     "error.work.foreign",
     "error.build.failed",
     "error.deadline.exceeded",
+    "error.internal",
 )
 
 #: ``artifacts[].path`` segments, §5.4. The same shape §9.2 forbids the

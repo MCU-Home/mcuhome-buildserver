@@ -466,6 +466,13 @@ REASON_CODES: dict[str, str] = {
     # deadline, and what would change the answer is a larger one, which
     # is the operator's to set and not a retry.
     "error.deadline.exceeded": "builder.failed",
+    # The program itself crashed (2026-08-11 erratum), in any action.
+    # From this server's side that is a builder that did not deliver, so
+    # the envelope code is `builder.failed` like the ordinary build
+    # failure; the distinct `error.internal` survives in details.reason,
+    # where a reader that wants "the program broke" versus "the build
+    # broke" can still tell them apart.
+    "error.internal": "builder.failed",
 }
 
 

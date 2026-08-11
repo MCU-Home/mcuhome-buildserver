@@ -180,6 +180,17 @@ def decode(raw: str) -> Command:
         data = json.loads(raw)
     except (ValueError, TypeError) as exc:
         raise ProtocolError(f"This frame is not valid JSON: {exc}.") from exc
+    except RecursionError as exc:
+        # Deeply nested JSON (``[[[[…]]]]``) overruns the interpreter's
+        # recursion limit inside ``json.loads`` rather than raising a
+        # ``ValueError``. ``RecursionError`` is a ``RuntimeError`` and
+        # would otherwise escape this guard, propagate out of the read
+        # loop and tear the connection down over a single hostile frame.
+        # It is the client's malformed frame like any other, so it
+        # becomes the same typed refusal — a short, static message,
+        # because interpolating anything here spends stack the parser
+        # just proved is nearly gone.
+        raise ProtocolError("This frame nests JSON too deeply to parse.") from exc
 
     if not isinstance(data, dict):
         raise ProtocolError("A frame must be a JSON object with id, type and payload.")

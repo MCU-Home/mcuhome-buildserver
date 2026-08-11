@@ -35,7 +35,11 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import secrets
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -43,9 +47,17 @@ from urllib.parse import urlsplit
 from aiohttp import web
 
 __all__ = [
+    "DEFAULT_AUTH_BASE_DELAY",
+    "DEFAULT_AUTH_FREE_ATTEMPTS",
+    "DEFAULT_AUTH_GLOBAL_LOCK",
+    "DEFAULT_AUTH_GLOBAL_THRESHOLD",
+    "DEFAULT_AUTH_MAX_DELAY",
+    "DEFAULT_AUTH_MAX_TRACKED",
+    "DEFAULT_AUTH_RESET_AFTER",
     "DEFAULT_PAIR_FILE",
     "STATE_KEY",
     "TOKEN_HEADER",
+    "AuthThrottle",
     "auth_middleware",
     "check_origin",
     "is_authorized",
@@ -150,19 +162,170 @@ def check_origin(request: web.Request, *, allowed: tuple[str, ...] = ()) -> bool
     return bool(host) and parts.netloc == host
 
 
+# --------------------------------------------------------------------------
+# Brute-force resistance for the bearer check
+# --------------------------------------------------------------------------
+
+#: Failed authentications from one source before any backoff begins.
+#: Small, but not one: a legitimate client that fat-fingers a token, or a
+#: dashboard configured with a stale one, should get a plain 401 a few
+#: times rather than a lockout on the first mistake.
+DEFAULT_AUTH_FREE_ATTEMPTS = 5
+#: The first lockout past the free attempts, in seconds, doubling with
+#: every further failed round up to :data:`DEFAULT_AUTH_MAX_DELAY`.
+DEFAULT_AUTH_BASE_DELAY = 1.0
+DEFAULT_AUTH_MAX_DELAY = 300.0
+#: Idle-forgiveness: a source that has not failed for this long is
+#: forgotten, so an old mistake does not haunt a client that returns much
+#: later, and the per-source table does not keep the dead forever.
+DEFAULT_AUTH_RESET_AFTER = 900.0
+#: The global backstop. Per-source backoff does nothing against an
+#: attacker who forges a fresh source address per attempt, so once this
+#: many failures have landed across *all* sources within one reset
+#: window, the gate closes for everyone for
+#: :data:`DEFAULT_AUTH_GLOBAL_LOCK` seconds. Conservative on purpose: it
+#: is a floor against a distributed grind, not a per-request throttle, so
+#: it sits well above any believable burst of honest misconfiguration.
+DEFAULT_AUTH_GLOBAL_THRESHOLD = 100
+DEFAULT_AUTH_GLOBAL_LOCK = 30.0
+#: How many source addresses the table holds before it evicts the
+#: longest-idle one. A bound on memory under a spoofed-source flood; the
+#: global backstop above is what actually blunts such a flood.
+DEFAULT_AUTH_MAX_TRACKED = 4096
+
+
+@dataclass
+class _Attempts:
+    """One source address's recent failed-auth history."""
+
+    failures: int = 0
+    locked_until: float = 0.0
+    last_seen: float = 0.0
+
+
+@dataclass
+class AuthThrottle:
+    """Failed-bearer-auth backoff, keyed on source address, with a backstop.
+
+    The token equals shell access (see the module docstring), and a
+    generated token is 256 bits — infeasible to guess. This is not for
+    that token: it is for an operator's own weak one, which without a
+    throttle can be ground down over the network at line rate. So a
+    handful of failures from a source are free, and past that the source
+    is locked out for a window that doubles each round; a correct token
+    clears the source's history at once, so a legitimate client is never
+    held to an attacker's backoff. A conservative global counter is the
+    backstop against a grind that forges a fresh source address per try.
+
+    Hardening, not a boundary, and deliberately proportionate: the
+    numbers are a security floor rather than an operator policy, so they
+    are constants here rather than configuration.
+    """
+
+    free_attempts: int = DEFAULT_AUTH_FREE_ATTEMPTS
+    base_delay: float = DEFAULT_AUTH_BASE_DELAY
+    max_delay: float = DEFAULT_AUTH_MAX_DELAY
+    reset_after: float = DEFAULT_AUTH_RESET_AFTER
+    global_threshold: int = DEFAULT_AUTH_GLOBAL_THRESHOLD
+    global_lock: float = DEFAULT_AUTH_GLOBAL_LOCK
+    max_tracked: int = DEFAULT_AUTH_MAX_TRACKED
+    #: Injected so tests drive time instead of sleeping through it.
+    clock: Callable[[], float] = time.monotonic
+    _by_source: dict[str, _Attempts] = field(default_factory=dict)
+    _global_failures: int = 0
+    _global_window_start: float = 0.0
+    _global_locked_until: float = 0.0
+
+    def retry_after(self, source: str) -> float | None:
+        """Seconds a caller from *source* must wait, or ``None`` to proceed."""
+        now = self.clock()
+        if now < self._global_locked_until:
+            return self._global_locked_until - now
+        state = self._by_source.get(source)
+        if state is None:
+            return None
+        if state.last_seen and now - state.last_seen > self.reset_after:
+            del self._by_source[source]
+            return None
+        if now < state.locked_until:
+            return state.locked_until - now
+        return None
+
+    def record_failure(self, source: str) -> None:
+        """Count one failed authentication and set the next lockout."""
+        now = self.clock()
+        self._note_global(now)
+        state = self._by_source.get(source)
+        if state is None:
+            self._evict_if_full()
+            state = self._by_source.setdefault(source, _Attempts())
+        state.failures += 1
+        state.last_seen = now
+        if state.failures > self.free_attempts:
+            step = state.failures - self.free_attempts  # 1, 2, 3, …
+            delay = min(self.base_delay * (2 ** (step - 1)), self.max_delay)
+            state.locked_until = now + delay
+
+    def record_success(self, source: str) -> None:
+        """Forget a source's failures: a correct token proves it is honest."""
+        self._by_source.pop(source, None)
+
+    def _note_global(self, now: float) -> None:
+        if now - self._global_window_start > self.reset_after:
+            self._global_window_start = now
+            self._global_failures = 0
+        self._global_failures += 1
+        if self._global_failures > self.global_threshold:
+            self._global_locked_until = now + self.global_lock
+
+    def _evict_if_full(self) -> None:
+        if len(self._by_source) < self.max_tracked:
+            return
+        oldest = min(self._by_source, key=lambda key: self._by_source[key].last_seen)
+        del self._by_source[oldest]
+
+
 @web.middleware
 async def auth_middleware(request: web.Request, handler: Any) -> web.StreamResponse:
-    """Refuse everything that is not ``/health`` without the token."""
+    """Refuse everything that is not ``/health`` without the token.
+
+    A brute-force backstop sits in front of the token comparison: a
+    source that has failed too many times recently is answered ``429``
+    with ``Retry-After`` before the comparison runs at all, so the gate
+    cannot be ground at line rate. It is checked first because a locked
+    source is turned away whatever it presents, and cleared on success so
+    the throttle never touches a client with the right token.
+    """
     if request.path in OPEN_PATHS:
         return await handler(request)
 
     state = request.app[STATE_KEY]
+    throttle: AuthThrottle = state.auth_throttle
+    source = request.remote or "unknown"
+    wait = throttle.retry_after(source)
+    if wait is not None:
+        logger.warning(
+            "locked out %s %s from %s for %.0fs (too many failed authentications)",
+            request.method,
+            request.path,
+            source,
+            wait,
+        )
+        raise web.HTTPTooManyRequests(
+            text=(
+                "Too many failed authentication attempts from this address. Wait for "
+                "the interval named in Retry-After and try again."
+            ),
+            headers={"Retry-After": str(max(1, math.ceil(wait)))},
+        )
+
     if not is_authorized(request, token=state.config.token):
+        throttle.record_failure(source)
         logger.warning(
             "refused an unauthenticated %s %s from %s",
             request.method,
             request.path,
-            request.remote,
+            source,
         )
         raise web.HTTPUnauthorized(
             text=(
@@ -172,4 +335,5 @@ async def auth_middleware(request: web.Request, handler: Any) -> web.StreamRespo
             ),
             headers={"WWW-Authenticate": 'Bearer realm="MCUHome Build Server"'},
         )
+    throttle.record_success(source)
     return await handler(request)

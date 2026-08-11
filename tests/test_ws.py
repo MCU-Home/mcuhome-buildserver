@@ -12,8 +12,14 @@ only through ``follow_job``. They are asserted directly here instead.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+
+from aiohttp import WSCloseCode
 
 from mcuhome_buildserver import protocol
+from mcuhome_buildserver import ws as ws_module
+from mcuhome_buildserver.app import ServerState, create_app
+from mcuhome_buildserver.protocol import Command
 from mcuhome_buildserver.ws import OUTBOX_LIMIT, Connection
 from tests.conftest import auth, call
 
@@ -126,6 +132,92 @@ async def test_a_frame_that_is_not_json_is_refused_typed(client) -> None:
         await ws.send_str("{not json")
         frame = await ws.receive_json(timeout=15)
     assert frame["error"]["code"] == "bad_request"
+
+
+async def test_a_deeply_nested_json_frame_is_refused_and_the_connection_survives(client) -> None:
+    """A hostile deep-JSON frame is a typed refusal, not a torn connection.
+
+    ``json.loads`` overruns the interpreter's recursion limit on
+    ``[[[[…]]]]`` and raises ``RecursionError`` — which is a
+    ``RuntimeError``, not a ``ValueError``, so before the guard was
+    broadened it escaped ``decode``, propagated out of the read loop and
+    tore the connection down over one frame. Now it becomes the same
+    ``bad_request`` any other unparseable frame gets, and the connection
+    is still usable afterwards.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        depth = 20000  # far past any default recursion limit; the frame stays tiny
+        await ws.send_str("[" * depth + "]" * depth)
+        frame = await ws.receive_json(timeout=15)
+        assert frame["type"] == "error"
+        assert frame["error"]["code"] == "bad_request"
+
+        # One bad frame is not a session: the connection still answers.
+        answer = await call(ws, "capabilities")
+        assert answer["type"] == "result"
+
+
+async def test_the_connection_cap_refuses_a_further_upgrade(aiohttp_client, config) -> None:
+    """Past ``max_connections`` the upgrade is turned away, not served.
+
+    ``state.connections`` is otherwise unbounded, so a token holder could
+    open sockets without limit. Hardening rather than a boundary (the
+    token equals shell): the caller past the cap did nothing wrong, so
+    the socket is prepared and then closed with TRY_AGAIN_LATER — come
+    back — and never joins the broadcast set.
+    """
+    state = ServerState(replace(config, max_connections=1))
+    client = await aiohttp_client(create_app(state))
+    async with client.ws_connect("/ws", headers=auth()) as first:
+        await call(first, "capabilities")
+        assert len(state.connections) == 1
+
+        second = await client.ws_connect("/ws", headers=auth())
+        # The server prepared the socket and closed it straight away;
+        # draining it yields the close and its code.
+        await second.receive(timeout=15)
+        assert second.close_code == WSCloseCode.TRY_AGAIN_LATER
+        # The refused connection never joined the set it was refused for.
+        assert len(state.connections) == 1
+        await second.close()
+
+
+async def test_a_connection_bounds_its_in_flight_commands(monkeypatch) -> None:
+    """One connection runs at most ``max_inflight`` command handlers at once.
+
+    The bound is held around the handler dispatch, so a flood of TEXT
+    frames on one connection cannot accumulate unbounded running handlers.
+    A blocking test handler makes the ceiling observable: six commands are
+    spawned, only ``max_inflight`` ever run together.
+    """
+    running = 0
+    peak = 0
+    gate = asyncio.Event()
+
+    async def slow(state, connection, command):
+        nonlocal running, peak
+        running += 1
+        peak = max(peak, running)
+        try:
+            await gate.wait()
+            return {"ok": True}
+        finally:
+            running -= 1
+
+    monkeypatch.setitem(ws_module.COMMANDS, "slow", slow)
+    connection = Connection(ws=None, max_inflight=2)  # type: ignore[arg-type]
+    tasks = [
+        connection.spawn(ws_module._run_command(None, connection, Command(id=str(i), type="slow")))
+        for i in range(6)
+    ]
+    await asyncio.sleep(0.05)
+    assert running == 2, "only max_inflight handlers run at once"
+    assert peak == 2
+
+    gate.set()
+    await asyncio.gather(*tasks)
+    assert peak == 2
+    await connection.close()
 
 
 async def test_a_closed_connection_is_forgotten(client, state) -> None:

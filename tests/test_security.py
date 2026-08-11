@@ -19,7 +19,12 @@ import aiohttp
 import pytest
 
 from mcuhome_buildserver.config import load_config, resolve_token
-from mcuhome_buildserver.security import publish_pairing_token, read_token_file
+from mcuhome_buildserver.security import (
+    DEFAULT_AUTH_FREE_ATTEMPTS,
+    AuthThrottle,
+    publish_pairing_token,
+    read_token_file,
+)
 from tests.conftest import TOKEN
 
 
@@ -27,8 +32,13 @@ async def test_health_is_open_and_says_nothing_secret(client) -> None:
     response = await client.get("/health")
     assert response.status == 200
     body = await response.json()
-    assert body["status"] == "ok"
+    # Only that the process is up. Not the token, and — since the version
+    # leak was closed — not the version or uptime either: the one pre-auth
+    # response is the wrong place to hand an attacker a version to target.
+    assert body == {"status": "ok"}
     assert "token" not in str(body).lower()
+    assert "version" not in str(body).lower()
+    assert "uptime" not in str(body).lower()
 
 
 async def test_a_missing_or_malformed_token_is_refused(client) -> None:
@@ -131,3 +141,133 @@ class TestConfig:
     def test_no_pair_file_means_no_pair_file(self) -> None:
         assert load_config(["--no-pair-file"], env={}).pair_file is None
         assert load_config([], env={}).pair_file is not None
+
+    def test_the_connection_caps_come_from_cli_and_environment(self) -> None:
+        config = load_config(["--max-connections", "3", "--max-inflight-commands", "7"], env={})
+        assert (config.max_connections, config.max_inflight_commands) == (3, 7)
+        config = load_config(
+            [],
+            env={
+                "MCUHOME_BUILDSERVER_MAX_CONNECTIONS": "9",
+                "MCUHOME_BUILDSERVER_MAX_INFLIGHT_COMMANDS": "11",
+            },
+        )
+        assert (config.max_connections, config.max_inflight_commands) == (9, 11)
+        # Non-positive is refused, like every other limit here.
+        with pytest.raises(SystemExit):
+            load_config(["--max-connections", "0"], env={})
+
+
+# --------------------------------------------------------------------------
+# Brute-force resistance for the bearer check
+# --------------------------------------------------------------------------
+
+
+class TestAuthThrottle:
+    """The unit rules of the failed-auth backoff, driven on a fake clock.
+
+    The token equals shell and a generated token is infeasible to guess;
+    this defends an operator's own weak token against a line-rate grind,
+    so it is hardening rather than a boundary. A fake clock lets the
+    lockout windows be asserted without sleeping through them.
+    """
+
+    def test_it_locks_out_with_growing_backoff_and_clears_on_success(self) -> None:
+        now = [100.0]
+        throttle = AuthThrottle(
+            free_attempts=2, base_delay=1.0, max_delay=10.0, clock=lambda: now[0]
+        )
+        source = "10.0.0.1"
+
+        # The free attempts are answered without a lockout.
+        for _ in range(2):
+            assert throttle.retry_after(source) is None
+            throttle.record_failure(source)
+
+        # Past them, the source is locked, and the window doubles each round.
+        throttle.record_failure(source)
+        assert throttle.retry_after(source) == 1.0
+        now[0] += 1.0
+        assert throttle.retry_after(source) is None
+        throttle.record_failure(source)
+        assert throttle.retry_after(source) == 2.0
+
+        # A correct token clears the history at once — a legitimate client
+        # is never held to an attacker's backoff.
+        throttle.record_success(source)
+        assert throttle.retry_after(source) is None
+
+    def test_the_backoff_is_capped(self) -> None:
+        now = [0.0]
+        throttle = AuthThrottle(
+            free_attempts=0, base_delay=1.0, max_delay=4.0, clock=lambda: now[0]
+        )
+        source = "10.0.0.9"
+        for _ in range(10):
+            throttle.record_failure(source)
+            now[0] += throttle.retry_after(source) or 0.0
+        # 1, 2, 4, 4, 4 … never past max_delay.
+        throttle.record_failure(source)
+        assert throttle.retry_after(source) == 4.0
+
+    def test_it_forgets_a_source_after_the_reset_window(self) -> None:
+        now = [0.0]
+        throttle = AuthThrottle(
+            free_attempts=1, base_delay=5.0, reset_after=100.0, clock=lambda: now[0]
+        )
+        source = "10.0.0.2"
+        throttle.record_failure(source)
+        throttle.record_failure(source)
+        assert throttle.retry_after(source) == 5.0
+
+        # Idle past the reset window: the history is forgotten, so an old
+        # mistake does not haunt a client that comes back much later.
+        now[0] += 101.0
+        assert throttle.retry_after(source) is None
+
+    def test_the_global_backstop_closes_the_gate_for_everyone(self) -> None:
+        """Per-source backoff does nothing against a grind that forges a
+        fresh source per try, so a conservative global counter is the
+        backstop: once too many failures land across all sources, even a
+        brand-new source is turned away."""
+        now = [0.0]
+        throttle = AuthThrottle(
+            free_attempts=100, global_threshold=5, global_lock=30.0, clock=lambda: now[0]
+        )
+        for index in range(6):
+            source = f"10.0.0.{index}"
+            assert throttle.retry_after(source) is None  # per-source never fires here
+            throttle.record_failure(source)
+        assert throttle.retry_after("10.0.0.250") == 30.0
+
+    def test_the_source_table_is_bounded(self) -> None:
+        now = [0.0]
+        throttle = AuthThrottle(
+            free_attempts=100, global_threshold=10**9, max_tracked=4, clock=lambda: now[0]
+        )
+        for index in range(50):
+            now[0] += 1.0
+            throttle.record_failure(f"10.0.0.{index}")
+        assert len(throttle._by_source) <= 4
+
+
+async def test_repeated_failed_tokens_are_locked_out_with_a_retry_after(client) -> None:
+    """The bearer gate is not brute-forceable at line rate.
+
+    After the free attempts, a source that keeps presenting a wrong token
+    is answered ``429`` with ``Retry-After`` instead of a plain ``401``,
+    so the token cannot be ground down. The default clock is real, but no
+    sleep is needed: the lockout appears the moment the threshold is
+    crossed.
+    """
+    bad = {"Authorization": "Bearer wrong"}
+    # The free attempts, and the one that arms the lock, are answered 401:
+    # the gate checks the lockout before it records the failure, so the
+    # arming failure is itself still a plain 401.
+    for _ in range(DEFAULT_AUTH_FREE_ATTEMPTS + 1):
+        assert (await client.get("/ws", headers=bad)).status == 401
+
+    # From here the source is locked out: 429 with a Retry-After.
+    response = await client.get("/ws", headers=bad)
+    assert response.status == 429
+    assert int(response.headers["Retry-After"]) >= 1

@@ -45,6 +45,19 @@ def test_a_malformed_frame_is_refused(raw: str) -> None:
         protocol.decode(raw)
 
 
+def test_deeply_nested_json_becomes_a_protocol_error_not_a_recursion_error() -> None:
+    """``json.loads`` raises ``RecursionError`` on ``[[[[…]]]]``, which is a
+    ``RuntimeError`` and not a ``ValueError``.
+
+    The codec is the one place untrusted text becomes a command, so it
+    converts that overrun into the same ``ProtocolError`` any other
+    unparseable frame gets — rather than letting a ``RuntimeError`` escape
+    the read loop's ``except ProtocolError`` and tear the connection down.
+    """
+    with pytest.raises(ProtocolError):
+        protocol.decode("[" * 20000 + "]" * 20000)
+
+
 def test_the_three_frame_shapes() -> None:
     assert protocol.result_frame("7", {"ok": True}) == {
         "id": "7",

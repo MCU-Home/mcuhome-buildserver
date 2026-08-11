@@ -406,26 +406,36 @@ def test_the_first_source_that_holds_the_package_wins(tmp_path: Path) -> None:
     assert (package.tree / "mcuhome/__init__.py").read_bytes() == b"first\n"
 
 
-def test_a_pin_no_source_holds_names_every_directory_searched(tmp_path: Path) -> None:
-    """``sdk.unavailable``, and the details are for the operator.
+def test_a_pin_no_source_holds_keeps_host_paths_off_the_wire(tmp_path: Path, caplog) -> None:
+    """``sdk.unavailable`` carries what the client can act on, and no
+    host path.
 
-    The failure is almost always a deployment gap rather than a bad
-    context, and the client that sees the refusal is not the party that
-    can fix it — so the version, the pinned hash and every directory
-    searched all travel with it.
+    The version and the pinned hash travel in the envelope — a client can
+    act on those. The directories that were searched are the operator's
+    filesystem layout, and the client that sees this refusal is not the
+    party that can fix a deployment gap, so they stay off the wire and go
+    to the log for the operator who can.
     """
-    with pytest.raises(SessionError) as excinfo:
+    searched = tmp_path / "nowhere"
+    with caplog.at_level("WARNING"), pytest.raises(SessionError) as excinfo:
         sdkstore.acquire_sdk(
             version="2.4.0",
             sha256="a" * 64,
-            sources=(tmp_path / "nowhere",),
+            sources=(searched,),
             into=tmp_path / "tree",
             caps=CAPS,
             max_bytes=1 << 20,
         )
     assert excinfo.value.code == "sdk.unavailable"
-    assert excinfo.value.details["sources"] == [str(tmp_path / "nowhere")]
     assert excinfo.value.details["version"] == "2.4.0"
+    assert excinfo.value.details["sha256"] == "a" * 64
+    # No operator host path anywhere in the envelope the client receives.
+    assert "sources" not in excinfo.value.details
+    assert "found" not in excinfo.value.details
+    envelope = excinfo.value.to_envelope()
+    assert str(searched) not in str(envelope)
+    # The operator, who can act on it, reads the searched directory in the log.
+    assert str(searched) in caplog.text
 
 
 def test_the_hash_decides_and_not_the_name(tmp_path: Path) -> None:

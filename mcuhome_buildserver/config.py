@@ -61,10 +61,12 @@ __all__ = [
     "DEFAULT_HOST",
     "DEFAULT_MAX_ARTIFACT_BYTES",
     "DEFAULT_MAX_COMPRESSED_BYTES",
+    "DEFAULT_MAX_CONNECTIONS",
     "DEFAULT_MAX_CONTEXT_YAML_BYTES",
     "DEFAULT_MAX_DECOMPRESSED_BYTES",
     "DEFAULT_MAX_ENTRIES",
     "DEFAULT_MAX_FILE_BYTES",
+    "DEFAULT_MAX_INFLIGHT_COMMANDS",
     "DEFAULT_MAX_PATH_DEPTH",
     "DEFAULT_PORT",
     "DEFAULT_SESSION_QUOTA_BYTES",
@@ -179,6 +181,19 @@ DEFAULT_CONTAINER_MEMORY = "8g"
 #: past any real toolchain and short of a host that stops scheduling.
 DEFAULT_CONTAINER_PIDS = 4096
 
+#: Concurrent ``/ws`` connections this server accepts, and in-flight
+#: command tasks one connection may run at once. Both are **hardening,
+#: not a trust boundary**: the bearer token already equals shell access
+#: (security.py), so a token holder can do worse than open sockets — the
+#: point is only that an authenticated flood cannot grow the connection
+#: set or the per-connection task set without bound. The numbers are
+#: generous against a real client (a single principal opens a handful of
+#: connections and pipelines a few commands on each) and mean against a
+#: flood, and they are options for the same reason every other limit here
+#: is (E44, the config is the policy).
+DEFAULT_MAX_CONNECTIONS = 64
+DEFAULT_MAX_INFLIGHT_COMMANDS = 32
+
 
 def default_context_root(env: Mapping[str, str]) -> Path:
     """Where per-session context directories live when nobody says.
@@ -221,6 +236,12 @@ class Config:
 
     allowed_origins: tuple[str, ...] = ()
     log_level: str = "INFO"
+
+    #: The ``/ws`` connection and per-connection concurrency caps. See the
+    #: module-level defaults: hardening against an authenticated flood,
+    #: not a trust boundary, since the token already equals shell.
+    max_connections: int = DEFAULT_MAX_CONNECTIONS
+    max_inflight_commands: int = DEFAULT_MAX_INFLIGHT_COMMANDS
 
     #: Session protocol v2: the patch layers a build context may carry
     #: patches for. **The config is the policy** — empty by default, and
@@ -415,7 +436,7 @@ _BACKEND_OPTIONS: tuple[tuple[str, str, int, str], ...] = (
 
 _LIMIT_ATTRIBUTES: tuple[str, ...] = (
     tuple(entry[1] for entry in _CAP_OPTIONS)
-    + ("session_quota_bytes",)
+    + ("session_quota_bytes", "max_connections", "max_inflight_commands")
     + tuple(entry[1] for entry in _BACKEND_OPTIONS)
 )
 
@@ -534,6 +555,26 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "per-session disk quota in bytes, answered typed rather than by host "
             f"exhaustion (default {DEFAULT_SESSION_QUOTA_BYTES})"
+        ),
+    )
+    parser.add_argument(
+        "--max-connections",
+        type=int,
+        metavar="N",
+        dest="max_connections",
+        help=(
+            "concurrent /ws connections this server accepts before it refuses the "
+            f"upgrade (default {DEFAULT_MAX_CONNECTIONS}); hardening, not a trust boundary"
+        ),
+    )
+    parser.add_argument(
+        "--max-inflight-commands",
+        type=int,
+        metavar="N",
+        dest="max_inflight_commands",
+        help=(
+            "in-flight command tasks one /ws connection may run at once "
+            f"(default {DEFAULT_MAX_INFLIGHT_COMMANDS})"
         ),
     )
     parser.add_argument(

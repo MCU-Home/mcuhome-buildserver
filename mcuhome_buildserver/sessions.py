@@ -92,7 +92,7 @@ from typing import Any
 from mcuhome.model.context import CONTEXT_FILE
 from mcuhome.model.hashes import sha256_file
 
-from mcuhome_buildserver import artifacts, events, protocol
+from mcuhome_buildserver import __version__, artifacts, events, protocol
 from mcuhome_buildserver.contextstore import (
     ContextPins,
     SessionPaths,
@@ -804,6 +804,15 @@ def capabilities_payload(state: Any, containers: list[dict[str, Any]]) -> dict[s
     # only ones this server can name are the ones it was told about.
     layers = list(PATCH_LAYERS) + sorted(allowed - set(PATCH_LAYERS))
     return {
+        # This server's own version and uptime. They live here, behind the
+        # token, rather than on the unauthenticated `/health`: a liveness
+        # probe needs neither, and the one pre-auth response is the wrong
+        # place to hand an attacker a version to match against a known
+        # weakness. A client that has presented the token may read them.
+        "server": {
+            "build_server": __version__,
+            "uptime_seconds": round(time.monotonic() - state.started_at, 3),
+        },
         "protocol": {
             "version": SESSION_PROTOCOL_VERSION,
             "context_format": {"min": CONTEXT_FORMAT_MIN, "max": CONTEXT_FORMAT_MAX},

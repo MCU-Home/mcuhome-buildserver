@@ -9,8 +9,9 @@ carries a bearer token.
 REST is one endpoint:
 
 ``GET /health``
-    Liveness for an orchestrator, before anyone has a token. Says what
-    is running and nothing about what it holds.
+    Liveness for an orchestrator, before anyone has a token. Says only
+    that the process is up — not its version and nothing about what it
+    holds. Version and uptime are behind the token, in ``capabilities``.
 
 The application also owns the two things that are true for as long as
 the process runs rather than for the length of one request: the
@@ -37,11 +38,11 @@ from dataclasses import dataclass, field
 
 from aiohttp import web
 
-from mcuhome_buildserver import __version__, sessions, ws
+from mcuhome_buildserver import sessions, ws
 from mcuhome_buildserver.backend import ContainerBackend, SessionBackend
 from mcuhome_buildserver.config import Config
 from mcuhome_buildserver.contextstore import prepare_context_root
-from mcuhome_buildserver.security import STATE_KEY, auth_middleware
+from mcuhome_buildserver.security import STATE_KEY, AuthThrottle, auth_middleware
 from mcuhome_buildserver.subprocessbackend import SubprocessBackend
 
 __all__ = ["BACKENDS", "REAPER_KEY", "ServerState", "create_app", "make_backend"]
@@ -87,6 +88,10 @@ class ServerState:
     #: stalled client must never hold up whatever is reporting.
     connections: set[ws.Connection] = field(default_factory=set)
     started_at: float = field(default_factory=time.monotonic)
+    #: The brute-force backstop in front of the bearer check. One per
+    #: process, so the failed-attempt history is shared across every
+    #: request the middleware sees.
+    auth_throttle: AuthThrottle = field(default_factory=AuthThrottle)
     sessions: sessions.SessionManager = field(init=False)
     #: The backend of the profile this server was configured for:
     #: build-environment discovery, the session's runtime, invocations
@@ -101,24 +106,17 @@ class ServerState:
 
 
 async def health(request: web.Request) -> web.Response:
-    """Liveness, unauthenticated.
+    """Liveness, unauthenticated. It says the process is up and no more.
 
-    It names this service's own version and nothing else. It used to
-    also report the version of the ``mcuhome`` build tool this server
-    spawned; there is no such subprocess any more — a build server is an
-    orchestrator and never itself the build environment
-    (build-container-contract.md §1.2) — and the build environments it
-    drives are per-session, so no single version could be named here
-    truthfully.
+    An orchestrator's liveness probe needs to know the server answers,
+    not which version it runs — and this is the one response served
+    before a token, so it is the wrong place to disclose a version an
+    attacker could match to a known weakness. Version and uptime moved
+    behind the token gate: the authenticated ``capabilities`` verb
+    carries them in its ``server`` block, to a client that has already
+    presented the token.
     """
-    state = request.app[STATE_KEY]
-    return web.json_response(
-        {
-            "status": "ok",
-            "build_server": __version__,
-            "uptime_seconds": round(time.monotonic() - state.started_at, 3),
-        }
-    )
+    return web.json_response({"status": "ok"})
 
 
 async def _reap_loop(state: ServerState) -> None:

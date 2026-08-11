@@ -140,25 +140,36 @@ def acquire_sdk(
             candidate = found
             break
     if candidate is None:
-        raise _unavailable(
+        # The searched directories are operator host paths, and they stay
+        # off the wire: they leak this host's filesystem layout to a
+        # client that cannot act on them anyway (the failure is a
+        # deployment gap only the operator can close). The operator, who
+        # can, reads them in the log.
+        logger.warning(
+            "SDK %s unavailable: no configured source holds %s (searched: %s)",
             version,
-            sha256,
-            searched,
-            f"no source directory holds {wanted}",
+            wanted,
+            ", ".join(searched) or "no sources configured",
         )
+        raise _unavailable(version, sha256, f"no configured source holds {wanted}")
 
     measured = sha256_file(candidate)
     if measured != sha256:
         # Named right, wrong bytes. Refused rather than repaired, and
         # said plainly: this is either a corrupted mirror or a package
         # somebody replaced, and both are answers an operator has to
-        # see rather than a fallback this server can make.
+        # see rather than a fallback this server can make. The located
+        # file's path is a host path and stays off the wire for the same
+        # reason; the operator reads it in the log, and the client keeps
+        # the pinned hash and the measured one, which are what it can act
+        # on.
+        logger.warning(
+            "SDK %s at %s hashes to %s, not the pinned %s", version, candidate, measured, sha256
+        )
         raise _unavailable(
             version,
             sha256,
-            searched,
-            f"{candidate} is named for this version and hashes to {measured}",
-            found=str(candidate),
+            "a file named for this version hashes to a different value",
             measured=measured,
         )
 
@@ -209,7 +220,6 @@ def _too_large(archive: Path, limit: int) -> SessionError:
 def _unavailable(
     version: str,
     sha256: str,
-    searched: list[str],
     problem: str,
     **details: str,
 ) -> SessionError:
@@ -222,20 +232,20 @@ def _unavailable(
     putting the package where this server looks, which is not something
     a client retry can bring about.
 
-    The details name all three things an operator needs to act — the
-    version, the hash the context pinned, and every directory that was
-    searched — because the failure is almost always a deployment gap
-    rather than a bad context, and the client that sees this refusal is
-    not the party that can fix it.
+    The envelope carries the two things the client can act on — the
+    version and the hash the context pinned — and no host path. The
+    directories that were searched, and any located file, are operator
+    filesystem layout: the failure is almost always a deployment gap the
+    client cannot close, so those go to the log for the operator who can,
+    not onto the wire to the client who cannot.
     """
     return SessionError(
         "sdk.unavailable",
         f"This server cannot supply the SDK package this context pins ({problem}). The "
         "package is fetched from operator-configured sources only and never from the "
         "url in the context, which is a hint; ask the operator to add "
-        f"{package_filename(version)} to one of the sources below.",
+        f"{package_filename(version)} to one of this server's configured SDK sources.",
         version=version,
         sha256=sha256,
-        sources=searched,
         **details,
     )

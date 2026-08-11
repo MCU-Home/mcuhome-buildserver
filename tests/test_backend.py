@@ -2039,7 +2039,12 @@ async def test_a_pin_no_source_holds_is_sdk_unavailable(client, config) -> None:
     assert error["code"] == "sdk.unavailable"
     assert error["retryable"] is False
     assert error["details"]["version"] == "2.4.0"
-    assert error["details"]["sources"] == [str(config.sdk_sources[0])]
+    # The client keeps what it can act on and no operator host path: the
+    # searched source directories are filesystem layout and stay off the
+    # wire (they are logged server-side instead).
+    assert "sources" not in error["details"]
+    assert "found" not in error["details"]
+    assert str(config.sdk_sources[0]) not in str(frame)
 
 
 async def test_a_package_with_the_right_name_and_wrong_bytes_is_refused(client, config) -> None:

@@ -52,6 +52,7 @@ from typing import Any
 from aiohttp import WSCloseCode, WSMsgType, web
 
 from mcuhome_buildserver import errors, protocol, sessions
+from mcuhome_buildserver.config import DEFAULT_MAX_INFLIGHT_COMMANDS
 from mcuhome_buildserver.ingress import Upload
 from mcuhome_buildserver.protocol import MAX_FRAME_BYTES, Command, ProtocolError
 from mcuhome_buildserver.security import STATE_KEY, check_origin
@@ -87,8 +88,20 @@ class Connection:
     instead of interleaved into the first.
     """
 
-    def __init__(self, ws: web.WebSocketResponse) -> None:
+    def __init__(
+        self, ws: web.WebSocketResponse, *, max_inflight: int = DEFAULT_MAX_INFLIGHT_COMMANDS
+    ) -> None:
         self._ws = ws
+        # A bound on the command tasks running at once on this connection.
+        # Hardening, not a boundary (the token equals shell): it keeps one
+        # authenticated connection from accumulating unbounded in-flight
+        # handler tasks under a flood of TEXT frames. Held around the
+        # handler dispatch in `_run_command` rather than acquired in the
+        # read loop, so the reader never blocks — an upload verb holds a
+        # slot while it awaits its BINARY frames, and blocking the reader
+        # on a full semaphore would then stop those very frames from
+        # arriving and deadlock the upload.
+        self._inflight = asyncio.Semaphore(max_inflight)
         # Text frames as dictionaries, binary frames as bytes, on **one**
         # queue. Two queues would be two orders, and the download's whole
         # correlation rule is order: a BINARY frame carries no id, so the
@@ -159,6 +172,16 @@ class Connection:
             await asyncio.wait({announced, task}, return_when=asyncio.FIRST_COMPLETED)
         finally:
             announced.cancel()
+
+    @property
+    def inflight(self) -> asyncio.Semaphore:
+        """The per-connection in-flight-command bound, as a context manager.
+
+        ``async with connection.inflight:`` around one command's handler
+        holds a slot for the length of that handler and releases it when
+        the handler returns, whatever its outcome.
+        """
+        return self._inflight
 
     @property
     def download_lock(self) -> asyncio.Lock:
@@ -353,6 +376,16 @@ COMMANDS = dict(sessions.SESSION_VERBS)
 
 
 async def _run_command(state: Any, connection: Connection, command: Command) -> None:
+    # One in-flight slot for the whole life of this command, so a flood of
+    # TEXT frames on one connection cannot run unbounded handlers at once.
+    # The acquire is here rather than in the read loop on purpose (see
+    # `Connection.__init__`): the reader must stay free to feed an
+    # upload's BINARY frames even while every slot is taken.
+    async with connection.inflight:
+        await _dispatch(state, connection, command)
+
+
+async def _dispatch(state: Any, connection: Connection, command: Command) -> None:
     handler = COMMANDS.get(command.type)
     if handler is None:
         # An unknown verb is a vocabulary mismatch, and the session
@@ -412,10 +445,30 @@ async def websocket_handler(request: web.Request) -> web.StreamResponse:
         logger.warning("refused a WebSocket upgrade from origin %r", request.headers.get("Origin"))
         raise web.HTTPForbidden(text="This origin may not open a WebSocket here.")
 
+    # The connection cap, before the socket joins the broadcast set. It is
+    # a bound on `state.connections`, which is otherwise unbounded, and
+    # hardening rather than a boundary (the token equals shell). A caller
+    # past the cap is a caller to turn away *later*, not one that did
+    # anything wrong, so it is closed with TRY_AGAIN_LATER — the same code
+    # `_overload` uses for a connection this server cannot serve right now.
+    if len(state.connections) >= state.config.max_connections:
+        logger.warning(
+            "refused a WebSocket upgrade: %d connections already open (max %d)",
+            len(state.connections),
+            state.config.max_connections,
+        )
+        full = web.WebSocketResponse()
+        await full.prepare(request)
+        await full.close(
+            code=WSCloseCode.TRY_AGAIN_LATER,
+            message=b"this build server is at its connection limit; retry later",
+        )
+        return full
+
     ws = web.WebSocketResponse(heartbeat=30.0, max_msg_size=MAX_FRAME_BYTES)
     await ws.prepare(request)
 
-    connection = Connection(ws)
+    connection = Connection(ws, max_inflight=state.config.max_inflight_commands)
     state.connections.add(connection)
     writer = asyncio.create_task(connection.write_loop(), name="mcuhome-build-ws-writer")
     try:

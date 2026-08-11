@@ -159,6 +159,24 @@ async def test_capabilities_answers_the_negotiation_surface(client, config) -> N
     }
 
 
+async def test_capabilities_reports_version_and_uptime_behind_the_token(client) -> None:
+    """Version and uptime moved off the unauthenticated ``/health`` to here.
+
+    A liveness probe needs neither, and the one pre-auth response is the
+    wrong place to disclose a version an attacker could match to a known
+    weakness. A client that has presented the token may read them.
+    """
+    from mcuhome_buildserver import __version__
+
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        frame = await call(ws, "capabilities")
+
+    server = frame["payload"]["server"]
+    assert server["build_server"] == __version__
+    assert isinstance(server["uptime_seconds"], int | float)
+    assert server["uptime_seconds"] >= 0
+
+
 async def test_the_announced_ingress_caps_come_from_the_configuration(
     aiohttp_client, config
 ) -> None:

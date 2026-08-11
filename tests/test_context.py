@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 import zstandard
 
-from mcuhome_buildserver import contextstore, sessions
+from mcuhome_buildserver import contextstore, protocol, sessions
 from mcuhome_buildserver.app import ServerState, create_app
 from mcuhome_buildserver.config import Config
 from tests.conftest import (
@@ -1876,3 +1876,24 @@ def test_the_two_informational_pin_fields_may_be_empty(tmp_path) -> None:
     assert pins.sdk.constraint == ""
     assert pins.sdk.url == ""
     assert pins.sdk.version == "2.4.0"
+
+
+def test_a_version_that_is_not_a_version_is_refused_at_the_pins(tmp_path) -> None:
+    """The version becomes a filename component in the SDK store's search,
+    so a path-shaped value is refused where it arrives, not trusted to
+    stay inside the operator's source directory.
+    """
+    for hostile in ("../../../etc/x", "a/b", ".hidden", "", "x" * 80):
+        document = tmp_path / "context.yaml"
+        document.write_text(
+            "context: 2\n"
+            "mcuhome:\n"
+            "  constraint: ''\n"
+            f"  version: '{hostile}'\n"
+            "  package: {url: '', sha256: '" + "a" * 64 + "'}\n"
+            "zephyr: '4.4'\n"
+            "target: {board: nrf7002dk/nrf5340/cpuapp}\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(protocol.ProtocolError):
+            contextstore.parse_context_yaml(document, expected_version=2, max_bytes=65536)

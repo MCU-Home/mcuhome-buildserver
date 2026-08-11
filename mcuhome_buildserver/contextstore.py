@@ -97,6 +97,14 @@ _SESSION_ID = re.compile(r"s-[A-Za-z0-9_-]{1,64}\Z")
 #: there because this is where one becomes a path segment.
 _INVOCATION_ID = re.compile(r"inv-[1-9][0-9]{0,9}\Z")
 
+#: The shape an SDK version may have — checked at the pins, because
+#: :func:`mcuhome_buildserver.sdkstore.package_filename` turns the value
+#: into a filename component and searches the operator's source
+#: directories for it. PEP 440 needs letters, digits, dots, plus (local
+#: versions), bang (epochs) and dashes; nothing a version can legally
+#: contain is a path separator, a leading dot, or empty.
+_SDK_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+!-]{0,63}\Z")
+
 
 class UnsafeContextRoot(Exception):
     """The configured context root is not a directory this server may own.
@@ -563,6 +571,11 @@ def _check_pin_spelling(pins: ContextPins) -> None:
         validate_zephyr_line(pins.zephyr)
     except BuildError as exc:
         raise _malformed(str(exc).rstrip(".")) from exc
+    # The version becomes a filename component in the SDK store's search
+    # (sdkstore.package_filename), so its shape is refused here — where
+    # the value arrives — rather than trusted to stay inside a directory.
+    if _SDK_VERSION.fullmatch(pins.sdk.version) is None:
+        raise _malformed(f"mcuhome.version {pins.sdk.version!r} is not a version")
 
 
 # --------------------------------------------------------------------------

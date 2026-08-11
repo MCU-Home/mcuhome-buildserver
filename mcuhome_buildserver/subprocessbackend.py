@@ -116,7 +116,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from mcuhome.model.context import ContainerResolution
-from mcuhome.model.toolchain import line_of, satisfies_line
+from mcuhome.model.toolchain import line_of, normalize_release, satisfies_line
 
 from mcuhome_buildserver import abi, container, processes, sdkstore
 from mcuhome_buildserver.abi import TreeEntry
@@ -152,10 +152,12 @@ def served_lines(profile: ProgramProfile) -> tuple[str, ...]:
     which is the manifest's tag, ``v4.4.0``. §2.1.1's value range has no
     leading ``v``, and MCUHome's own image already normalizes the same
     way for its ``org.mcuhome.zephyr`` label (the r7 repair: "§2.1.1 asks
-    for the version *without* west's leading ``v``"). Exactly one leading
-    ``v`` is dropped and nothing else about the value is touched — a
-    branch name or a commit sha is not a release, and what does not parse
-    as one below must not be repaired into one here.
+    for the version *without* west's leading ``v``").
+    :func:`~mcuhome.model.toolchain.normalize_release` is the one place
+    that strip happens — exactly one leading ``v`` is dropped and nothing
+    else about the value is touched — a branch name or a commit sha is
+    not a release, and what does not parse as one below must not be
+    repaired into one here.
 
     **Release to line.** :func:`~mcuhome.model.toolchain.line_of`, the
     same function the container backend reads its labels through, so
@@ -171,8 +173,7 @@ def served_lines(profile: ProgramProfile) -> tuple[str, ...]:
     version = profile.tree_version("zephyr")
     if version is None:
         return ()
-    candidate = version[1:] if version.startswith("v") else version
-    line = line_of(candidate)
+    line = line_of(normalize_release(version))
     return () if line is None else (line,)
 
 

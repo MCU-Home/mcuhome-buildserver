@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 import zstandard
 
-from mcuhome_buildserver import sessions
+from mcuhome_buildserver import contextstore, sessions
 from mcuhome_buildserver.app import ServerState, create_app
 from mcuhome_buildserver.config import Config
 from tests.conftest import (
@@ -1851,3 +1851,28 @@ def test_a_context_root_owned_by_somebody_else_refuses_to_serve(
     with pytest.raises(UnsafeContextRoot) as refusal:
         prepare_context_root(root)
     assert "credentials" in str(refusal.value)
+
+
+def test_the_two_informational_pin_fields_may_be_empty(tmp_path) -> None:
+    """Contract §3.2: constraint is "original intent — never hashed" and
+    package.url is "hint only — never hashed". The reference client
+    writes both empty for a local source (an unstated constraint is PEP
+    440's empty "any", and a file:// hint would leak its filesystem
+    layout here), so an empty statement is accepted; a missing key or a
+    non-string stays malformed.
+    """
+    document = tmp_path / "context.yaml"
+    document.write_text(
+        "context: 2\n"
+        "mcuhome:\n"
+        "  constraint: ''\n"
+        "  version: 2.4.0\n"
+        "  package: {url: '', sha256: '" + "a" * 64 + "'}\n"
+        "zephyr: '4.4'\n"
+        "target: {board: nrf7002dk/nrf5340/cpuapp}\n",
+        encoding="utf-8",
+    )
+    pins = contextstore.parse_context_yaml(document, expected_version=2, max_bytes=65536)
+    assert pins.sdk.constraint == ""
+    assert pins.sdk.url == ""
+    assert pins.sdk.version == "2.4.0"

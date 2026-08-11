@@ -403,13 +403,33 @@ def _malformed(problem: str) -> ProtocolError:
 
 def _string(data: dict[str, Any], *keys: str) -> str:
     """One required string, addressed by its dotted path, or a refusal."""
+    node = _informational(data, *keys)
+    if not node.strip():
+        raise _malformed(f"{'.'.join(keys)} is not a non-empty string")
+    return node
+
+
+def _informational(data: dict[str, Any], *keys: str) -> str:
+    """A required string that may be empty.
+
+    For exactly the fields the contract calls informational —
+    ``mcuhome.constraint`` ("original intent — never hashed") and
+    ``mcuhome.package.url`` ("hint only — never hashed"). A client that
+    stated no constraint writes the empty specifier (PEP 440's own "any
+    version"), and a package resolved from a local directory has no URL
+    a backend may follow — forcing either non-empty made the reference
+    client invent values, and the invented URL carried the creator's
+    local filesystem layout into a document uploaded here. The key must
+    still exist and hold a string: absence is a malformed document,
+    emptiness is a statement.
+    """
     node: Any = data
     for index, key in enumerate(keys):
         if not isinstance(node, dict) or key not in node:
             raise _malformed(f"it has no {'.'.join(keys[: index + 1])}")
         node = node[key]
-    if not isinstance(node, str) or not node.strip():
-        raise _malformed(f"{'.'.join(keys)} is not a non-empty string")
+    if not isinstance(node, str):
+        raise _malformed(f"{'.'.join(keys)} is not a string")
     return node
 
 
@@ -492,9 +512,9 @@ def parse_context_yaml(path: Path, *, expected_version: int, max_bytes: int) -> 
     pins = ContextPins(
         context_version=expected_version,
         sdk=SdkPin(
-            constraint=_string(data, "mcuhome", "constraint"),
+            constraint=_informational(data, "mcuhome", "constraint"),
             version=_string(data, "mcuhome", "version"),
-            url=_string(data, "mcuhome", "package", "url"),
+            url=_informational(data, "mcuhome", "package", "url"),
             sha256=_string(data, "mcuhome", "package", "sha256"),
         ),
         zephyr=_string(data, "zephyr"),

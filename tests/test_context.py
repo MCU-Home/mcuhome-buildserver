@@ -1100,8 +1100,8 @@ async def test_an_extension_that_removes_and_adds_the_same_path_keeps_the_new_on
 async def test_an_extension_may_not_touch_context_yaml(client, how) -> None:
     """``context.pins-immutable``, in both directions.
 
-    ADR 0018 requires "an attempt is a typed error" and names no code;
-    this one was registered for it, deliberately apart from
+    ADR 0018 requires "an attempt is a typed error" and names this code;
+    it is registered deliberately apart from
     ``context.unsafe-entry``. A ``context.yaml`` in an extension is a
     perfectly well-formed entry aimed at a forbidden target, and telling
     a client its path was unsafe would send it looking for the wrong

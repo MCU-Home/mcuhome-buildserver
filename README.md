@@ -14,7 +14,7 @@ environment.** It materializes paths, invokes the build program and
 reads its result — over `docker exec` into a per-session container, or
 as a subprocess in one shared filesystem where there is no container
 runtime. Both profiles are specified by
-[the build-container contract](https://github.com/mcu-home/mcuhome/blob/main/docs/design/build-container-contract.md) §1.2,
+[the build-container contract](https://github.com/mcu-home/mcuhome-sdk/blob/main/docs/design/build-container-contract.md) §1.2,
 and both are implemented here; `--backend-profile` picks one and
 `open-session` tells the client which it got.
 
@@ -834,26 +834,18 @@ same reason the context root is not swept at startup.
 
 ## Deployment
 
-### On the WSL build machine (the current development target)
+### On a dedicated build machine
 
-The real target today is the WSL instance `mcuhome-build` on the
-Windows machine, with the workspace mirrored at `/root/MCUHome` — the
-operational details, the sync command and the machine's own quirks live
-in the workspace-level `REMOTE-BUILD.md`, which is the source of truth
-for that box.
-
-Install into the instance (once):
+Any Linux machine with Docker and systemd works — bare metal, a VM, or
+a WSL instance. Install from a checkout (once):
 
 ```sh
-wsl -d mcuhome-build -u root -e sh -c '
-  cd /root/MCUHome/build-server &&
-  python3 -m venv /opt/mcuhome-build-server &&
-  /opt/mcuhome-build-server/bin/pip install -e .
-'
+cd build-server &&
+python3 -m venv /opt/mcuhome-build-server &&
+/opt/mcuhome-build-server/bin/pip install .
 ```
 
-A systemd unit for the instance (it has systemd, and Docker is already
-enabled there) — `/etc/systemd/system/mcuhome-build-server.service`:
+A systemd unit — `/etc/systemd/system/mcuhome-build-server.service`:
 
 ```ini
 [Unit]
@@ -882,8 +874,8 @@ chmod 600 /etc/mcuhome/build-server.token
 systemctl enable --now mcuhome-build-server
 ```
 
-The instance's address changes with WSL's NAT; reach it from the dev
-machine over the Windows host's port proxy, or over SSH with a
+A WSL instance's address changes with WSL's NAT; reach it from other
+machines over the Windows host's port proxy, or over SSH with a
 forwarded port. Either way the dashboard is configured with a URL and
 that token.
 

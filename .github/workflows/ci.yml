@@ -7,13 +7,11 @@
 #          the other MCUHome repositories use; bump them together.
 #   test — pytest over the transport, the token and the session protocol.
 #
-# The test gate needs no sibling repository. It used to check out
-# `mcu-home/mcuhome` and `mcu-home/cli` with their own read-only deploy
-# keys, because the build server spawned the `mcuhome` command as its
-# builder and one test ran the real `mcuhome build --help`; both went
-# with the job protocol, so the checkouts, the installs and the
-# MCUHOME_DEPLOY_KEY / CLI_DEPLOY_KEY secrets are no longer used here.
-# The secrets can be revoked on the respective repositories.
+# The test gate checks out one sibling, `mcu-home/mcuhome-sdk`:
+# pyproject declares mcuhome-model (ADR 0020 decision 4), which is not
+# published yet, so the sibling checkout satisfies the declaration —
+# a plain checkout, no deploy key needed since the repositories went
+# public (ADR 0024).
 #
 # All actions are pinned to commit SHAs, not tags (see dependabot.yml,
 # which keeps the pins current via its github-actions ecosystem entry).
@@ -61,17 +59,15 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # pyproject declares mcuhome-model (ADR 0020 decision 4), which is
-      # not on an index while the repositories are private — so the
-      # sibling checkout satisfies the declaration, exactly as
-      # requirements-dev.txt does on a developer machine. Read-only
-      # deploy key; the checkout becomes unnecessary the day the
+      # not published yet — so the sibling checkout satisfies the
+      # declaration, exactly as requirements-dev.txt does on a developer
+      # machine. The checkout becomes unnecessary the day the
       # distribution is published.
-      - name: Checkout the mcuhome library family
+      - name: Checkout mcuhome-sdk
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: mcu-home/mcuhome
-          ssh-key: ${{ secrets.MCUHOME_DEPLOY_KEY }}
-          path: .deps/mcuhome
+          repository: mcu-home/mcuhome-sdk
+          path: .deps/mcuhome-sdk
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -80,7 +76,7 @@ jobs:
 
       - name: Install
         run: |
-          python -m pip install --disable-pip-version-check ./.deps/mcuhome/packaging/model
+          python -m pip install --disable-pip-version-check ./.deps/mcuhome-sdk/packaging/model
           python -m pip install --disable-pip-version-check -e '.[dev]'
 
       - name: pytest

@@ -328,8 +328,8 @@ class Upload:
             raise SessionError(
                 "context.integrity-mismatch",
                 "The archive this server received does not hash to the value the upload "
-                "declared. Declared hashes are advisory and the bytes decide (ADR 0019 "
-                "decision 8), so the upload is refused rather than repaired.",
+                "declared. Declared hashes are advisory and the bytes decide, so the "
+                "upload is refused rather than repaired.",
                 declared=self._declared_sha256,
                 computed=computed,
                 paths=[],
@@ -505,7 +505,7 @@ def check_file_target(path: str, *, allow_context_file: bool) -> None:
                 "context.pins-immutable",
                 "An extension may not carry context.yaml. It holds the pins this session "
                 "was admitted on, and changing them is a new session rather than an "
-                "extension (ADR 0018's amendment, build-container contract §3.2).",
+                "extension.",
                 entry=path,
             )
         return

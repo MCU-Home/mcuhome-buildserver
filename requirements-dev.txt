@@ -26,5 +26,11 @@
 # contract and on nothing else (ADR 0017 decision 3, dashboard ADR 0012).
 # The frame envelope the two products share is pinned by the contract,
 # not by importing one product into the other's test run.
+#
+# Working on this repository ALONE (no sibling checkout): satisfy the
+# declaration from git instead — pip clones internally, you keep
+# exactly one checkout:
+#
+#     pip install "mcuhome-model @ git+https://github.com/mcu-home/mcuhome-sdk#subdirectory=packaging/model" -e .[dev]
 -e ../mcuhome-sdk/packaging/model
 -e .[dev]

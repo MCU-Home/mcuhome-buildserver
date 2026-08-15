@@ -842,8 +842,13 @@ a WSL instance. Install from a checkout (once):
 ```sh
 cd build-server &&
 python3 -m venv /opt/mcuhome-build-server &&
-/opt/mcuhome-build-server/bin/pip install .
+/opt/mcuhome-build-server/bin/pip install \
+  "mcuhome-model @ git+https://github.com/mcu-home/mcuhome-sdk#subdirectory=packaging/model" .
 ```
+
+(The explicit `mcuhome-model` reference satisfies the one MCUHome
+dependency from git while nothing is published on PyPI yet; once it is,
+`pip install .` alone will do.)
 
 A systemd unit — `/etc/systemd/system/mcuhome-build-server.service`:
 

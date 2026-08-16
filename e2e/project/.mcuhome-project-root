@@ -1,0 +1,8 @@
+# This file marks the root of an MCUHome project.
+#
+# DO NOT EDIT. MCUHome maintains this file itself, and changing it by
+# hand can break the whole project. Your own settings belong in
+# mcuhome.yaml next to it.
+
+version = 1
+id = "01a00bf3-1b94-7916-8b2c-f293fa693f6b"

@@ -1,11 +1,18 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
 #
-# CI for the MCUHome build server. Two gates:
+# CI for the MCUHome build server. Three gates:
 #
 #   lint — ruff (check + format) and REUSE, pinned to the same versions
 #          the other MCUHome repositories use; bump them together.
 #   test — pytest over the transport, the token and the session protocol.
+#   e2e  — one real remote build: this server as a process, a real build
+#          container, `mcuhome device build --build-mode remote` against
+#          it, and a signed image at the end. The unit suite fakes docker
+#          — correctly, a build server is an orchestrator — and that is
+#          exactly why three lease-versus-time defects and one address
+#          parsed as a URL reached a real build before anything noticed.
+#          e2e/run.py is the harness and its head comment is the reason.
 #
 # The test gate checks out one sibling, `mcu-home/mcuhome-sdk`:
 # pyproject declares mcuhome-model (ADR 0020 decision 4), which is not
@@ -81,3 +88,105 @@ jobs:
 
       - name: pytest
         run: pytest
+
+  # ------------------------------------------------------------------
+  # The whole chain, once, for real.
+  #
+  # Four repositories meet here because a remote build needs all four:
+  # the command (mcu-home/cli), the client half of the session protocol
+  # and the signing step (mcu-home/mcuhome), the SDK package and the
+  # build container (mcu-home/mcuhome-sdk), and this server. They are
+  # checked out at `main` and this repository at the commit under test —
+  # which is the arrangement the product owner chose over a shared
+  # workflow the other three would call: what is being tested here is
+  # building a firmware *through this server*. When the workbench and the
+  # compiler grow their own end-to-end job for the local methods, the
+  # method will stop being the distinguishing thing and this can be
+  # revisited.
+  #
+  # The device is deliberately the cheapest one that still walks the
+  # whole chain (e2e/project/devices/e2e-node/main.yaml says why): no
+  # transport, no Matter, therefore no OpenThread and no CHIP. Four
+  # minutes rather than fifteen — and a remote build is ALWAYS a cold
+  # one, because this server mounts a shared compiler cache read-only
+  # and never a writable one (README, "the cache"), so the cheap device
+  # is not a nicety here.
+  e2e:
+    name: End-to-end (one real remote build)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Pull the build container. It is public, but an authenticated
+      # pull does not share the anonymous rate limit.
+      packages: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The SDK repository is a west manifest repository and its own CI
+      # puts it one level below the workspace top directory for that
+      # reason. Nothing here runs west, so a plain sub-directory is fine.
+      - name: Checkout mcuhome-sdk
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mcu-home/mcuhome-sdk
+          path: .deps/mcuhome-sdk
+
+      - name: Checkout mcuhome
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mcu-home/mcuhome
+          path: .deps/mcuhome
+
+      - name: Checkout cli
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mcu-home/cli
+          path: .deps/cli
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      # In dependency order, which pip does not need and a reader does.
+      # `remote` is the extra the session-protocol client lives in
+      # (aiohttp + zstandard); zstandard also builds the SDK archive
+      # below.
+      - name: Install the four distributions
+        run: |
+          python -m pip install --disable-pip-version-check \
+            -e ./.deps/mcuhome-sdk/packaging/model \
+            -e ./.deps/mcuhome-sdk/packaging/compiler \
+            -e './.deps/mcuhome[remote]' \
+            -e ./.deps/cli \
+            -e .
+
+      # The build container image is several gigabytes and the build
+      # tree lands beside it. The preinstalled Android/.NET/Haskell
+      # toolchains are worth tens of gigabytes and nothing here uses one.
+      - name: Make room on the runner
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
+
+      # Both halves of the SDK pin come from this one archive: the client
+      # resolves the version out of it and states the sha256 in the
+      # context, and the server resolves the same version out of the same
+      # directory and checks the bytes against that pin. Same directory
+      # here because there is one machine; on a real deployment they are
+      # two, which is the case the pin exists for.
+      - name: Build the SDK source archive
+        run: |
+          python -m pip install --disable-pip-version-check zstandard
+          python .deps/mcuhome-sdk/scripts/build_sdk_archive.py --output-dir dist/sdk
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: One real remote build
+        run: python e2e/run.py --sdk-dir dist/sdk

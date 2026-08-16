@@ -1,0 +1,25 @@
+# The device this repository's end-to-end job builds, and the reason it
+# looks like this.
+#
+# What the job tests is the chain — a command, the workbench, this
+# server, a build container, artifacts, host-side signing — not the
+# firmware that comes out of it. So the configuration is the cheapest
+# one that still walks the whole chain: no transport and no Matter, which
+# means no OpenThread and no CHIP, which is the difference between three
+# minutes of runner time and fifteen.
+#
+# "No transport" is a state MCUHome names rather than tolerates —
+# `mcuhome device validate` calls it a standalone device — and the build
+# is a real one: sysbuild, MCUboot, an application image, a merged hex
+# and a host-side signature. Only the Matter OTA image is missing, and
+# that one is Matter's by definition.
+#
+# Do not grow this file. A sensor here would compile a driver and prove
+# nothing this job is about; if the firmware itself needs testing, the
+# `matter` job in mcu-home/mcuhome-sdk is where a real device is built.
+
+device:
+  name: e2e-node
+  friendly_name: "End-to-End Node"
+  board: nrf7002dk/nrf5340/cpuapp
+  version: "0.1.0"

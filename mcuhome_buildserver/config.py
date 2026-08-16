@@ -49,6 +49,10 @@ from pathlib import Path
 from mcuhome_buildserver.security import DEFAULT_PAIR_FILE, read_token_file
 from mcuhome_buildserver.sessions import (
     DEFAULT_IDLE_TIMEOUT,
+    DEFAULT_MAX_OPEN_SESSIONS,
+    DEFAULT_MAX_SEATS,
+    DEFAULT_SEAT_RETRY_MAX_SECONDS,
+    DEFAULT_SEAT_RETRY_SECONDS,
     PATCH_LAYERS,
     is_patch_layer_name,
 )
@@ -320,6 +324,12 @@ class Config:
     #: The idle half of the session lease (:data:`_SESSION_OPTIONS`). The
     #: hard half is not here: it is derived from the build deadline.
     session_idle_timeout_seconds: int = int(DEFAULT_IDLE_TIMEOUT)
+    #: How many sessions may be open at once, and how a client that finds
+    #: them all taken is made to wait (:data:`_ADMISSION_OPTIONS`).
+    max_sessions: int = DEFAULT_MAX_OPEN_SESSIONS
+    seat_retry_seconds: int = int(DEFAULT_SEAT_RETRY_SECONDS)
+    seat_retry_max_seconds: int = int(DEFAULT_SEAT_RETRY_MAX_SECONDS)
+    max_seats: int = DEFAULT_MAX_SEATS
     max_artifact_bytes: int = DEFAULT_MAX_ARTIFACT_BYTES
 
     #: The per-session container's resource ceilings — the enforcement
@@ -463,11 +473,57 @@ _SESSION_OPTIONS: tuple[tuple[str, str, int, str], ...] = (
     ),
 )
 
+#: Admission: how many turns there are, and how a client that finds none
+#: free is made to wait. Same table shape and same reason again.
+#:
+#: The cap was a constant with no option in front of it, which made the
+#: ``container`` profile's four concurrent sessions — four containers at
+#: ``--container-memory`` each — a number an operator could not lower on
+#: a machine that cannot feed them, and made the ``subprocess`` profile's
+#: "one build environment, therefore one session" unsayable. Sizing it
+#: from real load is a later version's job; a static number is what an
+#: operator can reason about, and a dynamic one that guessed wrong would
+#: be a build killed for arithmetic.
+#:
+#: The two seat times are the operator's judgement in the same way the
+#: idle timeout is: a private server sets the base high, because a queue
+#: there is rare and a chatty client buys nothing, and a public one sets
+#: it low. The grace on top of an appointment is *not* here — it absorbs
+#: jitter around a time this server itself named, and the base is the
+#: knob for wanting a longer leash.
+_ADMISSION_OPTIONS: tuple[tuple[str, str, int, str], ...] = (
+    (
+        "--max-sessions",
+        "max_sessions",
+        DEFAULT_MAX_OPEN_SESSIONS,
+        "how many sessions may be open at once (the subprocess profile serves one)",
+    ),
+    (
+        "--seat-retry-seconds",
+        "seat_retry_seconds",
+        int(DEFAULT_SEAT_RETRY_SECONDS),
+        "base wait a refused client is told to keep before presenting its seat again",
+    ),
+    (
+        "--seat-retry-max-seconds",
+        "seat_retry_max_seconds",
+        int(DEFAULT_SEAT_RETRY_MAX_SECONDS),
+        "ceiling on that wait, however deep the queue is",
+    ),
+    (
+        "--max-seats",
+        "max_seats",
+        DEFAULT_MAX_SEATS,
+        "how many waiting turns this server holds before it stops issuing them",
+    ),
+)
+
 _LIMIT_ATTRIBUTES: tuple[str, ...] = (
     tuple(entry[1] for entry in _CAP_OPTIONS)
     + ("session_quota_bytes", "max_connections", "max_inflight_commands")
     + tuple(entry[1] for entry in _BACKEND_OPTIONS)
     + tuple(entry[1] for entry in _SESSION_OPTIONS)
+    + tuple(entry[1] for entry in _ADMISSION_OPTIONS)
 )
 
 
@@ -672,7 +728,11 @@ def build_parser() -> argparse.ArgumentParser:
             "already bounds the parallelism a conforming program asks for)"
         ),
     )
-    for option, attribute, default, what in (*_BACKEND_OPTIONS, *_SESSION_OPTIONS):
+    for option, attribute, default, what in (
+        *_BACKEND_OPTIONS,
+        *_SESSION_OPTIONS,
+        *_ADMISSION_OPTIONS,
+    ):
         parser.add_argument(
             option,
             type=int,

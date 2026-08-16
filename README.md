@@ -111,6 +111,10 @@ the command line wins. `--help` lists them all.
 | `--build-deadline-seconds` | `5400` | how long one invocation may run before this server stops it |
 | `--cancel-grace-seconds` | `60` | how long a cancelled invocation has to stop itself before the hard path |
 | `--max-artifact-bytes` | 256 MiB | egress cap: the size of one artifact this server will serve |
+| `--max-sessions` | `4` | how many sessions may be open at once (a `subprocess` deployment serves one) |
+| `--seat-retry-seconds` | `60` | base wait a refused client is told to keep before presenting its seat again |
+| `--seat-retry-max-seconds` | `900` | ceiling on that wait, however deep the queue is |
+| `--max-seats` | `128` | how many waiting turns this server holds before it stops issuing them |
 | `--container-memory` | `8g` | `container` profile only: `docker run --memory` for the session container; the empty string removes the ceiling |
 | `--container-pids` | `4096` | `container` profile only: `docker run --pids-limit` for the session container |
 | `--container-cpus` | none | `container` profile only: `docker run --cpus` for the session container |
@@ -155,10 +159,73 @@ may sit with no command and no running invocation before it is closed.
 The **session TTL** deliberately is not: it follows the build deadline
 (`sessions.ttl_for`), because a lease shorter than the time one build is
 allowed to take can only ever throw away work that was still running.
-Maximum concurrent sessions and the compile-lane limit are still
-defaults on `SessionManager` (`sessions.py`) with no option in front of
-them; inventing options for them now would advertise knobs that do
-nothing.
+
+## Admission, and waiting for a turn
+
+`--max-sessions` bounds how many sessions are open at once. A
+`subprocess` deployment sets it to `1`: that profile *is* the host, so
+several builds there compete for one machine's memory with nothing
+between them — contract §1.2 names "no per-session resource limits" as
+one of its reduced guarantees. Sizing the number from real load is a
+later version's job; a static one is what an operator can reason about,
+and a dynamic one that guessed wrong would be a build killed for
+arithmetic.
+
+A client that finds every slot taken is refused with
+`session.limit-exceeded`, whose details now carry **a seat token and the
+seconds to wait**:
+
+```json
+{"code": "session.limit-exceeded", "retryable": true,
+ "details": {"max_open": 1, "seat": "seat-…", "retry_after_seconds": 60}}
+```
+
+It waits, sends the token back in the payload of its next
+`open-session`, and is either admitted — the seat is spent — or told to
+wait again with the same token and a fresh time. This is additive: a
+server that does not know seats ignores the field, and a client only
+ever sends a token a server gave it, so no protocol version moves. A
+token this server no longer holds is not an error; that caller is simply
+a walk-in again.
+
+**The wait is all a client is told.** Seats are served in arrival order
+here, and the order is deliberately not on the wire: a later version
+that admits a paying client ahead of a free one would turn a published
+"you are second" into a lie. The number is relative seconds rather than
+a timestamp, because over a wait of minutes the least reliable clock in
+the system is the client's; this server's own bookkeeping runs on a
+monotonic clock, so a time correction cannot reorder the queue.
+
+The wait grows with the position — `--seat-retry-seconds × position`,
+capped by `--seat-retry-max-seconds` — which makes the head of the queue
+the fastest poller. That is what pays for the guarantee: **when a slot
+frees and anybody is waiting, it is held for the head**, and a walk-in
+in that window is turned away with a seat of its own. Held for a uniform
+five minutes, a server with fifteen-minute builds would stand idle about
+17 % of the time; at the default base the head's appointment is 60
+seconds and the cost is about 3 %. Turn the base up on a private server,
+where a queue is rare and a chatty client buys nothing, and down on a
+public one.
+
+A seat expires at its own appointment plus one minute, and the next one
+moves up. The grace is a constant, not a knob — it absorbs jitter around
+a time this server named, and `--seat-retry-seconds` is the knob for
+wanting a longer leash. There is therefore no verb to give a seat back:
+a client that walks away is forgotten within that window, and the case
+this matters for — somebody who has already waited a quarter of an hour
+to reach the front — is not the case that walks away.
+
+`--max-seats` bounds the queue. Past it, admission refuses with
+`session.no-seat` and issues nothing: a refusal that hands out a seat is
+a promise to serve, and there has to be a way to refuse without making
+one. The reason that will join `queue-full` there is a per-client seat
+quota, which needs an identity this server does not have while one
+bearer token is one principal — **fairness here is per request, not per
+user**, and a greedy client can hold several seats.
+
+Seats live in memory, like sessions and for the same reason. A restarted
+server has none, and the clients holding them are walk-ins on their next
+try.
 
 ## Backend profiles
 

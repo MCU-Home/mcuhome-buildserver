@@ -827,6 +827,45 @@ def test_the_idle_half_is_the_operators_and_reaches_the_manager(tmp_path) -> Non
     assert state.sessions.ttl == sessions.ttl_for(parsed.build_deadline_seconds)
 
 
+def test_admission_is_the_operators_and_reaches_the_manager(tmp_path) -> None:
+    """The cap and the waiting room, wired rather than merely accepted.
+
+    The cap was a constant with no option in front of it, which made the
+    ``container`` profile's four concurrent sessions a number an operator
+    could not lower on a machine that cannot feed four builds, and made
+    the ``subprocess`` profile's "one build environment, therefore one
+    session" unsayable. The two seat times are the same kind of setting
+    as the idle timeout: a private server sets the base high, a public
+    one low.
+    """
+    parsed = config_module.load_config(
+        [
+            "--max-sessions",
+            "1",
+            "--seat-retry-seconds",
+            "30",
+            "--seat-retry-max-seconds",
+            "300",
+            "--max-seats",
+            "8",
+            "--context-root",
+            str(tmp_path),
+        ],
+        env={},
+    )
+    assert (parsed.max_sessions, parsed.max_seats) == (1, 8)
+
+    variable = config_module.ENV_PREFIX + "MAX_SESSIONS"
+    from_env = config_module.load_config(["--context-root", str(tmp_path)], env={variable: "2"})
+    assert from_env.max_sessions == 2
+
+    state = app_module.ServerState(config=parsed)
+    assert state.sessions.max_open == 1
+    assert state.sessions.seats.retry_seconds == 30
+    assert state.sessions.seats.retry_max_seconds == 300
+    assert state.sessions.seats.max_seats == 8
+
+
 async def test_the_server_sweeps_without_anybody_asking(
     aiohttp_client, config, monkeypatch
 ) -> None:

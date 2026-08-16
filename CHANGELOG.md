@@ -10,6 +10,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Seat tokens: a busy server hands out turns instead of running a
+  lottery.** A client refused for want of capacity now gets a seat token
+  and the seconds to wait in the details of `session.limit-exceeded`,
+  sends the token back in its next `open-session`, and is either
+  admitted — the seat is spent — or told to wait again with the same
+  token and a fresh time. Additive on both ends, so no protocol version
+  moves. **A freed slot is held for the head of the queue**, which is
+  the guarantee the whole thing exists for: without it, whoever happens
+  to be dialling in that microsecond wins. The wait grows with the
+  position (`--seat-retry-seconds × position`, capped by
+  `--seat-retry-max-seconds`), which is what makes the head the fastest
+  poller and the reservation affordable — about 3 % idle capacity per
+  handover instead of the 17 % a uniform five-minute wait would cost.
+  A seat expires at its own appointment plus a minute, so the next one
+  moves up and no "give up my seat" verb is needed.
+
+  **The order is never on the wire.** A client learns when to come back
+  and nothing else: seats are served in arrival order today, and a later
+  version that admits a paying client ahead of a free one would turn a
+  published position into a lie. The seconds are relative rather than a
+  timestamp — over a wait of minutes the least reliable clock in the
+  system is the client's — and the queue's own bookkeeping is monotonic,
+  so a time correction cannot reorder it or resurrect an expired seat.
+
+- `session.no-seat`: admission refused **without** issuing a turn, with
+  the reason in `details`. A refusal that hands out a seat is a promise
+  to serve, and there has to be a way to refuse without making one.
+  Today the only reason is `queue-full` (`--max-seats`, default 128,
+  which also bounds the queue's memory); the reason that will join it is
+  a per-client seat quota, which needs an identity this server does not
+  have while one bearer token is one principal. Fairness here is per
+  request, not per user.
+
+- `--max-sessions` (`MCUHOME_BUILDSERVER_MAX_SESSIONS`, default 4): the
+  concurrent-session cap, which was a constant. It made the `container`
+  profile's four simultaneous builds — four containers at
+  `--container-memory` each — a number an operator could not lower on a
+  machine that cannot feed them, and made the `subprocess` profile's
+  "one build environment, therefore one session" unsayable. A
+  `subprocess` deployment now sets `1` and that is a configuration, not
+  a special case in the code.
+
 - An **end-to-end job**: one real remote build in CI, with nothing faked
   — this server as a process, a real build container, `mcuhome device
   build --build-mode remote` against it, a signed image at the end, and

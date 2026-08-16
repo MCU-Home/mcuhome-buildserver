@@ -123,12 +123,18 @@ __all__ = [
     "CONTEXT_UNLOCKED",
     "DEFAULT_IDLE_TIMEOUT",
     "DEFAULT_MAX_OPEN_SESSIONS",
+    "DEFAULT_MAX_SEATS",
     "DEFAULT_REAP_INTERVAL",
+    "DEFAULT_SEAT_RETRY_MAX_SECONDS",
+    "DEFAULT_SEAT_RETRY_SECONDS",
     "DEFAULT_SESSION_TTL",
     "PATCH_LAYERS",
     "PROFILES",
+    "SEAT_GRACE",
     "SESSION_PROTOCOL_VERSION",
     "SESSION_VERBS",
+    "Seat",
+    "SeatQueue",
     "Session",
     "SessionManager",
     "UPLOAD_VERBS",
@@ -248,6 +254,39 @@ DEFAULT_REAP_INTERVAL = 30.0
 #: per-user machinery, work metering and cost classes belong to the
 #: hosted phase and are not implemented here.
 DEFAULT_MAX_OPEN_SESSIONS = 4
+
+#: The base of a seat's waiting time. A seat at position *n* is told to
+#: come back after ``n ×`` this, capped by
+#: :data:`DEFAULT_SEAT_RETRY_MAX_SECONDS` — so the head of the queue is
+#: the fastest poller, which is what makes reserving a freed slot for it
+#: affordable (:class:`SeatQueue`). An operator turns it up on a private
+#: server, where a queue is rare and a chatty client buys nothing, and
+#: down on a public one.
+DEFAULT_SEAT_RETRY_SECONDS = 60.0
+
+#: The ceiling on that number, so a deep queue does not answer "come
+#: back in three hours" — a client told that has been refused, not
+#: queued.
+DEFAULT_SEAT_RETRY_MAX_SECONDS = 900.0
+
+#: What a seat gets on top of its own appointment before it expires. A
+#: constant rather than an option: it exists to absorb scheduling and
+#: network jitter around a time the server itself named, and an operator
+#: who wants a longer leash has :data:`DEFAULT_SEAT_RETRY_SECONDS` for
+#: it. This is also why there is no "give up my seat" verb — a seat left
+#: behind is gone within its appointment plus this.
+SEAT_GRACE = 60.0
+
+#: How many seats this server will hold. It bounds the queue's memory
+#: and is the honest answer to a server being used as a queue rather
+#: than as a build server; past it, admission refuses **without** handing
+#: out a seat (``session.no-seat``).
+DEFAULT_MAX_SEATS = 128
+
+#: The shape of a seat token. Opaque and unguessable for the same reason
+#: a session id is: it is the only thing standing between a caller and
+#: somebody else's turn.
+SEAT_ID_BYTES = 12
 
 STATE_OPEN = "open"
 STATE_CLOSED = "closed"
@@ -567,6 +606,146 @@ def _lease_over(session: Session, now: float) -> str | None:
     return None
 
 
+@dataclass
+class Seat:
+    """One held turn: what it is called, and until when it is held."""
+
+    #: The token the client presents. Opaque to everyone but this queue.
+    id: str
+    #: What the client was told to wait, in seconds. Echoed to it so the
+    #: two sides agree on the appointment they are keeping.
+    retry_after: float
+    #: On the **monotonic** clock, so an NTP correction cannot reorder
+    #: the queue or resurrect an expired seat.
+    expires_at: float
+
+
+class SeatQueue:
+    """The waiting room in front of admission.
+
+    A client refused for want of capacity is handed a seat token and a
+    time to come back; it presents the token on its next ``open-session``
+    and is either admitted or told to wait again — same token, fresh
+    time. The token costs about forty bytes and survives a client that
+    closes its socket, changes network or is a script invoked once a
+    minute by something else, which a held connection does not: a waiting
+    client that kept its socket open would spend a connection slot and an
+    inflight budget for the whole wait, and both are caps this server
+    announces.
+
+    **Order is kept here and is never published.** Seats are served in
+    arrival order today, and :meth:`position` exists to *compute* a
+    waiting time rather than to answer one to a client. A later version
+    with tariff tiers will admit a paying client ahead of a free one, and
+    a protocol that had promised "you are second" would have become a lie
+    the moment that shipped. What a client can act on is when to come
+    back.
+
+    The clock is monotonic throughout. Wall time here would let a clock
+    correction expire every seat at once or none of them ever.
+    """
+
+    def __init__(
+        self,
+        *,
+        retry_seconds: float = DEFAULT_SEAT_RETRY_SECONDS,
+        retry_max_seconds: float = DEFAULT_SEAT_RETRY_MAX_SECONDS,
+        max_seats: int = DEFAULT_MAX_SEATS,
+    ) -> None:
+        self.retry_seconds = retry_seconds
+        self.retry_max_seconds = retry_max_seconds
+        self.max_seats = max_seats
+        self._seats: list[Seat] = []
+
+    def __len__(self) -> int:
+        return len(self._seats)
+
+    @property
+    def full(self) -> bool:
+        return len(self._seats) >= self.max_seats
+
+    def sweep(self, now: float) -> tuple[str, ...]:
+        """Drop every seat whose appointment came and went.
+
+        This is the whole of "the next one moves up": a client that
+        misses its own appointment plus :data:`SEAT_GRACE` loses its
+        place, and the seat behind it becomes the head. Returns the ids
+        dropped, for the log.
+        """
+        gone = tuple(seat.id for seat in self._seats if now > seat.expires_at)
+        if gone:
+            self._seats = [seat for seat in self._seats if now <= seat.expires_at]
+        return gone
+
+    def position(self, token: str | None) -> int | None:
+        """Where *token* stands, 1-based, or ``None`` if it is not held.
+
+        ``None`` covers every way a token can fail — never issued,
+        expired, already consumed, invented — because none of them is
+        worth telling apart: all four mean the caller has no turn, and
+        answering "your token expired" rather than "unknown" would let
+        anyone probe which tokens once existed.
+        """
+        if token is None:
+            return None
+        for index, seat in enumerate(self._seats, start=1):
+            if seat.id == token:
+                return index
+        return None
+
+    def _wait_at(self, position: int) -> float:
+        return min(self.retry_seconds * position, self.retry_max_seconds)
+
+    def issue(self, now: float) -> Seat:
+        """Append a new seat at the back and time it."""
+        wait = self._wait_at(len(self._seats) + 1)
+        seat = Seat(
+            id=f"seat-{secrets.token_urlsafe(SEAT_ID_BYTES)}",
+            retry_after=wait,
+            expires_at=now + wait + SEAT_GRACE,
+        )
+        self._seats.append(seat)
+        return seat
+
+    def reissue(self, position: int, now: float) -> Seat:
+        """Re-time the seat standing at *position*, in place.
+
+        The token does not change — the client keeps the one it has, and
+        the queue keeps the order it had. Re-timing at the *current*
+        position is what corrects a seat that was told 180 seconds at
+        position 3 and has since become the head: its next appointment is
+        the head's.
+        """
+        seat = self._seats[position - 1]
+        seat.retry_after = self._wait_at(position)
+        seat.expires_at = now + seat.retry_after + SEAT_GRACE
+        return seat
+
+    def release(self, position: int) -> None:
+        """Consume the seat at *position*. Its holder is being admitted."""
+        del self._seats[position - 1]
+
+    def reserved_against(self, position: int | None) -> int:
+        """Slots held back from a caller standing at *position*.
+
+        **A freed slot belongs to the head of the queue**, which is the
+        guarantee the queue exists for: without it, the client that
+        happens to be dialling in that microsecond wins and "you are
+        first" means nothing. So one slot is held whenever anybody is
+        waiting — held against a walk-in and against every seat further
+        back, and never against the head itself.
+
+        It costs idle capacity, and the cost is exactly the head's own
+        appointment: at the default base that is 60 seconds, so an
+        average handover loses 30 of them — about 3 % of a
+        fifteen-minute build, which is what makes the guarantee worth
+        having.
+        """
+        if not self._seats or position == 1:
+            return 0
+        return 1
+
+
 class SessionManager:
     """Every session this process knows, and the admission rules.
 
@@ -583,11 +762,13 @@ class SessionManager:
         ttl: float = DEFAULT_SESSION_TTL,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
         max_open: int = DEFAULT_MAX_OPEN_SESSIONS,
+        seats: SeatQueue | None = None,
     ) -> None:
         self._sessions: dict[str, Session] = {}
         self.ttl = ttl
         self.idle_timeout = idle_timeout
         self.max_open = max_open
+        self.seats = SeatQueue() if seats is None else seats
 
     @property
     def open_count(self) -> int:
@@ -623,8 +804,14 @@ class SessionManager:
         Both halves of the lease are swept, because both are real: the
         hard TTL bounds a session that is working, and the idle timeout
         bounds one that is not. Returns the ids reaped, for the log.
+
+        The waiting room is swept in the same pass. Admission sweeps it
+        too, before every decision, so this is not what makes an expired
+        seat expire — it is what keeps a queue nobody is dialling from
+        holding its memory until somebody does.
         """
         moment = time.time() if now is None else now
+        self.seats.sweep(time.monotonic())
         reaped: list[str] = []
         for session in list(self._sessions.values()):
             over = _lease_over(session, moment) if session.state == STATE_OPEN else None
@@ -670,12 +857,63 @@ class SessionManager:
                 session.state = STATE_CLOSED
             session.discard_context()
 
+    def _admit(self, seat: str | None) -> None:
+        """Let this caller through, or refuse it with a turn to come back.
+
+        The two refusals are deliberately different promises.
+        ``session.limit-exceeded`` hands out a seat and is therefore an
+        undertaking to serve this caller in its turn;
+        ``session.no-seat`` makes no such promise and says why it did
+        not. There has to be a way to refuse without promising, and the
+        wire needs it now rather than after the fact: today the only
+        reason is a full queue, and the reason that follows it is a
+        per-client seat quota — a rule about identity, which this server
+        cannot express while one bearer token is one principal
+        (ADR 0019). That later work adds a reason, not a wire format.
+
+        A token this queue does not hold — never issued, long expired,
+        already spent, invented — is not an error. The caller simply has
+        no turn, and is treated as the walk-in it effectively is.
+        """
+        now = time.monotonic()
+        self.seats.sweep(now)
+        position = self.seats.position(seat)
+
+        free = self.max_open - self.open_count
+        if free - self.seats.reserved_against(position) >= 1:
+            if position is not None:
+                self.seats.release(position)
+            return
+
+        if position is not None:
+            held = self.seats.reissue(position, now)
+        elif self.seats.full:
+            raise SessionError(
+                "session.no-seat",
+                f"This server is holding its limit of {self.seats.max_seats} waiting turns "
+                "and issued none for this request. Try again later.",
+                reason="queue-full",
+                retry_after_seconds=int(self.seats.retry_max_seconds),
+            )
+        else:
+            held = self.seats.issue(now)
+        raise SessionError(
+            "session.limit-exceeded",
+            f"This server builds at most {self.max_open} at a time and they are all "
+            f"running. Your turn is held: come back in {int(held.retry_after)} seconds "
+            "with this seat.",
+            max_open=self.max_open,
+            seat=held.id,
+            retry_after_seconds=int(held.retry_after),
+        )
+
     def open(
         self,
         *,
         profile: str,
         protocol_version: int,
         context_format: int,
+        seat: str | None = None,
     ) -> Session:
         """Admission. Every refusal is typed, at the door (concept §4).
 
@@ -683,6 +921,13 @@ class SessionManager:
         manifest header away from ``open-session``, so admission decides
         the protocol version, the context-format version and the
         profile, and nothing about the context itself.
+
+        The fourth argument is not an operand and does not negotiate
+        anything: *seat* is the token a client was handed when this
+        server had no room, and presenting it asks for the turn that
+        token stands for. It is checked **after** the three, because a
+        request this server cannot serve at all should not be answered
+        with a place in a queue for it.
         """
         if protocol_version != SESSION_PROTOCOL_VERSION:
             raise SessionError(
@@ -707,13 +952,7 @@ class SessionManager:
                 f'"{profile}" is not a session profile this server has.',
                 profiles=list(PROFILES),
             )
-        if self.open_count >= self.max_open:
-            raise SessionError(
-                "session.limit-exceeded",
-                f"This server admits at most {self.max_open} concurrent sessions and "
-                "they are all taken. Close one, or retry when a lease runs out.",
-                max_open=self.max_open,
-            )
+        self._admit(seat)
         now = time.time()
         session = Session(
             id=f"s-{secrets.token_urlsafe(12)}",
@@ -919,7 +1158,16 @@ async def open_session(state: Any, connection: Any, command: Command) -> dict[st
 
         {"profile": "oneshot",            # oneshot | dev | test
          "protocol_version": 2,           # required; mismatch is typed
-         "context_format": 1}             # the format the context will use
+         "context_format": 1,             # the format the context will use
+         "seat": "seat-…"}                # optional; a turn this server held
+
+    ``seat`` is the token a client was handed when this server had no
+    room (``session.limit-exceeded``, whose details carry it together
+    with the seconds to wait). Presenting it asks for that turn. It is
+    additive and moves no protocol version: a server that does not know
+    seats ignores the field, and a client only ever sends a token a
+    server gave it. A token this server no longer holds is not an error
+    — the caller is simply a walk-in again.
 
     **There is no manifest operand.** ADR 0019's amendment takes
     ``open-session``'s first operand away: admission negotiates the
@@ -980,6 +1228,7 @@ async def open_session(state: Any, connection: Any, command: Command) -> dict[st
         profile="oneshot" if profile is None else profile,
         protocol_version=protocol_version,
         context_format=CONTEXT_FORMAT_MAX if context_format is None else context_format,
+        seat=command.optional_str("seat", None),
     )
     return {
         "session": session.to_dict(),

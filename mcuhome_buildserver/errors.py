@@ -133,6 +133,18 @@ REGISTRY: dict[str, ErrorCode] = _seed(
         summary="this server's concurrent-session limit is reached",
     ),
     ErrorCode(
+        # The counterpart to the one above, and the difference is a
+        # promise: `session.limit-exceeded` hands out a seat token and
+        # is therefore an undertaking to serve this caller in its turn,
+        # while this one refuses without making that promise and says
+        # why in `details.reason`. Today the only reason is a full
+        # waiting room; the one that follows is a per-client seat quota,
+        # which needs an identity this server does not have yet.
+        "session.no-seat",
+        retryable=True,
+        summary="admission refused and no waiting turn was issued",
+    ),
+    ErrorCode(
         "session.profile-unknown",
         retryable=False,
         summary="open-session named a profile this server does not have",

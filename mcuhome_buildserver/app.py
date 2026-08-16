@@ -101,7 +101,11 @@ class ServerState:
     backend: SessionBackend = field(init=False)
 
     def __post_init__(self) -> None:
-        self.sessions = sessions.SessionManager()
+        # The lease has to be able to hold what this server allows one
+        # invocation to take (sessions.ttl_for).
+        self.sessions = sessions.SessionManager(
+            ttl=sessions.ttl_for(self.config.build_deadline_seconds)
+        )
         self.backend = make_backend(self.config)
 
 

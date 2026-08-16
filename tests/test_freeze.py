@@ -26,6 +26,7 @@ from mcuhome.model.context import (
 )
 from ruamel.yaml import YAML
 
+from mcuhome_buildserver import config as config_module
 from mcuhome_buildserver import sessions
 from mcuhome_buildserver.errors import SessionError
 from tests.conftest import (
@@ -762,6 +763,44 @@ def test_the_hard_ttl_takes_a_working_session_anyway(tmp_path) -> None:
 
     assert manager.reap() == (session.id,)
     assert manager.reaped_reason(session.id) == "lease"
+
+
+def test_finishing_an_invocation_restarts_the_idle_clock(tmp_path) -> None:
+    """The end of a build is activity, and no command marks it.
+
+    The command that starts a build is sent before it runs, so a
+    fifteen-minute build ends into a session already past its idle
+    timeout — and the next verb is ``get-artifact``, the one that
+    collects what the build produced. Observed exactly so: 892 seconds of
+    compiling, delivered nowhere, refused with ``session.expired``.
+    """
+    manager = sessions.SessionManager(ttl=3600.0, idle_timeout=1.0)
+    session = _abandoned(manager, tmp_path)
+    session.last_command_at = time.time() - 60.0
+    session.invocations["inv-1"] = sessions.INVOCATION_RUNNING
+
+    # The build ends: state first, then the touch the backend performs.
+    session.invocations["inv-1"] = sessions.INVOCATION_FINISHED
+    session.touch()
+
+    assert manager.reap() == (), "a session that just finished work is not idle"
+
+
+def test_the_lease_can_hold_a_build_that_uses_its_whole_deadline(tmp_path) -> None:
+    """Two numbers that used to contradict each other.
+
+    The build deadline is the operator's and the hard TTL was a constant
+    below it, so a build allowed 90 minutes lived in a session reaped
+    after 60 — the deadline could never fire, and the work was thrown
+    away by the lease instead.
+    """
+    deadline = config_module.DEFAULT_BUILD_DEADLINE_SECONDS
+    assert sessions.ttl_for(deadline) > deadline
+
+    # An operator who raises the deadline gets a lease that still holds
+    # it; one who lowers it keeps the ordinary lease.
+    assert sessions.ttl_for(deadline * 2) > deadline * 2
+    assert sessions.ttl_for(60) == sessions.DEFAULT_SESSION_TTL
 
 
 async def test_the_server_sweeps_without_anybody_asking(

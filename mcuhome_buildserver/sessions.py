@@ -205,6 +205,28 @@ def is_patch_layer_name(name: str) -> bool:
 #: machine), small relative to a forgotten one.
 DEFAULT_SESSION_TTL = 3600.0
 
+#: What a session needs on top of one invocation's own deadline: the
+#: context upload before it, and the artifact download after it. A build
+#: that used its whole deadline would otherwise die of the hard TTL
+#: *before* its deadline could ever fire — two numbers contradicting each
+#: other, with the build's work thrown away either way.
+SESSION_WORK_MARGIN = 900.0
+
+
+def ttl_for(build_deadline_seconds: float) -> float:
+    """The hard TTL a server with this build deadline has to give.
+
+    The deadline is the operator's (``--build-deadline-seconds``) and the
+    TTL was a constant, so raising one silently made the other the real
+    limit. Deriving it keeps the promise the two numbers make together:
+    a session can host one invocation that runs for its full deadline,
+    plus :data:`SESSION_WORK_MARGIN` for the transfers around it. The
+    floor stays :data:`DEFAULT_SESSION_TTL`, because a *short* deadline
+    is no reason to shorten the lease of a session that is idle.
+    """
+    return max(DEFAULT_SESSION_TTL, build_deadline_seconds + SESSION_WORK_MARGIN)
+
+
 #: Idle timeout: absent *commands*, not absent connections — a client
 #: may disconnect and attach-session back without losing the session.
 #: Enforced by :meth:`SessionManager.reap` and by
@@ -417,6 +439,17 @@ class Session:
                 "still offers, close the session, and start a new one with pristine trees.",
                 session_id=self.id,
             )
+
+    def touch(self, *, now: float | None = None) -> None:
+        """Mark the session as having just done something.
+
+        The idle half of the lease counts absent **commands**, so every
+        verb refreshes this — and so does the *end* of an invocation,
+        which is the one piece of activity no command marks: a build is
+        one command that then runs for minutes, and its client sends
+        nothing until it is over.
+        """
+        self.last_command_at = time.time() if now is None else now
 
     def poison(self) -> None:
         """One-way. The caller is the future container backend (§6.3)."""
@@ -727,7 +760,7 @@ class SessionManager:
                 f'Session "{session_id}" is closed.',
                 session_id=session_id,
             )
-        session.last_command_at = time.time()
+        session.touch()
         return session
 
     def close(self, session_id: str) -> Session:

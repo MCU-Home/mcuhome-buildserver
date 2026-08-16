@@ -785,6 +785,14 @@ class SessionBackend:
         record.outcome = outcome
         record.artifacts = outcome.artifacts
         session.invocations[record.id] = _FINISHED
+        # The idle clock counts absent commands, and the command that
+        # started this invocation was sent before it ran: a fifteen-minute
+        # build would end into a session already minutes past its idle
+        # timeout, and the next verb — `get-artifact`, the one that
+        # collects what the build produced — would be refused
+        # `session.expired`. Observed exactly so, on a build that had
+        # just finished linking. Finishing work is activity.
+        session.touch()
         if outcome.reason in _POISONING:
             # §6.2 and §6.3: both are terminal for the session, and both
             # say so in the same words — "the backend MUST refuse every

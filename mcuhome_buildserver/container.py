@@ -60,7 +60,7 @@ import re
 import shlex
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from mcuhome.model.context import ContainerResolution
@@ -177,7 +177,9 @@ class Mount:
     """
 
     source: Path
-    target: Path
+    #: A path inside the container, and POSIX whatever the host is:
+    #: ``str()`` of a ``WindowsPath`` would hand docker backslashes.
+    target: PurePosixPath | Path
     read_only: bool = False
 
     def to_argument(self) -> str:
@@ -654,15 +656,17 @@ def session_run_command(
       that creates the container rather than on the exec that uses it:
       a limit on the exec bounds one process tree, and a limit on the
       container bounds the session.
-    * The mounts are **path-identical**, host path to the same container
-      path. That is workbench convenience rather than contract (§4 fixes
-      no mount points at all and forbids a program from depending on
-      one); it is kept because the request document then names paths
-      that mean the same thing on both sides of the boundary, which is
-      what makes a stalled build inspectable from the host — and, since
-      the session tree is mounted piece by piece rather than wholesale,
-      what makes the request document's paths *exactly* the set the
-      container can see.
+    * The mount **targets are the same for every session**, on this
+      machine and on any other (:mod:`mcuhome.model.containerpaths`).
+      §4 fixes no mount points and forbids a *program* from depending on
+      one; a backend choosing the same ones every time is the convention
+      §4 permits and §10.1 explains — the compiler cache is keyed on the
+      compile command line, into which Zephyr puts three absolute paths,
+      so a session directory in the target would be a session directory
+      in every cache key. The sources stay this session's own, and the
+      tree is mounted piece by piece rather than wholesale, which is what
+      makes the request document's paths *exactly* the set the container
+      can see.
     """
     argv = [docker, "run", "--detach", "--init", "--network=none"]
     if user is not None:

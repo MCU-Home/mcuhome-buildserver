@@ -67,14 +67,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
+from mcuhome.model import containerpaths
 from mcuhome.model.context import ContainerResolution
 from mcuhome.model.toolchain import line_of, satisfies_line
 
@@ -404,12 +406,13 @@ class SessionBackend:
     onto the program", and the two duties that *are* profile-dependent —
     network isolation and per-session resource limits — are not on it.
 
-    A subclass supplies five things and nothing else: what it can serve
+    A subclass supplies six things and nothing else: what it can serve
     (:meth:`inventory`), which environment answers a context's
     requirement (:meth:`resolve_image`), how the session's environment is
     materialized (:meth:`_materialize`), how one invocation of the
-    program is started (:meth:`_start`), and how the environment is
-    reaped (:meth:`_release_runtime`).
+    program is started (:meth:`_start`), how the environment is reaped
+    (:meth:`_release_runtime`), and how the environment spells a path
+    this server owns (:meth:`_inside`).
     """
 
     #: The backend profile this server declares at ``open-session``
@@ -465,6 +468,17 @@ class SessionBackend:
     async def _release_runtime(self, runtime: SessionRuntime) -> None:
         """Reap the session's build environment. Never raises."""
         raise NotImplementedError
+
+    def _inside(self, runtime: SessionRuntime, path: Path) -> PurePosixPath | Path:
+        """*path*, as the build environment spells it.
+
+        Every path this server puts in a request document goes through
+        here, because "the directory this server made" and "the path the
+        program is told about" are only the same string in a profile
+        where they are. In this one they are: a subprocess shares this
+        filesystem, so the answer is the path itself.
+        """
+        return path
 
     # ----------------------------------------------------------------
     # The session's build environment
@@ -732,19 +746,20 @@ class SessionBackend:
             params = {"mode": mode or "clean"}
             required.append("/params/mode")
             required += [f"/trees/{layer}" for layer in runtime.patched_layers]
+        inside = functools.partial(self._inside, runtime)
         return abi.request_document(
-            result=record.result,
+            result=inside(record.result),
             session=record.session_id,
-            out=record.out,
-            work=runtime.paths.work,
-            tmp=record.directory / "tmp",
-            context=runtime.paths.context,
+            out=inside(record.out),
+            work=inside(runtime.paths.work),
+            tmp=inside(record.directory / "tmp"),
+            context=inside(runtime.paths.context),
             trees=runtime.trees,
             jobs=self.config.build_jobs,
             deadline_seconds=self.config.build_deadline_seconds,
             cancel_grace_seconds=self.config.cancel_grace_seconds,
-            events=record.events,
-            cancel=record.cancel,
+            events=inside(record.events),
+            cancel=inside(record.cancel),
             params=params,
             required=tuple(required),
             ccache=runtime.ccache,
@@ -1399,9 +1414,22 @@ class ContainerBackend(SessionBackend):
         """
         assert isinstance(profile, ImageProfile)  # noqa: S101 - resolve_image's own type
         trees, mounts = self._arrange_trees(profile, paths, package, patched)
-        ccache = self._shared_cache(profile)
-        if ccache is not None:
-            mounts.append(container.Mount(source=ccache.path, target=ccache.path, read_only=True))
+        # The cache is mounted, never stated. An image configures ccache
+        # itself — contract §10.1 — so the read-only shared store goes on
+        # the path its configuration already names, and the request
+        # document says nothing about a cache at all. The writable half
+        # is deliberately not mounted here: this server serves contexts
+        # it does not trust, and §10 makes a shared store read-only for
+        # exactly that reason.
+        shared = self._shared_cache(profile)
+        if shared is not None:
+            mounts.append(
+                container.Mount(
+                    source=shared.path,
+                    target=containerpaths.CCACHE_SHARED,
+                    read_only=True,
+                )
+            )
         container_id = await self.docker.start(
             image=_pinned(profile.facts),
             mounts=container.mounts_for(mounts),
@@ -1426,7 +1454,9 @@ class ContainerBackend(SessionBackend):
             paths=paths,
             trees=trees,
             patched_layers=patched,
-            ccache=ccache,
+            # Not `shared`: in this profile the cache is a mount and not a
+            # field, so the request document must not carry one.
+            ccache=None,
         )
 
     def _arrange_trees(
@@ -1496,12 +1526,12 @@ class ContainerBackend(SessionBackend):
             # §9.1: write-protected "with the strongest means its
             # profile has", which in this profile is the kernel rather
             # than a promise — and nothing else is mounted over it.
-            container.Mount(source=paths.context, target=paths.context, read_only=True),
-            container.Mount(source=paths.work, target=paths.work),
-            container.Mount(source=paths.invocations, target=paths.invocations),
+            container.Mount(source=paths.context, target=containerpaths.CONTEXT, read_only=True),
+            container.Mount(source=paths.work, target=containerpaths.WORK),
+            container.Mount(source=paths.invocations, target=containerpaths.INVOCATIONS),
         ]
         sdk_writable = "sdk" in patched
-        sdk_target = profile.tree_path("sdk") or package.tree
+        sdk_target = profile.tree_path("sdk") or containerpaths.SDK
         mounts.append(
             container.Mount(source=package.tree, target=sdk_target, read_only=not sdk_writable)
         )
@@ -1515,6 +1545,35 @@ class ContainerBackend(SessionBackend):
             trees[layer] = TreeEntry(path=declared, writable=True)
         return trees, mounts
 
+    def _inside(self, runtime: SessionRuntime, path: Path) -> PurePosixPath | Path:
+        """*path*, as the container spells it — through this session's mounts.
+
+        Three directories of this session are visible in there, each at a
+        path that is the same for every session on every machine
+        (:mod:`mcuhome.model.containerpaths`), so this is a substitution
+        of prefixes and nothing more. It is the reason a build cannot
+        tell this server from a workbench building locally, and the
+        reason the compiler cache is worth keeping at all: Zephyr puts
+        three ``-fmacro-prefix-map=<absolute path>`` options on every
+        compile, so a session directory in here would be a session
+        directory in every cache key.
+
+        A path under none of the three is a path the container cannot
+        see, and putting one in a request document would produce a
+        refusal the client cannot act on — so it is a defect here, raised
+        as one.
+        """
+        for host, target in (
+            (runtime.paths.context, containerpaths.CONTEXT),
+            (runtime.paths.work, containerpaths.WORK),
+            (runtime.paths.invocations, containerpaths.INVOCATIONS),
+        ):
+            if path == host:
+                return target
+            if host in path.parents:
+                return target / path.relative_to(host)
+        raise AssertionError(f"{path} is not mounted into the session's container")
+
     async def _start(self, runtime: SessionRuntime, record: InvocationRecord) -> processes.Process:
         """``docker exec`` the program: the contract's whole invocation.
 
@@ -1527,7 +1586,7 @@ class ContainerBackend(SessionBackend):
         return await self.docker.invoke(
             container=str(runtime.container_id),
             action=record.action,
-            request=record.request,
+            request=self._inside(runtime, record.request),
             on_line=lambda line: self._log(record, line),
             user=container.current_user(),
         )

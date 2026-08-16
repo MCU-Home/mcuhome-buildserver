@@ -25,6 +25,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from mcuhome.model import containerpaths
 from ruamel.yaml import YAML
 
 from mcuhome_buildserver import sessions
@@ -158,16 +159,41 @@ async def test_the_session_tree_is_mounted_piece_by_piece_and_never_wholesale(
     started = next(argv for argv in docker.calls if "--detach" in argv)
     assert sorted(_volumes(started)) == sorted(
         [
-            f"{paths.context}:{paths.context}:ro",
-            f"{paths.work}:{paths.work}",
-            f"{paths.invocations}:{paths.invocations}",
-            f"{paths.sdk}:{paths.sdk}:ro",
+            f"{paths.context}:{containerpaths.CONTEXT}:ro",
+            f"{paths.work}:{containerpaths.WORK}",
+            f"{paths.invocations}:{containerpaths.INVOCATIONS}",
+            f"{paths.sdk}:{containerpaths.SDK}:ro",
         ]
     )
     root = paths.root
     assert f"{root}:{root}" not in _volumes(started)
     assert not any(str(paths.downloads) in volume for volume in _volumes(started))
     assert not any(str(paths.staging) in volume for volume in _volumes(started))
+
+
+async def test_a_request_document_never_names_this_machine(client, config, docker, state) -> None:
+    """A build cannot tell this server from a workbench building locally.
+
+    Every path the program is given is one of the four the container
+    profile fixes, identical on every machine and for every session. It
+    is a property worth pinning rather than a coincidence: the compiler
+    cache is keyed on the compile command line, into which Zephyr puts
+    three absolute paths, so one session directory leaking into the
+    document would give this server a cache per session — which is no
+    cache at all.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, _ = await locked(ws, config)
+        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
+        await collect(ws, until="invocation.verdict")
+        paths = state.sessions.require(session_id).paths
+
+    document = docker.invocations[-1].request
+    for key in ("result", "out", "work", "tmp", "context", "events", "cancel"):
+        assert document[key].startswith(f"{containerpaths.ROOT}/"), key
+    assert document["trees"]["sdk"]["path"].startswith(f"{containerpaths.ROOT}/")
+    assert str(paths.root) not in json.dumps(document)
+    assert session_id not in json.dumps({k: v for k, v in document.items() if k != "session"})
 
 
 async def test_a_read_only_tree_has_no_writable_second_name(client, config, docker, state) -> None:
@@ -1178,9 +1204,14 @@ async def test_the_shared_cache_is_offered_read_only_and_keyed_by_program_id(
         await collect(ws, until="invocation.verdict")
 
     store = cached.ccache_dir / "org.mcuhome.build-container"
-    assert docker.invocations[-1].request["ccache"] == {"path": str(store), "writable": False}
     started = next(argv for argv in docker.calls if "--detach" in argv)
-    assert f"{store}:{store}:ro" in _volumes(started)
+    assert f"{store}:{containerpaths.CCACHE_SHARED}:ro" in _volumes(started)
+    # Mounted, never stated: an image configures ccache itself (§10.1),
+    # so the request document carries no cache at all — and the writable
+    # half is absent, which is what keeps a shared store read-only for
+    # work this server does not trust.
+    assert "ccache" not in docker.invocations[-1].request
+    assert not any(str(containerpaths.CCACHE_LOCAL) in v for v in _volumes(started))
 
 
 async def test_a_program_id_that_is_not_a_path_segment_gets_no_cache_at_all(
@@ -1804,7 +1835,10 @@ async def test_cancel_creates_the_sentinel_file_the_request_named(
         sentinel = session.paths.invocation("inv-1") / "cancel"
 
     assert sentinel.exists()
-    assert docker.invocations[-1].request["cancel"] == str(sentinel)
+    assert docker.invocations[-1].request["cancel"] == str(
+        containerpaths.invocation("inv-1") / "cancel"
+    )
+    assert docker.host(docker.invocations[-1].request["cancel"]) == sentinel
 
 
 async def test_the_liveness_ladder_starts_with_the_sentinel_and_then_signals(
@@ -2081,8 +2115,10 @@ async def test_the_sdk_is_unpacked_per_session_and_mounted_where_describe_asked(
         paths = state.sessions.require(session_id).paths
 
     assert (paths.sdk / "mcuhome/__init__.py").read_bytes() == b"# the SDK\n"
-    assert docker.invocations[-1].request["trees"]["sdk"]["path"] == str(paths.sdk)
+    assert docker.invocations[-1].request["trees"]["sdk"]["path"] == str(containerpaths.SDK)
     assert docker.invocations[-1].request["trees"]["sdk"]["writable"] is False
+    started = next(argv for argv in docker.calls if "--detach" in argv)
+    assert f"{paths.sdk}:{containerpaths.SDK}:ro" in _volumes(started)
 
 
 async def test_describe_is_asked_once_per_image_digest(client, config, docker) -> None:

@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The container profile mounts every session at the same paths**
+  (`/mcuhome/ctx`, `/mcuhome/work`, `/mcuhome/inv/<id>`), so a request
+  document no longer names a directory of this server's. Contract §4
+  leaves mount points to the backend and §10.1 says why these are worth
+  choosing: the compiler cache is keyed on the compile command line,
+  into which Zephyr puts three absolute paths, so a session directory in
+  a mount target is a session directory in every cache key. A build in
+  the container cannot tell this server from a workbench building
+  locally. The `subprocess` profile is unchanged — several sessions
+  share one filesystem namespace there and cannot all have
+  `/mcuhome/work` — and `SessionBackend._inside` is the seam between the
+  two.
+- The shared compiler cache is **mounted read-only at the path the image
+  configures** (`/ccache/cache-shared`) instead of being named in the
+  request document. An image that configures ccache itself needs no
+  field, and read-only for untrusted work is unchanged (§10).
+
 ### Added
 
 - **The `subprocess` backend profile** — the second of the two profiles

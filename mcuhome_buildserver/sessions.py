@@ -898,10 +898,16 @@ class SessionManager:
         else:
             held = self.seats.issue(now)
         raise SessionError(
+            # Stated as a fact rather than as an instruction, because not
+            # every client is going to act on it: one told to come back
+            # with a seat it has already thrown away — a client asked to
+            # fail rather than wait — would be reading a step it cannot
+            # take. What is true either way is that the turn is being
+            # held, and for how long.
             "session.limit-exceeded",
             f"This server builds at most {self.max_open} at a time and they are all "
-            f"running. Your turn is held: come back in {int(held.retry_after)} seconds "
-            "with this seat.",
+            f"running. A turn is being held for this client for the next "
+            f"{int(held.retry_after)} seconds.",
             max_open=self.max_open,
             seat=held.id,
             retry_after_seconds=int(held.retry_after),

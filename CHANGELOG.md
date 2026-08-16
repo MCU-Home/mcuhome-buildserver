@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A session no longer dies under its own build.** The idle half of the
+  lease counts absent commands, and a build is one command that then
+  runs for minutes: a session compiling away looked idle after ten
+  minutes and was reaped mid-compile, and one that finished a
+  fifteen-minute build was already past its timeout when its client
+  asked for the artifacts. A running invocation is now work, finishing
+  one is activity, and a session the sweep does take away tells whoever
+  is listening — an `invocation.verdict` carrying `session.expired`,
+  instead of a client waiting forever on a socket that stays open.
+- **The hard TTL follows the build deadline.** The deadline is the
+  operator's and the TTL was a constant below it, so a build allowed
+  ninety minutes lived in a session reaped after sixty.
+
 ### Changed
 
 - **The container profile mounts every session at the same paths**

@@ -10,6 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- An **end-to-end job**: one real remote build in CI, with nothing faked
+  — this server as a process, a real build container, `mcuhome device
+  build --build-mode remote` against it, a signed image at the end, and
+  eight checks that each print the sentence they prove (`e2e/`). Four
+  minutes, because the device it builds is the cheapest one that still
+  walks the whole chain. Proven against the defects it exists for: each
+  of the four that reached a real build was restored one at a time, and
+  each turned the job red.
+
 - `--session-idle-timeout-seconds` (`MCUHOME_BUILDSERVER_SESSION_IDLE_TIMEOUT_SECONDS`):
   how long a session may sit with no command and no running invocation.
   It was a constant, and the lease-versus-time defects above could

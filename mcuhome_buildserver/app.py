@@ -146,7 +146,12 @@ async def _reap_loop(state: ServerState) -> None:
             # deleted tree is the one state neither half can recover
             # from.
             for session_id in reaped:
-                await state.backend.release(session_id)
+                # The half of the lease that ran out travels with it: a
+                # client still listening is owed the reason its build
+                # stopped, and this is the only place that knows it.
+                await state.backend.release(
+                    session_id, reaped=state.sessions.reaped_reason(session_id)
+                )
         except Exception:  # pragma: no cover - defensive; a sweep is a dict walk
             logger.exception("the session reaper failed a sweep")
         else:

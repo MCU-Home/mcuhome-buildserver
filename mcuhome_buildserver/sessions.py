@@ -263,6 +263,12 @@ INVOCATION_RUNNING = "running"
 INVOCATION_CANCELLING = "cancelling"
 INVOCATION_FINISHED = "finished"
 
+#: The invocation states that mean "this session is doing something".
+#: A cancelling invocation counts: it is winding a program down, and
+#: pulling its directory out from under it is the one state neither half
+#: recovers from.
+_WORKING = (INVOCATION_RUNNING, INVOCATION_CANCELLING)
+
 
 @dataclass
 class Session:
@@ -508,10 +514,22 @@ def _lease_over(session: Session, now: float) -> str | None:
     absent connections — a client may drop its socket and
     ``attach-session`` back without losing anything, which is exactly
     what makes a closed socket unusable as the signal here.
+
+    **A running invocation is work, not idleness**, and the idle half
+    has to know it: a build is *one* command that then takes minutes to
+    hours, during which a well-behaved client sends nothing and only
+    listens. Counting commands alone, a session compiling away looked
+    idle after ten minutes and was reaped under its own build —
+    observed, with the container removed mid-compile and a client left
+    waiting on a verdict that could no longer come. The hard TTL still
+    applies, and so does the invocation's own deadline, so this cannot
+    make a session immortal.
     """
     if now > session.expires_at:
         return "lease"
     if session.idle_timeout > 0 and now > session.last_command_at + session.idle_timeout:
+        if any(state in _WORKING for state in session.invocations.values()):
+            return None
         return "idle timeout"
     return None
 
@@ -584,6 +602,18 @@ class SessionManager:
             session.discard_context()
             reaped.append(session.id)
         return tuple(reaped)
+
+    def reaped_reason(self, session_id: str) -> str | None:
+        """Which half of the lease took *session_id* away, if one did.
+
+        The sweep records it on the session and the backend needs it a
+        moment later, to tell an audience why its build stopped. Kept as
+        a lookup rather than folded into :meth:`reap`'s answer so that
+        the sweep's return value stays what every caller reads it as: the
+        ids, for the log.
+        """
+        session = self._sessions.get(session_id)
+        return None if session is None else session.reaped
 
     def shutdown(self) -> None:
         """Discard every live session's directory. For process exit.

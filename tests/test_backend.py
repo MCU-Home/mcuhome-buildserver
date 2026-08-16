@@ -1979,6 +1979,56 @@ async def test_an_action_describe_does_not_announce_is_never_invoked(
     assert not any(argv[-2:-1] == ["verify"] for argv in docker.calls)
 
 
+async def test_a_reaped_session_tells_whoever_is_waiting(client, config, state) -> None:
+    """A build stopped by the sweep owes its client a verdict.
+
+    A client waits for exactly one frame — the verdict of the invocation
+    it started — and the socket stays open when a session is reaped, so
+    no connection loss ends that wait either. This server used to drop
+    the audience silently; measured once at 56 minutes of a client
+    waiting for a build whose container had long since been removed.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, _ = await locked(ws, config)
+        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
+        await collect(ws, until="invocation.verdict")
+        # An invocation this server has not judged is what the sweep
+        # finds when it takes a session away mid-build.
+        record = state.backend._records[(session_id, "inv-1")]
+        record.outcome = None
+
+        await state.backend.release(session_id, reaped="idle timeout")
+        frames = await collect(ws, until="invocation.verdict")
+
+    verdict = frames[-1]["payload"]
+    assert verdict["invocation_id"] == "inv-1"
+    assert verdict["status"] == "failure"
+    assert verdict["error"]["code"] == "session.expired"
+    assert "idle timeout" in verdict["error"]["message"]
+    assert verdict["artifacts"] == []
+
+
+async def test_a_closed_session_announces_nothing(client, config, state) -> None:
+    """``close-session`` is the client's own act, and needs no answer.
+
+    The announcement belongs to the sweep alone: a client that closed a
+    session knows it did, and a frame telling it so would be a second
+    spelling of its own verb's answer.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, _ = await locked(ws, config)
+        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
+        await collect(ws, until="invocation.verdict")
+        state.backend._records[(session_id, "inv-1")].outcome = None
+
+        await state.backend.release(session_id)
+        answer = await call(ws, "capabilities", {}, frame_id="c")
+
+    # The next thing on the socket is the answer to the next command,
+    # not a verdict nobody asked for.
+    assert answer["id"] == "c"
+
+
 async def test_close_session_reaps_the_container(client, config, docker) -> None:
     """One session is one container, and the container goes with it."""
     async with client.ws_connect("/ws", headers=auth()) as ws:

@@ -1118,8 +1118,13 @@ class SessionBackend:
     # Teardown
     # ----------------------------------------------------------------
 
-    async def release(self, session_id: str) -> None:
+    async def release(self, session_id: str, *, reaped: str | None = None) -> None:
         """Reap the session's build environment, if it had one. Never raises.
+
+        *reaped* is the half of the lease that ran out, and it is set by
+        the sweep alone: a session this server took away owes its
+        audience an explanation, while ``close-session`` is the client's
+        own act and process shutdown reaches nobody anyway.
 
         Called from ``close-session``, from the reaper's sweep and from
         process shutdown — the same three exits the per-session
@@ -1131,12 +1136,57 @@ class SessionBackend:
         half can recover from.
         """
         runtime = self._runtimes.pop(session_id, None)
+        if reaped is not None:
+            self._announce_reaping(session_id, reaped)
         self._audience.pop(session_id, None)
         for key in [key for key in self._records if key[0] == session_id]:
             self._records.pop(key, None)
         if runtime is None:
             return
         await self._release_runtime(runtime)
+
+    def _announce_reaping(self, session_id: str, reaped: str) -> None:
+        """Tell whoever is still listening that this session was taken away.
+
+        A client waits for one frame and one frame only — the
+        ``invocation.verdict`` of the invocation it started — and this
+        server used to drop the audience without sending anything, so a
+        session reaped under a running build left the client waiting on a
+        verdict that could never arrive. The socket stays open, so not
+        even a connection loss ends the wait: measured at 56 minutes
+        before it was killed by hand.
+
+        So the verdict is sent, as a failure carrying the session layer's
+        own ``session.expired`` — the code whose summary has always been
+        "the session's lease or hard TTL ran out and it was reaped".
+        Only for invocations this server never judged: one that already
+        has an outcome has already had its verdict.
+        """
+        for (owner, _), record in list(self._records.items()):
+            if owner != session_id or record.outcome is not None:
+                continue
+            self._publish(
+                record,
+                protocol.event_frame(
+                    "invocation.verdict",
+                    {
+                        "session_id": record.session_id,
+                        "invocation_id": record.id,
+                        "action": record.action,
+                        "status": abi.STATUS_FAILURE,
+                        "context": record.context_id,
+                        "artifacts": [],
+                        "error": errors.envelope(
+                            "session.expired",
+                            f"This session was reaped ({reaped}) while its invocation was "
+                            f"still running, so the build was stopped and its directory "
+                            f"deleted. Nothing was delivered.",
+                            session_id=session_id,
+                            invocation_id=record.id,
+                        ),
+                    },
+                ),
+            )
 
     async def release_all(self) -> None:
         for session_id in list(self._runtimes):

@@ -726,6 +726,44 @@ def test_the_sweep_takes_an_idle_session_too(tmp_path) -> None:
     assert "idle timeout" in refusal.value.message
 
 
+def test_a_session_running_an_invocation_is_not_idle(tmp_path) -> None:
+    """A build is one command that then runs for minutes.
+
+    Counting commands alone, a session compiling away looked idle after
+    ten minutes and was reaped under its own build — the container
+    removed mid-compile, the client left waiting on a verdict that could
+    never arrive. Observed on a real remote build before this held.
+    """
+    manager = sessions.SessionManager(ttl=3600.0, idle_timeout=1.0)
+    session = _abandoned(manager, tmp_path)
+    session.last_command_at = time.time() - 60.0
+    session.invocations["inv-1"] = sessions.INVOCATION_RUNNING
+
+    assert manager.reap() == (), "a session doing work is not an idle one"
+    assert session.paths.root.exists()
+
+    # And the moment the work ends, the idle half applies again — the
+    # exemption is "is working", not "has ever worked".
+    session.invocations["inv-1"] = sessions.INVOCATION_FINISHED
+    assert manager.reap() == (session.id,)
+
+
+def test_the_hard_ttl_takes_a_working_session_anyway(tmp_path) -> None:
+    """The two halves keep their own meanings.
+
+    "The hard TTL bounds a session that is working" — so the exemption
+    above belongs to the idle half alone, and a running invocation
+    cannot make a session immortal.
+    """
+    manager = sessions.SessionManager(ttl=1.0, idle_timeout=3600.0)
+    session = _abandoned(manager, tmp_path)
+    session.expires_at = time.time() - 1.0
+    session.invocations["inv-1"] = sessions.INVOCATION_RUNNING
+
+    assert manager.reap() == (session.id,)
+    assert manager.reaped_reason(session.id) == "lease"
+
+
 async def test_the_server_sweeps_without_anybody_asking(
     aiohttp_client, config, monkeypatch
 ) -> None:

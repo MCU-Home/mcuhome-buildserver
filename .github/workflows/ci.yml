@@ -188,5 +188,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # This server pulls nothing, by design: it answers a context's
+      # Zephyr line out of the images this host already has, and a
+      # server that fetched one on demand would decide at build time
+      # which environment a context gets. So the image has to be here
+      # first, and the reference comes from the compiler — the same
+      # module a local build resolves it with, so the two can never
+      # disagree about what "the build container" is.
+      - name: Pull the build container
+        run: |
+          reference="$(python -c '
+          from mcuhome.compiler.container import IMAGE
+          print(IMAGE)')"
+          echo "::notice::pulling $reference"
+          docker pull --quiet "$reference"
+
       - name: One real remote build
         run: python e2e/run.py --sdk-dir dist/sdk

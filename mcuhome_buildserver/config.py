@@ -47,7 +47,11 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from mcuhome_buildserver.security import DEFAULT_PAIR_FILE, read_token_file
-from mcuhome_buildserver.sessions import PATCH_LAYERS, is_patch_layer_name
+from mcuhome_buildserver.sessions import (
+    DEFAULT_IDLE_TIMEOUT,
+    PATCH_LAYERS,
+    is_patch_layer_name,
+)
 
 __all__ = [
     "BACKEND_PROFILES",
@@ -313,6 +317,9 @@ class Config:
     build_jobs: int = DEFAULT_BUILD_JOBS
     build_deadline_seconds: int = DEFAULT_BUILD_DEADLINE_SECONDS
     cancel_grace_seconds: int = DEFAULT_CANCEL_GRACE_SECONDS
+    #: The idle half of the session lease (:data:`_SESSION_OPTIONS`). The
+    #: hard half is not here: it is derived from the build deadline.
+    session_idle_timeout_seconds: int = int(DEFAULT_IDLE_TIMEOUT)
     max_artifact_bytes: int = DEFAULT_MAX_ARTIFACT_BYTES
 
     #: The per-session container's resource ceilings — the enforcement
@@ -434,10 +441,33 @@ _BACKEND_OPTIONS: tuple[tuple[str, str, int, str], ...] = (
     ),
 )
 
+#: The session lease's own numbers, same table shape and same reason.
+#: Only the idle timeout is here: the hard lease follows the build
+#: deadline (:func:`mcuhome_buildserver.sessions.ttl_for`), so it is
+#: derived rather than configured, and a knob that could contradict the
+#: deadline is a knob that can end a build that is still running.
+#:
+#: The idle timeout cannot be derived that way, because it measures
+#: something else: how long a session may sit with nothing happening.
+#: What "nothing" means is the operator's judgement — a workshop machine
+#: wants minutes, a shared server wants less — and a test wants seconds,
+#: which is the case that made this configurable: the defects that cost
+#: this project a build were lease-versus-time defects, and reproducing
+#: one must not require a build long enough to outlast ten minutes.
+_SESSION_OPTIONS: tuple[tuple[str, str, int, str], ...] = (
+    (
+        "--session-idle-timeout-seconds",
+        "session_idle_timeout_seconds",
+        int(DEFAULT_IDLE_TIMEOUT),
+        "how long a session may sit idle — no command, no running invocation — before it is closed",
+    ),
+)
+
 _LIMIT_ATTRIBUTES: tuple[str, ...] = (
     tuple(entry[1] for entry in _CAP_OPTIONS)
     + ("session_quota_bytes", "max_connections", "max_inflight_commands")
     + tuple(entry[1] for entry in _BACKEND_OPTIONS)
+    + tuple(entry[1] for entry in _SESSION_OPTIONS)
 )
 
 
@@ -642,7 +672,7 @@ def build_parser() -> argparse.ArgumentParser:
             "already bounds the parallelism a conforming program asks for)"
         ),
     )
-    for option, attribute, default, what in _BACKEND_OPTIONS:
+    for option, attribute, default, what in (*_BACKEND_OPTIONS, *_SESSION_OPTIONS):
         parser.add_argument(
             option,
             type=int,

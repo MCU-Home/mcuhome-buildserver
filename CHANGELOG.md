@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `--session-idle-timeout-seconds` (`MCUHOME_BUILDSERVER_SESSION_IDLE_TIMEOUT_SECONDS`):
+  how long a session may sit with no command and no running invocation.
+  It was a constant, and the lease-versus-time defects above could
+  therefore only be reproduced by a build long enough to outlast ten
+  minutes of silence — which is a quarter of an hour of runner time per
+  attempt. The hard half of the lease stays derived from the build
+  deadline: a knob that could contradict the deadline is a knob that can
+  end a build that is still running.
+
 ### Fixed
 
 - **A session no longer dies under its own build.** The idle half of the

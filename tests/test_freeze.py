@@ -26,6 +26,7 @@ from mcuhome.model.context import (
 )
 from ruamel.yaml import YAML
 
+from mcuhome_buildserver import app as app_module
 from mcuhome_buildserver import config as config_module
 from mcuhome_buildserver import sessions
 from mcuhome_buildserver.errors import SessionError
@@ -801,6 +802,29 @@ def test_the_lease_can_hold_a_build_that_uses_its_whole_deadline(tmp_path) -> No
     # it; one who lowers it keeps the ordinary lease.
     assert sessions.ttl_for(deadline * 2) > deadline * 2
     assert sessions.ttl_for(60) == sessions.DEFAULT_SESSION_TTL
+
+
+def test_the_idle_half_is_the_operators_and_reaches_the_manager(tmp_path) -> None:
+    """Configured, not constant — and wired, not merely accepted.
+
+    The hard half is derived from the build deadline, so it has no knob;
+    the idle half measures something the server cannot derive, and a
+    server that could not be told would make every lease-versus-time
+    defect reproducible only by a build long enough to outlast ten
+    minutes of silence.
+    """
+    parsed = config_module.load_config(
+        ["--session-idle-timeout-seconds", "15", "--context-root", str(tmp_path)], env={}
+    )
+    assert parsed.session_idle_timeout_seconds == 15
+
+    variable = config_module.ENV_PREFIX + "SESSION_IDLE_TIMEOUT_SECONDS"
+    from_env = config_module.load_config(["--context-root", str(tmp_path)], env={variable: "20"})
+    assert from_env.session_idle_timeout_seconds == 20
+
+    state = app_module.ServerState(config=parsed)
+    assert state.sessions.idle_timeout == 15
+    assert state.sessions.ttl == sessions.ttl_for(parsed.build_deadline_seconds)
 
 
 async def test_the_server_sweeps_without_anybody_asking(

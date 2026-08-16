@@ -104,7 +104,8 @@ class ServerState:
         # The lease has to be able to hold what this server allows one
         # invocation to take (sessions.ttl_for).
         self.sessions = sessions.SessionManager(
-            ttl=sessions.ttl_for(self.config.build_deadline_seconds)
+            ttl=sessions.ttl_for(self.config.build_deadline_seconds),
+            idle_timeout=self.config.session_idle_timeout_seconds,
         )
         self.backend = make_backend(self.config)
 

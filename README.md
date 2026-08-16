@@ -149,11 +149,16 @@ have, and an option that made an untrusted build's cache writable would
 be the one setting that turns a shared cache into a shared attack
 surface.
 
-The per-server limits that ADR 0019 names for v1.0 — maximum concurrent
-sessions, session TTL, idle timeout and the compile-lane limit — are
-**not configurable yet**: they exist as defaults on `SessionManager`
-(`sessions.py`) with no option in front of them. Inventing options for
-them now would advertise knobs that do nothing.
+Of the per-server limits ADR 0019 names for v1.0, the **idle timeout**
+is configurable — `--session-idle-timeout-seconds`, how long a session
+may sit with no command and no running invocation before it is closed.
+The **session TTL** deliberately is not: it follows the build deadline
+(`sessions.ttl_for`), because a lease shorter than the time one build is
+allowed to take can only ever throw away work that was still running.
+Maximum concurrent sessions and the compile-lane limit are still
+defaults on `SessionManager` (`sessions.py`) with no option in front of
+them; inventing options for them now would advertise knobs that do
+nothing.
 
 ## Backend profiles
 

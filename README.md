@@ -115,6 +115,7 @@ the command line wins. `--help` lists them all.
 | `--seat-retry-seconds` | `60` | base wait a refused client is told to keep before presenting its seat again |
 | `--seat-retry-max-seconds` | `900` | ceiling on that wait, however deep the queue is |
 | `--max-seats` | `128` | how many waiting turns this server holds before it stops issuing them |
+| `--reconnect-grace-seconds` | `60` | how long a session whose client is gone is kept before a waiting one may have it |
 | `--container-memory` | `8g` | `container` profile only: `docker run --memory` for the session container; the empty string removes the ceiling |
 | `--container-pids` | `4096` | `container` profile only: `docker run --pids-limit` for the session container |
 | `--container-cpus` | none | `container` profile only: `docker run --cpus` for the session container |
@@ -226,6 +227,30 @@ user**, and a greedy client can hold several seats.
 Seats live in memory, like sessions and for the same reason. A restarted
 server has none, and the clients holding them are walk-ins on their next
 try.
+
+### When there is nothing to free
+
+A client that dies without closing its session leaves that session
+holding its slot: connection loss is never abandonment, which is what
+makes `attach-session` worth having, so the lease runs to its idle
+timeout — ten minutes by default. With `--max-sessions 1` that is ten
+minutes of a build server doing nothing while somebody polls a seat.
+
+So admission looks once more before it refuses: a session with **no
+client attached**, **nothing running** and quiet for
+`--reconnect-grace-seconds` is released, and its build environment and
+directory go with it. All three conditions are promises being kept — a
+detached build is work, an attached client owns its session however long
+it thinks, and the grace is the time a dropped socket has to come back.
+Attached means any command naming the session, not `attach-session`
+alone, so a client that reconnected and simply carried on is attached.
+
+**Only when somebody wants the slot.** With room for both, an idle
+session is left alone; there is no client whose wait it is costing. The
+released client hears `session.expired` when it next asks, with a
+sentence that says what happened rather than that its lease ran out —
+and nothing new on the wire, because a session nobody is attached to has
+nobody to send an event to.
 
 ## Backend profiles
 

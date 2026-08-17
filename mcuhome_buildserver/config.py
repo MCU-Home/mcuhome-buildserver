@@ -51,6 +51,7 @@ from mcuhome_buildserver.sessions import (
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_MAX_OPEN_SESSIONS,
     DEFAULT_MAX_SEATS,
+    DEFAULT_RECONNECT_GRACE,
     DEFAULT_SEAT_RETRY_MAX_SECONDS,
     DEFAULT_SEAT_RETRY_SECONDS,
     PATCH_LAYERS,
@@ -330,6 +331,7 @@ class Config:
     seat_retry_seconds: int = int(DEFAULT_SEAT_RETRY_SECONDS)
     seat_retry_max_seconds: int = int(DEFAULT_SEAT_RETRY_MAX_SECONDS)
     max_seats: int = DEFAULT_MAX_SEATS
+    reconnect_grace_seconds: int = int(DEFAULT_RECONNECT_GRACE)
     max_artifact_bytes: int = DEFAULT_MAX_ARTIFACT_BYTES
 
     #: The per-session container's resource ceilings — the enforcement
@@ -515,6 +517,12 @@ _ADMISSION_OPTIONS: tuple[tuple[str, str, int, str], ...] = (
         "max_seats",
         DEFAULT_MAX_SEATS,
         "how many waiting turns this server holds before it stops issuing them",
+    ),
+    (
+        "--reconnect-grace-seconds",
+        "reconnect_grace_seconds",
+        int(DEFAULT_RECONNECT_GRACE),
+        "how long a session whose client is gone is kept before a waiting one may have it",
     ),
 )
 

@@ -270,6 +270,229 @@ async def test_the_seat_makes_the_round_trip_over_the_wire(aiohttp_client, confi
         assert len(state.sessions.seats) == 0
 
 
+# --------------------------------------------------------------------------
+# The handover: a session nobody is attached to does not outrank a client
+# --------------------------------------------------------------------------
+
+
+def _unattended(manager: sessions.SessionManager, quiet_for: float = 300.0) -> sessions.Session:
+    """A session whose client opened it and was never heard from again."""
+    session = _open(manager)
+    connection = object()
+    manager.attach(session, connection)
+    session.touch(now=time.time() - quiet_for)
+    manager.detach(connection, now=time.time() - quiet_for)
+    return session
+
+
+def test_a_session_nobody_is_attached_to_is_handed_to_a_client_that_is_waiting() -> None:
+    """The measured case: with one slot, an abandoned session was the server.
+
+    A client that dies without closing its session holds it for the full
+    idle timeout, because connection loss is never abandonment. That
+    stays true — with nobody waiting nothing happens here — but it stops
+    being unconditional.
+    """
+    manager = sessions.SessionManager(max_open=1)
+    abandoned = _unattended(manager)
+
+    admitted = _open(manager)
+
+    assert admitted.state == sessions.STATE_OPEN
+    assert abandoned.state == sessions.STATE_CLOSED
+    assert abandoned.reaped == sessions.GONE_HANDOVER
+    # And the build environment is handed to whoever can remove it.
+    assert manager.take_released() == (abandoned.id,)
+    assert manager.take_released() == ()
+
+
+def test_a_room_with_space_never_takes_an_idle_session() -> None:
+    """Scarcity is the whole justification.
+
+    With a free slot there is no client whose wait the idle session is
+    paying for, and taking it would break a lease this server gave for
+    nothing.
+    """
+    manager = sessions.SessionManager(max_open=2)
+    idle = _unattended(manager)
+
+    assert _open(manager).state == sessions.STATE_OPEN
+    assert idle.state == sessions.STATE_OPEN
+    assert manager.take_released() == ()
+
+
+def test_a_client_on_the_socket_keeps_its_session_however_long_it_is_quiet() -> None:
+    """Attached is attached. A dev session is allowed to think.
+
+    The idle timeout is out of the way here on purpose: this is the
+    handover rule alone, and a session quiet for an hour under the
+    default lease is the reaper's business, not admission's.
+    """
+    manager = sessions.SessionManager(max_open=1, idle_timeout=7200.0)
+    session = _open(manager)
+    manager.attach(session, object())
+    session.touch(now=time.time() - 3600.0)
+
+    assert _refused(manager).code == "session.limit-exceeded"
+    assert session.state == sessions.STATE_OPEN
+
+
+def test_a_build_that_is_running_detached_keeps_its_session() -> None:
+    """Work is not idleness — the same rule the idle timeout follows.
+
+    A client that starts a build and drops its socket is the case
+    ``attach-session`` exists for, and it must survive a queue forming
+    behind it.
+    """
+    manager = sessions.SessionManager(max_open=1)
+    building = _unattended(manager)
+    building.invocations["inv-1"] = sessions.INVOCATION_RUNNING
+
+    assert _refused(manager).code == "session.limit-exceeded"
+    assert building.state == sessions.STATE_OPEN
+
+
+def test_the_grace_is_the_time_a_client_has_to_come_back() -> None:
+    manager = sessions.SessionManager(max_open=1, reconnect_grace=60.0)
+    dropped = _unattended(manager, quiet_for=30.0)
+
+    seat = _refused(manager).details["seat"]
+    assert dropped.state == sessions.STATE_OPEN
+
+    # A second past it, and the client that is waiting has the better claim.
+    dropped.touch(now=time.time() - 61.0)
+    dropped.disconnected_since = time.time() - 61.0
+    assert _open(manager, seat).state == sessions.STATE_OPEN
+    assert dropped.reaped == sessions.GONE_HANDOVER
+
+
+def test_the_clock_runs_from_whichever_came_last() -> None:
+    """Quiet and disconnected are two ways of being unattended.
+
+    A client that goes quiet and *then* loses its socket has not been
+    unattended for the length of its silence.
+    """
+    manager = sessions.SessionManager(max_open=1, idle_timeout=7200.0, reconnect_grace=60.0)
+    session = _open(manager)
+    connection = object()
+    manager.attach(session, connection)
+    session.touch(now=time.time() - 3600.0)
+    manager.detach(connection, now=time.time() - 10.0)
+
+    assert _refused(manager).code == "session.limit-exceeded"
+    assert session.state == sessions.STATE_OPEN
+
+
+def test_a_client_that_reconnected_without_attach_session_counts_as_attached() -> None:
+    """``attach-session`` re-joins the event stream; it is not a check-in.
+
+    A client that reconnects and simply carries on — send-context on a
+    fresh socket — is driving its session, and a long upload must not
+    look unattended while it runs.
+    """
+    manager = sessions.SessionManager(max_open=1, reconnect_grace=0.0)
+    session = _unattended(manager)
+    manager.require(session.id, object())
+
+    assert _refused(manager).code == "session.limit-exceeded"
+    assert session.state == sessions.STATE_OPEN
+
+
+def test_the_longest_unattended_session_goes_first() -> None:
+    manager = sessions.SessionManager(max_open=2, idle_timeout=7200.0)
+    older = _unattended(manager, quiet_for=900.0)
+    newer = _unattended(manager, quiet_for=300.0)
+
+    _open(manager)
+
+    assert older.reaped == sessions.GONE_HANDOVER
+    assert newer.state == sessions.STATE_OPEN
+
+
+def test_the_handover_takes_the_directory_with_it() -> None:
+    """It holds a device's commissioning credentials, like every reaping does."""
+    manager = sessions.SessionManager(max_open=1)
+    abandoned = _unattended(manager)
+    abandoned.context_state = sessions.CONTEXT_LOCKED
+
+    _open(manager)
+
+    assert abandoned.context_state == sessions.CONTEXT_NONE
+
+
+def test_a_handed_over_session_says_so_when_its_client_comes_back() -> None:
+    """Different news from a lease that ran out, so a different sentence."""
+    manager = sessions.SessionManager(max_open=1)
+    abandoned = _unattended(manager)
+    _open(manager)
+
+    with pytest.raises(SessionError) as excinfo:
+        manager.require(abandoned.id)
+    assert excinfo.value.code == "session.expired"
+    assert "waiting for a turn" in excinfo.value.message
+    assert "outlived" not in excinfo.value.message
+
+
+def test_a_slot_a_walk_in_frees_still_belongs_to_the_head() -> None:
+    """The two rules compose, and the order is: free it, then hold it.
+
+    A walk-in may hand an unattended session over and still be refused,
+    which is why the release is drained even when admission says no.
+    """
+    manager = sessions.SessionManager(max_open=1)
+    abandoned = _open(manager)
+    connection = object()
+    manager.attach(abandoned, connection)
+    # The head queues while the session still has its client…
+    waiting = _refused(manager).details["seat"]
+    # …and that client is gone by the time the next one dials in.
+    abandoned.touch(now=time.time() - 300.0)
+    manager.detach(connection, now=time.time() - 300.0)
+
+    walk_in = _refused(manager)
+
+    assert walk_in.details["seat"] != waiting
+    assert abandoned.reaped == sessions.GONE_HANDOVER
+    assert manager.take_released() == (abandoned.id,)
+    assert _open(manager, waiting).state == sessions.STATE_OPEN
+
+
+async def test_the_handover_reaches_the_backend_over_the_wire(aiohttp_client, config) -> None:
+    """Marking is admission's; removing the build environment is not.
+
+    Admission runs inside one command and cannot wait for a container to
+    go away, so ``open-session`` drains what it marked — and the sweep is
+    the backstop behind it.
+    """
+    state = ServerState(replace(config, max_sessions=1, reconnect_grace_seconds=1))
+    released: list[tuple[str, str | None]] = []
+    original = state.backend.release
+
+    async def record(session_id: str, *, reaped: str | None = None) -> None:
+        released.append((session_id, reaped))
+        await original(session_id, reaped=reaped)
+
+    state.backend.release = record  # type: ignore[method-assign]
+    client = await aiohttp_client(create_app(state))
+    payload = {"protocol_version": sessions.SESSION_PROTOCOL_VERSION}
+
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        first = await call(ws, "open-session", payload, frame_id="a")
+        abandoned = first["payload"]["session"]["id"]
+
+    # The socket is gone and the session has been quiet since before the
+    # grace, so the next client to ask has the better claim.
+    session = state.sessions.require(abandoned)
+    session.touch(now=time.time() - 60.0)
+    session.disconnected_since = time.time() - 60.0
+
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        second = await call(ws, "open-session", payload, frame_id="b")
+        assert second["type"] == "result"
+
+    assert released == [(abandoned, sessions.GONE_HANDOVER)]
+
+
 def test_waiting_costs_no_lease() -> None:
     """A seat is not a session: the lease begins at admission.
 

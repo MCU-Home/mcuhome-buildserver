@@ -513,8 +513,12 @@ async def websocket_handler(request: web.Request) -> web.StreamResponse:
         state.connections.discard(connection)
         # A closed socket leaves the invocations it was watching running
         # — connection loss is never abandonment — so what goes away
-        # here is only this connection's place in their audience.
+        # here is only this connection's place in their audience, and its
+        # place among the clients a session counts as attached. The
+        # second is what starts the reconnect grace: a session nobody
+        # comes back to may be handed to a client that is waiting.
         state.backend.detach(connection)
+        state.sessions.detach(connection)
         await connection.close()
         writer.cancel()
         with contextlib.suppress(asyncio.CancelledError):

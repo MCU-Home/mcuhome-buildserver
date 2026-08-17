@@ -288,6 +288,53 @@ DEFAULT_MAX_SEATS = 128
 #: somebody else's turn.
 SEAT_ID_BYTES = 12
 
+#: How long a session with no client attached is protected from being
+#: handed to somebody who is waiting.
+#:
+#: "Connection loss is never abandonment" (ADR 0019) is what makes
+#: ``attach-session`` worth having, and it stays true: a session is taken
+#: away only when a *third party* wants the slot, and only after this
+#: much quiet. What it stops being is unconditional. With
+#: ``--max-sessions 1`` — the subprocess profile's setting — a client
+#: that died without closing its session used to hold the whole server
+#: for the full idle timeout, measured at ten minutes of a build server
+#: doing nothing while a client polled its seat.
+#:
+#: Sixty seconds because that is a reconnect, generously: a client that
+#: lost its socket dials back in seconds, and one that needs a minute has
+#: not lost a socket, it has gone. Turning it up protects a flaky client
+#: at a waiting one's expense, and turning it down to a second or two
+#: hands a session over as soon as it is unattended. There is no
+#: "never": that is the behaviour this replaces.
+DEFAULT_RECONNECT_GRACE = 60.0
+
+#: Why a session is gone, when it is gone: the values :attr:`Session.reaped`
+#: carries. Two say the lease ran out — the client's own time was up —
+#: and the third says this server took the session away while it still
+#: had time, which is different news and gets a different sentence.
+GONE_LEASE = "lease"
+GONE_IDLE = "idle timeout"
+GONE_HANDOVER = "handover"
+
+_GONE_MESSAGE = {
+    GONE_LEASE: 'Session "{session_id}" outlived its lease and was reaped.',
+    GONE_IDLE: 'Session "{session_id}" outlived its idle timeout and was reaped.',
+    GONE_HANDOVER: (
+        'Session "{session_id}" had no client attached and nothing running while another '
+        "client was waiting for a turn, so this server released it and deleted its "
+        "directory. Open a new session."
+    ),
+}
+
+
+def gone_message(session_id: str, reason: str) -> str:
+    """The sentence for a session that is no longer there."""
+    template = _GONE_MESSAGE.get(reason)
+    if template is None:  # pragma: no cover - the three above are all there are
+        return f'Session "{session_id}" was reaped ({reason}).'
+    return template.format(session_id=session_id)
+
+
 STATE_OPEN = "open"
 STATE_CLOSED = "closed"
 
@@ -410,8 +457,20 @@ class Session:
     #: first into the second. It carries the reason rather than a flag
     #: because the two halves are different advice: a hard TTL says the
     #: work was too long for one session, an idle timeout says nobody was
-    #: driving it.
+    #: driving it. :data:`GONE_HANDOVER` is the third value and the one
+    #: that is not a lease at all — this server took the session away
+    #: while it still had time, for a client that was waiting.
     reaped: str | None = None
+    #: The live connections speaking for this session. Never serialized
+    #: and not part of the protocol: it is what "a client is attached"
+    #: means to :meth:`SessionManager._hand_over`, and nothing else reads
+    #: it. Bound by every command that names the session, so a client
+    #: that reconnected without ``attach-session`` counts as attached too.
+    connections: set[Any] = field(default_factory=set)
+    #: When the last of them went away, or ``None`` while one is here. A
+    #: session that never had one reads as unattended from the start,
+    #: which is what it is.
+    disconnected_since: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -598,12 +657,32 @@ def _lease_over(session: Session, now: float) -> str | None:
     make a session immortal.
     """
     if now > session.expires_at:
-        return "lease"
+        return GONE_LEASE
     if session.idle_timeout > 0 and now > session.last_command_at + session.idle_timeout:
-        if any(state in _WORKING for state in session.invocations.values()):
+        if _is_working(session):
             return None
-        return "idle timeout"
+        return GONE_IDLE
     return None
+
+
+def _is_working(session: Session) -> bool:
+    """Whether an invocation of this session is running or being stopped."""
+    return any(state in _WORKING for state in session.invocations.values())
+
+
+def _quiet_since(session: Session) -> float:
+    """When this session was last attended, on the wall clock.
+
+    The later of its last command and the moment its last connection went
+    away, because both are ways of being unattended and the grace has to
+    run from whichever came last: a client that goes quiet and *then*
+    loses its socket has not been unattended for the length of its
+    silence, and one that is uploading over a socket nobody attached is
+    not unattended at all.
+    """
+    if session.disconnected_since is None:
+        return session.last_command_at
+    return max(session.last_command_at, session.disconnected_since)
 
 
 @dataclass
@@ -762,13 +841,18 @@ class SessionManager:
         ttl: float = DEFAULT_SESSION_TTL,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
         max_open: int = DEFAULT_MAX_OPEN_SESSIONS,
+        reconnect_grace: float = DEFAULT_RECONNECT_GRACE,
         seats: SeatQueue | None = None,
     ) -> None:
         self._sessions: dict[str, Session] = {}
         self.ttl = ttl
         self.idle_timeout = idle_timeout
         self.max_open = max_open
+        self.reconnect_grace = reconnect_grace
         self.seats = SeatQueue() if seats is None else seats
+        #: Sessions this manager has taken away and whose build
+        #: environment is still running. Drained by :meth:`take_released`.
+        self._released: list[str] = []
 
     @property
     def open_count(self) -> int:
@@ -857,6 +941,85 @@ class SessionManager:
                 session.state = STATE_CLOSED
             session.discard_context()
 
+    def attach(self, session: Session, connection: Any) -> None:
+        """Record that *connection* is speaking for this session.
+
+        Called for ``open-session`` and then by :meth:`require`, so it
+        covers every command that names the session — a client that
+        reconnected and simply carried on, without ``attach-session``,
+        is attached here too. Attachment is not permission and grants
+        nothing: the only question it answers is whether a session that
+        has gone quiet still has anybody behind it.
+        """
+        session.connections.add(connection)
+        session.disconnected_since = None
+
+    def detach(self, connection: Any, *, now: float | None = None) -> None:
+        """Drop a closed socket from every session it was speaking for."""
+        moment = time.time() if now is None else now
+        for session in self._sessions.values():
+            if connection not in session.connections:
+                continue
+            session.connections.discard(connection)
+            if not session.connections:
+                session.disconnected_since = moment
+
+    def take_released(self) -> tuple[str, ...]:
+        """The sessions this manager took away since the last call.
+
+        Admission runs inside one command and cannot wait for a container
+        to be removed, so it marks the session and this hands the id to
+        somebody who can do the asynchronous half. Drained by
+        ``open-session`` right after admission — including when admission
+        then refused it anyway, which is a real case: a slot freed by a
+        walk-in belongs to the head of the queue — and by the sweep,
+        which is the backstop for every other path.
+        """
+        released, self._released = tuple(self._released), []
+        return released
+
+    def _handover_ready(self, session: Session, now: float) -> bool:
+        """Whether this session may be taken away for a waiting client.
+
+        Four conditions, and the last two are the promises being kept.
+        **Nothing running**: work is not idleness, so a detached build
+        keeps its session exactly as the idle timeout does. **Nobody
+        attached**: a client on the socket owns its session however long
+        it thinks, which is the whole of the dev profile. Then a lease
+        that has not run out — a session past it belongs to the sweep,
+        which has the right reason for it — and the reconnect grace.
+        """
+        if session.state != STATE_OPEN:
+            return False
+        if _lease_over(session, now) is not None:
+            return False
+        if session.connections or _is_working(session):
+            return False
+        return now >= _quiet_since(session) + self.reconnect_grace
+
+    def _hand_over(self, wanted: int) -> tuple[str, ...]:
+        """Take up to *wanted* unattended sessions away. Longest quiet first.
+
+        Called only from admission and only when the caller would
+        otherwise be refused, so an idle session is never taken while the
+        server has room for both. The directory goes with it, here and
+        now, for the reason :meth:`reap` gives: it holds a device's
+        commissioning credentials.
+        """
+        now = time.time()
+        ready = sorted(
+            (session for session in self._sessions.values() if self._handover_ready(session, now)),
+            key=_quiet_since,
+        )
+        taken: list[str] = []
+        for session in ready[:wanted]:
+            session.state = STATE_CLOSED
+            session.reaped = GONE_HANDOVER
+            session.discard_context()
+            self._released.append(session.id)
+            taken.append(session.id)
+        return tuple(taken)
+
     def _admit(self, seat: str | None) -> None:
         """Let this caller through, or refuse it with a turn to come back.
 
@@ -880,6 +1043,16 @@ class SessionManager:
         position = self.seats.position(seat)
 
         free = self.max_open - self.open_count
+        # Somebody wants in and there is no room: before refusing, look
+        # for a session that nobody is attached to and that has nothing
+        # running. Only here, because scarcity is the whole justification
+        # — with a free slot there is no client whose wait an idle
+        # session is paying for, and taking it would be a lease this
+        # server had promised and then broken for nothing.
+        short_by = 1 + self.seats.reserved_against(position) - free
+        if short_by > 0:
+            self._hand_over(short_by)
+            free = self.max_open - self.open_count
         if free - self.seats.reserved_against(position) >= 1:
             if position is not None:
                 self.seats.release(position)
@@ -972,8 +1145,15 @@ class SessionManager:
         self._sessions[session.id] = session
         return session
 
-    def require(self, session_id: str) -> Session:
-        """The open session called *session_id*, or a typed refusal."""
+    def require(self, session_id: str, connection: Any = None) -> Session:
+        """The open session called *session_id*, or a typed refusal.
+
+        *connection* is the socket the command came in on, and passing it
+        is what keeps "a client is attached" true for a client that
+        reconnected without ``attach-session`` (:meth:`attach`). It is
+        optional so that a caller with no socket — a test, or a future
+        internal one — can still ask.
+        """
         session = self._sessions.get(session_id)
         if session is None:
             raise SessionError(
@@ -996,7 +1176,7 @@ class SessionManager:
         if session.reaped is not None:
             raise SessionError(
                 "session.expired",
-                f'Session "{session_id}" outlived its {session.reaped} and was reaped.',
+                gone_message(session_id, session.reaped),
                 session_id=session_id,
             )
         if session.state != STATE_OPEN:
@@ -1005,6 +1185,8 @@ class SessionManager:
                 f'Session "{session_id}" is closed.',
                 session_id=session_id,
             )
+        if connection is not None:
+            self.attach(session, connection)
         session.touch()
         return session
 
@@ -1230,12 +1412,24 @@ async def open_session(state: Any, connection: Any, command: Command) -> dict[st
     # the door, never a downstream failure".
     profile = command.optional_str("profile", "oneshot")
     context_format = command.optional_int("context_format", CONTEXT_FORMAT_MAX)
-    session = state.sessions.open(
-        profile="oneshot" if profile is None else profile,
-        protocol_version=protocol_version,
-        context_format=CONTEXT_FORMAT_MAX if context_format is None else context_format,
-        seat=command.optional_str("seat", None),
-    )
+    try:
+        session = state.sessions.open(
+            profile="oneshot" if profile is None else profile,
+            protocol_version=protocol_version,
+            context_format=CONTEXT_FORMAT_MAX if context_format is None else context_format,
+            seat=command.optional_str("seat", None),
+        )
+        # Attached from its first breath, so the grace can never run on a
+        # session whose client is right here.
+        state.sessions.attach(session, connection)
+    finally:
+        # Admission may have made room by taking unattended sessions
+        # away, and it can only mark them: removing a container is
+        # asynchronous and admission is not. In a `finally` because a
+        # refused caller can free a slot too — for the head of the queue,
+        # which the reservation holds it for.
+        for released in state.sessions.take_released():
+            await state.backend.release(released, reaped=GONE_HANDOVER)
     return {
         "session": session.to_dict(),
         "lease": session.lease_dict(),
@@ -1446,7 +1640,7 @@ async def send_context(state: Any, connection: Any, command: Command) -> dict[st
     fails wholesale rather than partially, because a context is one
     artifact and half of one has no meaning.
     """
-    session = state.sessions.require(command.require_str("session_id"))
+    session = state.sessions.require(command.require_str("session_id"), connection)
     session.require_workable()
     session.require_writable_context()
     with _context_work(session):
@@ -1650,7 +1844,7 @@ async def extend_context(state: Any, connection: Any, command: Command) -> dict[
     ``close-session`` already follows — and the answer says how many of
     the named paths existed, so a typo is still visible.
     """
-    session = state.sessions.require(command.require_str("session_id"))
+    session = state.sessions.require(command.require_str("session_id"), connection)
     session.require_workable()
     session.require_writable_context()
     paths = _require_paths(session)
@@ -1897,7 +2091,7 @@ async def lock_context(state: Any, connection: Any, command: Command) -> dict[st
     extension must not begin applying to a context that was locked while
     it waited.
     """
-    session = state.sessions.require(command.require_str("session_id"))
+    session = state.sessions.require(command.require_str("session_id"), connection)
     session.require_workable()
     session.require_writable_context()
     with _context_work(session):
@@ -1960,7 +2154,7 @@ async def _start_working(
     ``invocation.finished`` (contract §8, numbered like every program
     event) is a different frame that arrives before it (E58).
     """
-    session = state.sessions.require(command.require_str("session_id"))
+    session = state.sessions.require(command.require_str("session_id"), connection)
     session.require_workable()
     session.require_locked_context()
     paths = _require_paths(session)
@@ -2113,7 +2307,7 @@ async def cancel(state: Any, connection: Any, command: Command) -> dict[str, Any
     acknowledgement promises is :func:`_signal_cancellation`'s, which
     the container backend fills in.
     """
-    session = state.sessions.require(command.require_str("session_id"))
+    session = state.sessions.require(command.require_str("session_id"), connection)
     invocation_id = command.require_str("invocation_id")
     found = session.invocations.get(invocation_id)
     if found is None:
@@ -2204,7 +2398,7 @@ async def get_artifact(state: Any, connection: Any, command: Command) -> None:
     matters most: that is exactly the moment its owner wants the logs
     and partial artifacts that explain what happened.
     """
-    session = state.sessions.require(command.require_str("session_id"))
+    session = state.sessions.require(command.require_str("session_id"), connection)
     invocation_id = command.require_str("invocation_id")
     if invocation_id not in session.invocations:
         raise SessionError(
@@ -2320,7 +2514,7 @@ async def attach_session(state: Any, connection: Any, command: Command) -> dict[
     consumers must not parse for machine decisions, and its own counter
     is what tells a client it missed lines.
     """
-    session = state.sessions.require(command.require_str("session_id"))
+    session = state.sessions.require(command.require_str("session_id"), connection)
     replayed = 0
     boundary: tuple[str, int] | None = None
     invocation_id = command.optional_str("invocation_id")

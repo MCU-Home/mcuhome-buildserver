@@ -107,6 +107,7 @@ class ServerState:
             ttl=sessions.ttl_for(self.config.build_deadline_seconds),
             idle_timeout=self.config.session_idle_timeout_seconds,
             max_open=self.config.max_sessions,
+            reconnect_grace=self.config.reconnect_grace_seconds,
             seats=sessions.SeatQueue(
                 retry_seconds=self.config.seat_retry_seconds,
                 retry_max_seconds=self.config.seat_retry_max_seconds,
@@ -150,16 +151,22 @@ async def _reap_loop(state: ServerState) -> None:
         await asyncio.sleep(sessions.DEFAULT_REAP_INTERVAL)
         try:
             reaped = state.sessions.reap()
+            # Whatever admission handed to a waiting client goes the same
+            # way. Admission drains this itself, right after it decides;
+            # the sweep is the backstop, and all it changes is how long a
+            # handed-over session's build environment may still be
+            # running when nobody opens a session afterwards.
+            released = state.sessions.take_released()
             # The build environment goes with the directory, and for the
             # same reason: the directory is what it works in — the
             # container's mounts in one profile, a child process's own
             # paths in the other — so anything left running against a
             # deleted tree is the one state neither half can recover
             # from.
-            for session_id in reaped:
-                # The half of the lease that ran out travels with it: a
-                # client still listening is owed the reason its build
-                # stopped, and this is the only place that knows it.
+            for session_id in (*reaped, *released):
+                # Why it is gone travels with it: a client still listening
+                # is owed the reason its build stopped, and this is the
+                # only place that knows it.
                 await state.backend.release(
                     session_id, reaped=state.sessions.reaped_reason(session_id)
                 )
@@ -168,6 +175,12 @@ async def _reap_loop(state: ServerState) -> None:
         else:
             if reaped:
                 logger.info("reaped %d expired session(s): %s", len(reaped), ", ".join(reaped))
+            if released:
+                logger.info(
+                    "released %d unattended session(s) for waiting clients: %s",
+                    len(released),
+                    ", ".join(released),
+                )
 
 
 async def _start_reaper(app: web.Application) -> None:

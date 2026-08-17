@@ -10,6 +10,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A session nobody is attached to is handed to a client that is
+  waiting.** Before admission refuses for want of capacity, it releases
+  a session that has no live connection naming it, nothing running, and
+  has been quiet for `--reconnect-grace-seconds` (default 60) — with its
+  build environment and directory. Measured with `--max-sessions 1`: a
+  client killed without closing its session held the server for the full
+  idle timeout, because connection loss is never abandonment. That rule
+  stands; it stops being unconditional. Only under scarcity — with a
+  free slot nothing is taken — and only for sessions nobody is driving:
+  any command counts as attached, not `attach-session` alone, so a long
+  upload on a fresh socket is safe, and a detached build is work rather
+  than idleness. Nothing new on the wire and no event: a session with
+  nobody attached has nobody to tell, and its client hears
+  `session.expired` on its next command with a sentence that says
+  another client was waiting.
+
 - **Seat tokens: a busy server hands out turns instead of running a
   lottery.** A client refused for want of capacity now gets a seat token
   and the seconds to wait in the details of `session.limit-exceeded`,

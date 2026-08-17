@@ -863,6 +863,28 @@ def load_config(
             f"({', '.join(BACKEND_PROFILES)})."
         )
 
+    # The `subprocess` profile serves one session at a time, and that is
+    # not advice: this profile *is* the host, so concurrent sessions
+    # compete for one machine's memory with nothing between them
+    # (contract §1.2: "no per-session resource limits"), and the same
+    # serialization is what lets its build area have one fixed path.
+    #
+    # An operator who names the profile has said all that is needed —
+    # requiring a second flag to make the server start at all would be a
+    # ceremony for a number with one legal value. Naming a different one
+    # is refused rather than clamped, because a server that ran at 1
+    # while its operator configured 4 would be answering a question
+    # nobody could see it had answered.
+    if backend_profile == "subprocess":
+        stated = limits.get("max_sessions")
+        if stated is not None and stated > 1:
+            raise SystemExit(
+                f"--max-sessions {stated} does not go with --backend-profile subprocess: "
+                "that profile is the host it builds on, so it serves one session at a "
+                "time. Leave --max-sessions out and it is 1."
+            )
+        limits["max_sessions"] = 1
+
     config = Config(
         host=args.host or env.get(ENV_PREFIX + "HOST") or DEFAULT_HOST,
         port=args.port or _env_int(env, "PORT") or DEFAULT_PORT,

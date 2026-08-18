@@ -317,6 +317,24 @@ operator's own list either way, and within it a pinned digest names
 exactly one set of bytes. A server whose images an operator places
 deliberately switches fetching off; the allowlist does not change.
 
+A fetch happens inside `send-context` and takes minutes, so docker's own
+layer counts are relayed while it runs, as `environment.pulling` events
+carrying the line verbatim:
+
+```jsonc
+{"type": "event", "event": "environment.pulling",
+ "session_id": "s-…", "line": "zephyr-4.4.0-r10: Pulling from mcu-home/build-container"}
+```
+
+They are droppable like the build log, and deliberately neither numbered
+nor replayed: the events file is an *invocation's* replay buffer, and a
+fetch belongs to no invocation — it happens before the session has a
+build environment at all, which is exactly why it is worth watching.
+Nothing depends on having seen one; a fetch that fails refuses with
+`version.builder-unfetchable`, which is **retryable**, while a server
+that does not fetch refuses with `version.builder-unsatisfiable`, which
+is not.
+
 The `subprocess` profile has no allowlist and needs none: it starts no
 image, honours no pin, and answers with the environment it runs in
 (below).

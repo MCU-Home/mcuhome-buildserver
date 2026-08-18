@@ -131,6 +131,7 @@ from mcuhome_buildserver.backend import (
 from mcuhome_buildserver.config import Config
 from mcuhome_buildserver.contextstore import ContextPins, SessionPaths, model_zephyr_line
 from mcuhome_buildserver.errors import SessionError
+from mcuhome_buildserver.processes import LineSink
 from mcuhome_buildserver.program import Program, program_argv
 
 __all__ = ["HostProfile", "SubprocessBackend", "served_lines"]
@@ -280,8 +281,15 @@ class SubprocessBackend(SessionBackend):
             for line in served_lines(profile)
         ]
 
-    async def resolve_image(self, pins: ContextPins, context: Path) -> HostProfile:
+    async def resolve_image(
+        self, pins: ContextPins, context: Path, *, on_progress: LineSink | None = None
+    ) -> HostProfile:
         """The build environment for a context's Zephyr line — or the refusal.
+
+        *on_progress* is ignored here and the signature carries it
+        anyway: there is nothing to fetch when the host *is* the build
+        environment, and a profile that refused the argument would make
+        every caller ask which profile it has.
 
         Called from ``send-context``, the same place the container
         backend resolves an image, and it answers the same question with

@@ -94,6 +94,7 @@ from mcuhome_buildserver.abi import Artifact, TreeEntry
 from mcuhome_buildserver.config import Config
 from mcuhome_buildserver.contextstore import ContextPins, SessionPaths, derive_patch_layers
 from mcuhome_buildserver.errors import SessionError
+from mcuhome_buildserver.processes import LineSink
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -426,8 +427,15 @@ class SessionBackend:
         """The build environments this server can serve, for ``capabilities``."""
         raise NotImplementedError
 
-    async def resolve_image(self, pins: ContextPins, context: Path) -> ProgramProfile:
+    async def resolve_image(
+        self, pins: ContextPins, context: Path, *, on_progress: LineSink | None = None
+    ) -> ProgramProfile:
         """The environment this context is built in, or a refusal.
+
+        *on_progress* is offered to every profile and used by the one
+        that can fetch: a container backend relays the pull's output
+        through it, and a profile that has nothing to fetch ignores it
+        rather than making the caller ask which kind it is talking to.
 
         *context* is the directory the bytes landed in. A container
         profile answers out of *pins* alone — the pin is a digest and
@@ -1238,8 +1246,10 @@ class ContainerBackend(SessionBackend):
             return []
         return [facts.to_wire() for facts in found]
 
-    async def resolve_image(self, pins: ContextPins, context: Path) -> ImageProfile:
-        """The image the context pins, found on this host, described and gated.
+    async def resolve_image(
+        self, pins: ContextPins, context: Path, *, on_progress: LineSink | None = None
+    ) -> ImageProfile:
+        """The image the context pins, found or fetched, described and gated.
 
         Called from ``send-context``, which is where ADR 0019's
         amendment puts container discovery: "``send-context`` answers
@@ -1248,17 +1258,26 @@ class ContainerBackend(SessionBackend):
         pins in hand does the backend know *which* container serves the
         session.
 
-        **The client chose; this server finds or refuses.** The context
-        names one image, pinned to a digest, and it is hashed into the
-        context's identity — so an image "of the same line" is not a
-        substitute for it, and there is nothing here to select. Nothing
-        is pulled either, so an image this host does not have is a final
-        answer rather than a deferred fetch.
+        **The client chose; this server finds, fetches or refuses.** The
+        context names one image, pinned to a digest, and it is hashed
+        into the context's identity — so an image "of the same line" is
+        not a substitute for it, and there is nothing here to select.
+        What there is, is the question of whether this host already has
+        those bytes: with fetching allowed (the default) a miss is a
+        pull, because a digest names exactly one set of bytes and
+        fetching them decides nothing. What *is* a decision — may this
+        server run images from that repository at all — was settled
+        before the first ``docker`` command, and independently of the
+        switch.
 
-        Three gates, in the order that makes each one's refusal legible:
-        the runtime is there; this host has the pinned image;
-        ``describe`` answers, answers conformingly, and says something
-        this server can actually drive.
+        Four gates, in the order that makes each one's refusal legible:
+        the repository is allowed; the runtime is there; this host has
+        the pinned image, or can get it; ``describe`` answers, answers
+        conformingly, and says something this server can actually drive.
+
+        *on_progress* receives the pull's own output line by line. A
+        fetch is minutes long and a client that asked for a session is
+        entitled to see why it is waiting.
         """
         del context  # a digest answers itself; nothing is read off the bytes
         # First, and before any `docker` command names this image: every
@@ -1271,7 +1290,7 @@ class ContainerBackend(SessionBackend):
             what="the context",
         )
         await self.docker.require_runtime()
-        facts = _find_pinned_image(await self.docker.inventory(), pin=pins.build_environment)
+        facts = await self._present(pins.build_environment, on_progress=on_progress)
         # And again on what the digest actually found. An image is
         # matched by digest alone, so a context may name a listed
         # repository while its pin belongs to an image from somewhere
@@ -1299,6 +1318,33 @@ class ContainerBackend(SessionBackend):
         profile = await self._describe(facts)
         self._images[key] = profile
         return profile
+
+    async def _present(
+        self, pin: EnvironmentPin, *, on_progress: LineSink | None
+    ) -> container.ImageFacts:
+        """The pinned image, on this host — fetched first if it is not.
+
+        The inventory is asked twice on the fetching path, and the
+        second answer is the one that counts: a pull that reports
+        success and still leaves nothing this server recognizes is an
+        image without the contract label, which the inventory filters
+        out and which would otherwise become a confusing failure two
+        gates later.
+        """
+        inventory = await self.docker.inventory()
+        found = _pinned_image_in(inventory, pin=pin)
+        if found is not None:
+            return found
+        if not self.config.auto_pull:
+            raise _no_such_environment(inventory, pin=pin, fetched=False)
+        logger.info("fetching build environment %s", pin.reference)
+        pulled = await self.docker.pull(
+            pin.reference, on_line=on_progress if on_progress is not None else lambda _line: None
+        )
+        found = _pinned_image_in(await self.docker.inventory(), pin=pin) if pulled else None
+        if found is None:
+            raise _no_such_environment(await self.docker.inventory(), pin=pin, fetched=True)
+        return found
 
     async def _describe(self, facts: container.ImageFacts) -> ImageProfile:
         """Ask the image what it is, and check the labels against it.
@@ -1759,9 +1805,9 @@ def _wire_status(outcome: abi.InvocationOutcome) -> str:
     return abi.STATUS_FAILURE
 
 
-def _find_pinned_image(
+def _pinned_image_in(
     inventory: tuple[container.ImageFacts, ...], *, pin: EnvironmentPin
-) -> container.ImageFacts:
+) -> container.ImageFacts | None:
     """The image this context is pinned to, out of what this host has.
 
     Matched on the **digest and nothing else**. A reference is a name and
@@ -1785,18 +1831,43 @@ def _find_pinned_image(
     for facts in inventory:
         if pin.digest in (facts.digest, facts.image_id):
             return facts
-    # **What this host could build**, so the answer is actionable rather
-    # than only negative: every environment it has, named the way the
-    # client would have to name one. ADR 0019's amendment calls the field
-    # "the lines available"; under a pinned environment the equivalent
-    # fact is the set of environments, and a client cannot act on a line
-    # any more because a line is not what it sends.
+    return None
+
+
+def _no_such_environment(
+    inventory: tuple[container.ImageFacts, ...], *, pin: EnvironmentPin, fetched: bool
+) -> SessionError:
+    """This server will not be building that context, and why.
+
+    Two codes, because a client acts on them differently and
+    ``retryable`` is what says so. ``version.builder-unsatisfiable`` is
+    an operator's standing decision: the images here are placed by hand,
+    and nothing about waiting changes it. ``version.builder-unfetchable``
+    covers everything a pull can fail at — no network, a registry wanting
+    a login, a private repository, a digest nothing answers to, or bytes
+    that arrived carrying no contract label. Most of those come back, so
+    it is retryable; the reason itself is in the pull output the client
+    already watched.
+
+    Both name **what this host could build** instead, so the answer is
+    actionable rather than only negative: every environment it has,
+    spelled the way a client would have to pin one.
+    """
     offered = sorted({facts.reference for facts in inventory})
-    raise SessionError(
-        "version.builder-unsatisfiable",
-        f"This server does not have the build environment {pin.reference}. It builds "
-        "in the exact image a context pins and pulls nothing, so the image has to be "
-        "on this host before a context naming it can build.",
+    if not fetched:
+        return SessionError(
+            "version.builder-unsatisfiable",
+            f"This server does not have the build environment {pin.reference}, and it "
+            "does not fetch. Its build environments are placed by its operator, so a "
+            "context naming one it does not have cannot build here.",
+            required=pin.reference,
+            available=offered,
+        )
+    return SessionError(
+        "version.builder-unfetchable",
+        f"This server could not fetch the build environment {pin.reference}. The pull "
+        "output above says why; the usual reasons are no network, a registry that wants "
+        "a login, and a digest nothing answers to.",
         required=pin.reference,
         available=offered,
     )

@@ -24,7 +24,9 @@ from mcuhome_buildserver.app import ServerState, create_app
 from mcuhome_buildserver.config import Config
 from tests.conftest import (
     CONTEXT_YAML,
+    IMAGE,
     IMAGE_LABELS,
+    IMAGE_REFERENCE,
     IMAGE_REFERENCE_FORMAT3,
     auth,
     base_context,
@@ -116,21 +118,90 @@ async def test_send_context_answers_the_serving_container(client) -> None:
     assert serving["actions"] == ["describe", "verify", "build"]
 
 
-async def test_a_context_requiring_a_line_this_host_lacks_is_refused(client, docker) -> None:
-    """``version.builder-unsatisfiable``, at the moment the pins arrive.
+async def test_an_image_this_host_lacks_is_fetched(client, docker) -> None:
+    """A missing image is a fetch, not a refusal — the pin decided which bytes.
 
-    Format 3: the client pins the build environment with a full reference.
-    The server looks for the pinned image in its local inventory. If not
-    found, it is a final answer (not retryable) rather than a fetch this
-    server declined to make. Refusing at ``send-context`` is the useful
-    moment: the client can go to a server that serves the image, without
-    having paid for a lock.
+    The reference is pinned to a digest by the time it reaches the
+    runtime, so exactly one set of bytes answers to it and fetching them
+    settles nothing that was not already settled. What *may* be fetched
+    at all is the allowlist's answer and is not this switch's business.
+    """
+    fetched = {
+        "Id": "sha256:" + "f" * 64,
+        "RepoTags": [f"{IMAGE}:zephyr-4.4.0-r10"],
+        "RepoDigests": [IMAGE_REFERENCE],
+        "Config": {"Labels": dict(IMAGE_LABELS)},
+    }
+    docker.images.clear()
+    docker.listed = []
+    docker.pullable[IMAGE_REFERENCE_FORMAT3] = fetched
 
-    The details name both sides: the reference required (what the client
-    pinned) and the references this server actually has.
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        frame = await send_archive(ws, "send-context", session_id, base_context())
+
+    assert frame["type"] == "result", frame
+    assert docker.pulls == [IMAGE_REFERENCE_FORMAT3]
+
+
+async def test_the_client_watches_the_fetch_happen(client, docker) -> None:
+    """A 1.3 GB download is not something to do behind a silent command frame.
+
+    Docker's own layer counts are the progress report, relayed verbatim
+    as ``environment.pulling`` events while ``send-context`` is still in
+    flight.
     """
     docker.images.clear()
     docker.listed = []
+    docker.pullable[IMAGE_REFERENCE_FORMAT3] = {
+        "Id": "sha256:" + "f" * 64,
+        "RepoTags": [f"{IMAGE}:zephyr-4.4.0-r10"],
+        "RepoDigests": [IMAGE_REFERENCE],
+        "Config": {"Labels": dict(IMAGE_LABELS)},
+    }
+    frames: list[dict] = []
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        answer = await send_archive(ws, "send-context", session_id, base_context(), seen=frames)
+
+    progress = [frame for frame in frames if frame.get("event") == "environment.pulling"]
+    assert progress, frames
+    assert all(frame["session_id"] == session_id for frame in progress)
+    assert any("Downloaded" in frame["line"] for frame in progress)
+    assert answer["type"] == "result", answer
+
+
+async def test_a_fetch_that_fails_is_retryable_and_says_so(client, docker) -> None:
+    """No network, a registry wanting a login, a digest nothing answers to.
+
+    All of them come back, which is what ``retryable`` promises — and
+    the reason itself was already on the client's screen, because the
+    pull's own output was relayed while it happened.
+    """
+    docker.images.clear()
+    docker.listed = []
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        frame = await send_archive(ws, "send-context", session_id, base_context())
+
+    error = frame["error"]
+    assert error["code"] == "version.builder-unfetchable"
+    assert error["retryable"] is True
+    assert error["details"]["required"] == IMAGE_REFERENCE_FORMAT3
+
+
+async def test_a_server_that_does_not_fetch_refuses_without_trying(
+    aiohttp_client, config, docker
+) -> None:
+    """``--no-auto-pull``: the images here are placed by an operator.
+
+    Not retryable, because nothing about waiting changes an operator's
+    standing decision — and the refusal names what this host *does*
+    have, so the answer is actionable rather than only negative.
+    """
+    docker.images.clear()
+    docker.listed = []
+    client, _state = await serve(aiohttp_client, config, auto_pull=False)
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         frame = await send_archive(ws, "send-context", session_id, base_context())
@@ -138,52 +209,40 @@ async def test_a_context_requiring_a_line_this_host_lacks_is_refused(client, doc
     error = frame["error"]
     assert error["code"] == "version.builder-unsatisfiable"
     assert error["retryable"] is False
-    assert (
-        error["details"]["required"]
-        == f"ghcr.io/mcu-home/build-container:zephyr-4.4.0-r10@sha256:{'b' * 64}"
-    )
+    assert error["details"]["required"] == IMAGE_REFERENCE_FORMAT3
     assert error["details"]["available"] == []
+    assert docker.pulls == []
 
 
-async def test_a_context_requiring_another_line_than_the_inventory_serves(client, docker) -> None:
-    """Format 3: the client pins a specific image digest.
+async def test_another_release_of_the_same_repository_is_not_a_substitute(
+    aiohttp_client, config, docker
+) -> None:
+    """The digest is the identity, so a neighbouring release does not answer for it.
 
-    When this host has images of the same repository but with different
-    digests (different releases), and the pinned digest is not available,
-    the server refuses. The offered references travel in the details so the
-    client or operator can see what is actually available.
+    The refusal names both sides: the reference the client pinned, and
+    what this host actually has — which is the useful pair, because a
+    client can act on the second.
     """
-    # Clear all images and add only a different release
-    docker.images.clear()
-    docker.listed = []
-
     other_digest = "sha256:" + "e" * 64
-    other_tag = "zephyr-4.4.2-r1"
-    other_ref = f"ghcr.io/mcu-home/build-container:{other_tag}"
-    other_digest_ref = f"ghcr.io/mcu-home/build-container@{other_digest}"
-
-    docker.images[other_digest_ref] = {
+    other_reference = f"{IMAGE}:zephyr-4.4.2-r1"
+    docker.images.clear()
+    docker.images[other_reference] = {
         "Id": "sha256:" + "d" * 64,
-        "RepoTags": [other_ref],
-        "RepoDigests": [other_digest_ref],
+        "RepoTags": [other_reference],
+        "RepoDigests": [f"{IMAGE}@{other_digest}"],
         "Config": {"Labels": dict(IMAGE_LABELS)},
     }
-    docker.images[other_ref] = docker.images[other_digest_ref]
-    docker.listed = [other_ref]
+    docker.listed = [other_reference]
 
+    client, _state = await serve(aiohttp_client, config, auto_pull=False)
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         frame = await send_archive(ws, "send-context", session_id, base_context())
 
     error = frame["error"]
     assert error["code"] == "version.builder-unsatisfiable"
-    # The required field contains the full reference the client pinned (with tag and digest)
-    assert (
-        error["details"]["required"]
-        == f"ghcr.io/mcu-home/build-container:zephyr-4.4.0-r10@sha256:{'b' * 64}"
-    )
-    # Available should list what references the server has
-    assert len(error["details"]["available"]) > 0
+    assert error["details"]["required"] == IMAGE_REFERENCE_FORMAT3
+    assert error["details"]["available"] == [other_reference]
 
 
 async def test_a_container_runtime_that_is_down_is_retryable(client, docker) -> None:

@@ -84,7 +84,7 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -1668,10 +1668,12 @@ async def send_context(state: Any, connection: Any, command: Command) -> dict[st
             recheck_patch_policy(paths.context, frozenset(state.config.allowed_patch_layers))
             context_yaml_sha256 = sha256_file(entry)
             # The environment last, and inside the same guard: an image
-            # this host does not have makes the whole send-context a
+            # this host cannot get makes the whole send-context a
             # refusal, so the context goes with it rather than sitting in
             # a session that can never build.
-            image = await state.backend.resolve_image(pins, paths.context)
+            image = await state.backend.resolve_image(
+                pins, paths.context, on_progress=_pulling(connection, session.id)
+            )
         except BaseException:
             session.discard_context()
             raise
@@ -1685,6 +1687,42 @@ async def send_context(state: Any, connection: Any, command: Command) -> dict[st
         "pins": pins.to_wire(),
         "container": image.to_wire(),
     }
+
+
+def _pulling(connection: Any, session_id: str) -> Callable[[str], None]:
+    """Relay a fetch's progress while ``send-context`` is still in flight.
+
+    A build environment is over a gigabyte, so a fetch is minutes of
+    silence on a command frame the client is blocked on. Docker's own
+    layer counts and percentages are the progress report — inventing a
+    spinner over them would say strictly less — and they go out as
+    ``environment.pulling`` events carrying the line verbatim.
+
+    **Offered, not sent.** It is the same rule the build log follows and
+    for the same reason: this runs in the middle of reading a pull's
+    pipe, so it must not await, and a client too slow to keep up loses
+    progress lines rather than stalling the fetch. The event is
+    droppable by construction — it is neither an answer nor the verdict
+    — and nothing depends on having seen it: the refusal that follows a
+    failed pull names the image on its own.
+
+    It is deliberately not numbered and not replayed. The events file is
+    an *invocation's* replay buffer, and a fetch belongs to no
+    invocation: it happens before the session has a build environment at
+    all, which is exactly why it is worth watching.
+    """
+
+    def relay(line: str) -> None:
+        connection.offer(
+            {
+                "type": protocol.TYPE_EVENT,
+                "event": "environment.pulling",
+                "session_id": session_id,
+                "line": line,
+            }
+        )
+
+    return relay
 
 
 @contextlib.contextmanager

@@ -214,6 +214,13 @@ class FakeDocker:
     #: What one invocation does. Replaced by tests that want a failure,
     #: a crash, a hang or a non-conforming answer.
     run_program: Any = None
+    #: References this host could fetch, mapped to the ``image inspect``
+    #: object a successful pull would leave behind. Empty by default:
+    #: most tests are about an image that is here or one that is not,
+    #: and a fake that fetched anything on request would hide the
+    #: difference.
+    pullable: dict[str, dict[str, Any]] = field(default_factory=dict)
+    pulls: list[str] = field(default_factory=list)
     containers: list[str] = field(default_factory=list)
     #: ``container target -> host source``, from the mounts of the
     #: ``docker run`` that created the session's container.
@@ -349,10 +356,36 @@ class FakeDocker:
 
     async def spawn(self, argv, *, on_line):
         self.calls.append(list(argv))
+        if argv[1:2] == ["pull"]:
+            return self._pull(argv[-1], on_line)
         action, request_path = argv[-2], self.host(argv[-1])
         request = json.loads(request_path.read_text())
         self.invocations.append(Invocation(action=action, argv=list(argv), request=request))
         return self.run_program(action, self.host_view(request), on_line)
+
+    def _pull(self, reference: str, on_line) -> FakeProcess:
+        """``docker pull <reference>``, as scripted by :attr:`pullable`.
+
+        A pull that succeeds puts the image in :attr:`images` and in
+        :attr:`listed`, which is what makes the second inventory find
+        it — the same two places a real pull would show up in. A pull
+        that is not scripted fails the way an unreachable registry does,
+        with its reason on the log, because that is the case every test
+        of a *missing* image is actually about.
+        """
+        self.pulls.append(reference)
+        inspected = self.pullable.get(reference)
+        if inspected is None:
+            on_line(f"Error response from daemon: manifest for {reference} not found")
+            return FakeProcess(1)
+        on_line(f"{reference.rpartition('@')[2][:12]}: Pulling from somewhere")
+        on_line("Status: Downloaded newer image")
+        tag = inspected["RepoTags"][0]
+        self.images[tag] = inspected
+        self.images[reference] = inspected
+        if tag not in self.listed:
+            self.listed.append(tag)
+        return FakeProcess(0)
 
     # -- the throwaway describe container --------------------------
 
@@ -699,7 +732,9 @@ def base_context(**files: bytes) -> bytes:
     return make_archive({"context.yaml": CONTEXT_YAML.encode(), **files})
 
 
-async def send_archive(ws, verb: str, session_id: str, archive: bytes, **payload) -> dict:
+async def send_archive(
+    ws, verb: str, session_id: str, archive: bytes, *, seen: list | None = None, **payload
+) -> dict:
     """Announce *archive*, push it as binary frames, return the answer.
 
     The two halves of E41's wire shape in one helper, because every test
@@ -707,6 +742,10 @@ async def send_archive(ws, verb: str, session_id: str, archive: bytes, **payload
     on its own. The chunking is deliberate — several frames per archive,
     since "multiple frames allowed" is part of the decided shape and a
     receiver that only ever saw one would not be exercised.
+
+    *seen* collects every frame read on the way, for the tests that are
+    about what arrives **while** a verb is still in flight rather than
+    about its answer.
     """
     frame_id = f"u-{verb}"
     await ws.send_json(
@@ -724,5 +763,7 @@ async def send_archive(ws, verb: str, session_id: str, archive: bytes, **payload
         await ws.send_bytes(archive[start : start + 64])
     while True:
         frame = await ws.receive_json(timeout=15)
+        if seen is not None:
+            seen.append(frame)
         if frame.get("id") == frame_id:
             return frame

@@ -307,8 +307,15 @@ REGISTRY: dict[str, ErrorCode] = _seed(
     ErrorCode(
         "version.builder-unsatisfiable",
         retryable=False,
-        summary="no build container this server serves carries the Zephyr line the context "
-        "requires; details name the required line and the lines available",
+        summary="this server does not have the build environment the context pins and will "
+        "not fetch it; details name the pin and the environments available",
+    ),
+    ErrorCode(
+        "version.builder-unfetchable",
+        retryable=True,
+        summary="the pinned build environment is not here and the fetch for it failed; "
+        "retryable because its usual causes — no network, a registry wanting a login — "
+        "come back",
     ),
     # invocation.* — one invocation of the build container's program,
     # addressed by the server-assigned invocation id (ADR 0019 decision

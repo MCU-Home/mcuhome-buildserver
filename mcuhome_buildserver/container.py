@@ -38,11 +38,14 @@ dies ten seconds in with somebody else's error text does not tell them
 apart. The first two are one wire code here —
 ``builder.runtime-unavailable``, retryable, because a daemon that is
 down comes back — and the third is ``version.builder-unavailable``,
-which is not retryable because the image this server does not have is
-not going to appear on its own. Contract v1 for this server pulls
-nothing (product-owner decision): the digest pin is resolved against
-the **local** inventory, so "not here" is a final answer rather than a
-fetch this server declined to make.
+which is not retryable once this server has decided it will not have
+that image: the pin is resolved against the **local** inventory, and
+when :attr:`~mcuhome_buildserver.config.Config.auto_pull` allows it
+(the default) a miss becomes a :meth:`Docker.pull` rather than a
+refusal. What never depends on that switch is *which* images may run at
+all — that is the allowlist
+(:mod:`mcuhome_buildserver.environments`), checked before any command
+here names the image.
 
 **What the composed argv says, line by line**, is in
 :func:`session_run_command`. Two of its flags are the contract's and the
@@ -310,6 +313,29 @@ class Docker:
         """
         found = await self._inspect(reference)
         return found[0] if found else None
+
+    async def pull(self, reference: str, *, on_line: LineSink) -> bool:
+        """Fetch *reference*, forwarding docker's own progress line by line.
+
+        Spawned rather than run, because a pull is minutes long and a
+        client watching one wants to see it happen; docker's layer
+        counts and percentages are that report, and inventing a spinner
+        over them would say less.
+
+        *reference* is pinned to a digest by the time it reaches here —
+        that is what makes fetching a mechanical step rather than a
+        decision: exactly one set of bytes answers to it, and either
+        they arrive or they do not. Whether this server may run them at
+        all was settled before the pull
+        (:mod:`mcuhome_buildserver.environments`).
+
+        ``False`` for every failure — no runtime, no network, a registry
+        that wants a login, a digest nothing answers to — because the
+        caller's next move is the same in each case and it names the
+        image rather than the mechanism.
+        """
+        process = await self._spawn([self.program, "pull", reference], on_line=on_line)
+        return await process.wait() == 0
 
     async def inventory(self) -> tuple[ImageFacts, ...]:
         """Every local image that claims contract conformance.

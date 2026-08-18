@@ -22,9 +22,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whether a stranger's image may execute. Checked twice, against the
   reference the context states and against the repository its digest
   actually found. Refusal: `policy.environment-denied`.
-- `--no-auto-pull`, for a server whose images an operator places
-  deliberately. Fetching is the default: inside the allowlist a pinned
-  digest names exactly one set of bytes.
+- **A missing build environment is a fetch, not a refusal.** Inside the
+  allowlist a pinned digest names exactly one set of bytes, so fetching
+  them decides nothing that was not already decided; docker's own layer
+  counts are relayed while it happens as `environment.pulling` events,
+  droppable like the build log and belonging to no invocation.
+  `--no-auto-pull` is the server whose images an operator places
+  deliberately — an air-gapped one, or one that will not spend a
+  gigabyte of transfer on a client's say-so.
+- `version.builder-unfetchable`, **retryable**: the pinned environment is
+  not here and the fetch for it failed. Its causes — no network, a
+  registry wanting a login — come back, which
+  `version.builder-unsatisfiable` cannot say, and that code now means
+  only the standing decision not to fetch.
 
 ### Changed
 

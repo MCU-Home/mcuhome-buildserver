@@ -41,6 +41,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **What a context can make this server execute, asserted from the
+  outside** (`tests/test_execution.py`). Putting a build library inside a
+  network service raises the question, and "by design it cannot" is not a
+  test: every field of a context is planted with a marker and a whole
+  build is run, then every argv is checked. The answer the tests pin is
+  that the only executable a context selects is an allowlisted build
+  environment, the program is always the operator's `--docker`, and
+  nothing a context *contains* reaches a command line. Mutation-checked:
+  passing one model field into a container label turns the first one red.
 - **An allowlist of build-environment repositories** (`--allow-environment`,
   default `ghcr.io/mcu-home/build-container`), always enforced and
   independent of whether fetching is switched on. A context's environment

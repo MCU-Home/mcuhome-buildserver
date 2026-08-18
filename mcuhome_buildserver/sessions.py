@@ -2485,7 +2485,7 @@ async def get_artifact(state: Any, connection: Any, command: Command) -> None:
                         "session_id": session.id,
                         "invocation_id": invocation_id,
                         "archive": {"size": delivery.size, "sha256": delivery.sha256},
-                        "artifacts": [entry.to_wire() for entry in delivery.members],
+                        "artifacts": [entry.to_dict() for entry in delivery.members],
                     },
                 )
             )

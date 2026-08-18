@@ -76,8 +76,9 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from mcuhome.model import containerpaths
 from mcuhome.model.context import EnvironmentPin
+from mcuhome.model.sdkindex import SDK_PACKAGE_NAME
+from mcuhome.workbench import api as workbench
 
 from mcuhome_buildserver import (
     abi,
@@ -309,6 +310,12 @@ class SessionRuntime:
     trees: dict[str, TreeEntry]
     patched_layers: tuple[str, ...]
     container_id: str | None = None
+    #: The ``container`` profile's build environment, which is the
+    #: workbench's and not this server's: it holds the container, the
+    #: session's ``work`` and the trees, and it is what an invocation is
+    #: prepared and run against. ``None`` in the ``subprocess`` profile,
+    #: which drives its own child.
+    environment: Any = None
     ccache: TreeEntry | None = None
     #: One invocation at a time per ``work`` (§9.1). The program cannot
     #: check it, so it is a backend duty; this flag is the whole of it.
@@ -338,6 +345,14 @@ class InvocationRecord:
     #: been applied".
     patched_layers: tuple[str, ...] = ()
     started_at: float = field(default_factory=time.monotonic)
+    #: What the orchestrator judged, in the ``container`` profile, kept
+    #: between :meth:`ContainerBackend._supervise` and its ``_collect``.
+    local_outcome: Any = None
+    #: The workbench invocation this record stands for, in the
+    #: ``container`` profile. It owns the request document, the sentinel
+    #: and the judgement; this record owns the id, the wire and the
+    #: replay. ``None`` in the ``subprocess`` profile.
+    invocation: Any = None
     #: Filled when the invocation ends. Until then the artifact list is
     #: empty, which is the truthful answer to ``get-artifact``: nothing
     #: has been declared, so nothing has been verified.
@@ -391,13 +406,28 @@ class SessionBackend:
     onto the program", and the two duties that *are* profile-dependent —
     network isolation and per-session resource limits — are not on it.
 
-    A subclass supplies six things and nothing else: what it can serve
-    (:meth:`inventory`), which environment answers a context's
-    requirement (:meth:`resolve_image`), how the session's environment is
-    materialized (:meth:`_materialize`), how one invocation of the
-    program is started (:meth:`_start`), how the environment is reaped
-    (:meth:`_release_runtime`), and how the environment spells a path
-    this server owns (:meth:`_inside`).
+    A subclass supplies what it can serve (:meth:`inventory`), which
+    environment answers a context's requirement (:meth:`resolve_image`),
+    how an invocation is prepared (:meth:`_prepare_invocation`) and
+    driven (:meth:`_supervise`, :meth:`_collect`), and how the
+    environment is reaped (:meth:`_release_runtime`).
+
+    **The two profiles no longer share the driving half, and that is
+    deliberate.** The ``container`` profile hands a session's build
+    environment to the workbench's orchestrator — the same object a
+    local build gets — so everything below :meth:`_prepare_invocation`
+    is that package's there: the request document, the mounts, the
+    liveness ladder, §5.3's judgement. What is left in *this* class is
+    the ``subprocess`` profile's own driving (:meth:`_materialize`,
+    :meth:`_start`, :meth:`_inside`, :meth:`_document`) together with
+    everything that is about a *session* rather than a build, which both
+    profiles still share: the record, the audience, the verdict frame,
+    the lease.
+
+    That asymmetry lasts exactly as long as the ``subprocess`` profile
+    does. It is not a container, so it falls out of the container
+    contract altogether; when it becomes an execution the workbench
+    knows about, the rest of this class goes with it.
     """
 
     #: The backend profile this server declares at ``open-session``
@@ -674,9 +704,9 @@ class SessionBackend:
                 "invocation.verdict event."
             )
 
-        record = self._prepare(session, runtime, action=action, context_id=context_id)
-        document = self._document(runtime, record, mode=mode)
-        abi.write_request(document, record.request)
+        record = self._prepare_invocation(
+            session, runtime, action=action, context_id=context_id, mode=mode
+        )
         runtime.busy = True
         self.attach(session.id, connection)
         task = asyncio.create_task(
@@ -684,6 +714,28 @@ class SessionBackend:
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        return record
+
+    def _prepare_invocation(
+        self,
+        session: Any,
+        runtime: SessionRuntime,
+        *,
+        action: str,
+        context_id: str,
+        mode: str | None,
+    ) -> InvocationRecord:
+        """One invocation's directory, request document and record.
+
+        A profile hook because the two profiles no longer write the
+        request document with the same code: the ``container`` profile
+        has the workbench prepare it — the same code a local build uses —
+        while this one still composes it here. Both answer with a record,
+        because the id, the wire and the replay are this server's either
+        way.
+        """
+        record = self._prepare(session, runtime, action=action, context_id=context_id)
+        abi.write_request(self._document(runtime, record, mode=mode), record.request)
         return record
 
     def _prepare(
@@ -980,7 +1032,7 @@ class SessionBackend:
             "action": record.action,
             "status": status,
             "context": record.context_id,
-            "artifacts": [entry.to_wire() for entry in outcome.artifacts],
+            "artifacts": [entry.to_dict() for entry in outcome.artifacts],
         }
         if outcome.violation is not None:
             payload["contract_violation"] = outcome.violation
@@ -1208,15 +1260,38 @@ class SessionBackend:
 
 
 class ContainerBackend(SessionBackend):
-    """Everything one build-server process knows about containers."""
+    """Everything one build-server process knows about containers.
 
-    #: ``container``, and never ``subprocess``: this backend starts a
-    #: container per session and is an orchestrator of it.
+    It is no longer an orchestrator. A session's build environment is
+    the workbench's — the same object a local build gets — and this
+    class owns what a *protocol* has and a build does not: which images
+    this host can serve, whether a client may run the one it pinned,
+    invocation ids, the audience watching them, and the verdict frame.
+
+    **Two seams onto one docker, and they answer different questions.**
+    :attr:`docker` is discovery: is there a runtime, which images are
+    here, fetch one. It is asynchronous because it is asked from verb
+    handlers, on the event loop. :attr:`driver` is the orchestrator's,
+    synchronous, and used only inside a worker thread — because driving a
+    container means blocking on a build. Merging them would mean giving
+    one of the two the other's concurrency shape for nothing; the
+    discovery half goes away when ``capabilities`` is rebuilt.
+    """
+
+    #: ``container``, and never ``subprocess``: this backend serves
+    #: containers and is not one.
     profile = "container"
 
-    def __init__(self, config: Config, *, docker: container.Docker | None = None) -> None:
+    def __init__(
+        self,
+        config: Config,
+        *,
+        docker: container.Docker | None = None,
+        driver: workbench.Docker | None = None,
+    ) -> None:
         super().__init__(config)
         self.docker = container.Docker(config.docker) if docker is None else docker
+        self.driver = workbench.Docker(config.docker) if driver is None else driver
         self._images: dict[str, ImageProfile] = {}
 
     # ----------------------------------------------------------------
@@ -1459,258 +1534,280 @@ class ContainerBackend(SessionBackend):
     async def _session_environment(self, session: Any) -> ImageProfile:
         """The image this session was answered with, still on this host.
 
-        The whole of "one session, one build environment": the profile
-        is the one :meth:`resolve_image` produced at ``send-context`` and
-        :func:`~mcuhome_buildserver.sessions.lock_context` froze into
-        ``manifest.yaml``, taken off the session rather than chosen
-        again. Nothing here compares releases or reads labels — the
-        choice was made, and re-making it is what would make the manifest
-        lie.
-
-        What is checked is that the choice is still there. An operator
-        may remove an image while a session sits locked, and the pinned
-        name is looked up rather than assumed because that name is what
-        ``docker run`` will be handed a moment later: a refusal here says
-        which image went away, where the same absence at container start
-        would surface as a docker error about a name the client never
-        chose. ``version.builder-unavailable`` is that refusal's code by
-        its own registry entry — "the image is not on this host" — and it
-        is deliberately not the retryable ``builder.runtime-unavailable``:
-        this server pulls nothing, so a missing image is a final answer,
-        while a missing *runtime* is not and is asked about first.
+        The whole of "one session, one build environment": the profile is
+        the one :meth:`resolve_image` produced at ``send-context`` and
+        ``lock-context`` froze into ``manifest.yaml``, taken off the
+        session rather than chosen again. What is checked here is only
+        that it is still present, because a build that started against an
+        image removed in between would fail somewhere unhelpful.
         """
-        profile: ImageProfile | None = session.image
-        if profile is None:  # pragma: no cover - set with the pins at send-context
-            raise SessionError(
-                "context.missing",
-                f'Session "{session.id}" holds no build container to work in.',
-                session_id=session.id,
-            )
-        await self.docker.require_runtime()
-        pinned = _pinned(profile.facts)
-        if await self.docker.image(pinned) is None:
-            raise SessionError(
-                "version.builder-unavailable",
-                f"The build container {pinned} this session was answered with is no longer "
-                "on this host. It is the image the context pins and the one its identity is "
-                "computed over, so the session refuses rather than building in another "
-                "image and reporting this one.",
-                environment=pinned,
-                digest=profile.facts.digest,
-            )
-        return profile
-
-    async def _materialize(
-        self,
-        session: Any,
-        profile: ProgramProfile,
-        paths: SessionPaths,
-        package: sdkstore.SdkPackage,
-        patched: tuple[str, ...],
-    ) -> SessionRuntime:
-        """Compose the mounts and start the session's container.
-
-        The container-profile half of :meth:`SessionBackend.ensure_runtime`:
-        the trees are resolved against what ``describe`` reported, the
-        mounts are composed, and the container is started with the
-        resource limits §1.2 promises for this profile.
-
-        The image is not looked up again here —
-        :meth:`_session_environment` has already turned the context's pin
-        into a presence check — and there is nothing to look it up *by*
-        that could differ: the pin is a digest, so "the image this
-        context names" cannot come to mean other bytes between the lock
-        and the first ``build``.
-        """
+        profile = session.image
         assert isinstance(profile, ImageProfile)  # noqa: S101 - resolve_image's own type
-        trees, mounts = self._arrange_trees(profile, paths, package, patched)
-        # The cache is mounted, never stated. An image configures ccache
-        # itself — contract §10.1 — so the read-only shared store goes on
-        # the path its configuration already names, and the request
-        # document says nothing about a cache at all. The writable half
-        # is deliberately not mounted here: this server serves contexts
-        # it does not trust, and §10 makes a shared store read-only for
-        # exactly that reason.
-        shared = self._shared_cache(profile)
-        if shared is not None:
-            mounts.append(
-                container.Mount(
-                    source=shared.path,
-                    target=containerpaths.CCACHE_SHARED,
-                    read_only=True,
-                )
+        await self.docker.require_runtime()
+        pin = session.pins.build_environment
+        # Asked about **this** image and not about the inventory: the
+        # choice was made at `send-context` and re-listing what this host
+        # has would be the shape of making it again. A targeted inspect
+        # answers the only question left — are those bytes still here.
+        #
+        # Asked as ``repository@digest`` and not as the pin's own
+        # spelling: docker resolves ``repo:tag@digest`` happily, but what
+        # it reports back are the names it *has* — repo tags and repo
+        # digests — and a pin carrying both is neither of them, so an
+        # inspect by it comes back matching nothing.
+        if await self.docker.image(environments.digest_reference(pin.reference)) is not None:
+            return profile
+        raise SessionError(
+            "version.builder-unavailable",
+            f"The build environment {pin.reference} is no longer on this host. This "
+            "session was opened against it and its manifest names it, so another image "
+            "of the same line is not a substitute: the firmware would be attributed to "
+            "a context that does not describe it.",
+            environment=pin.reference,
+            digest=pin.digest,
+        )
+
+    async def ensure_runtime(
+        self, session: Any, pins: ContextPins, *, context_id: str
+    ) -> SessionRuntime:
+        """The session's build environment, materialized by the workbench.
+
+        Everything this used to do itself — verify the SDK package
+        against its pin, learn the mount layout from ``describe``,
+        arrange the trees piece by piece, start the container with this
+        profile's resource ceilings — is one call now, and it is the same
+        call a local build makes. That is the whole of the rebuild: a
+        context that arrived over a socket and one created on this
+        machine reach the same orchestrator, so a fix to either is a fix
+        to both.
+
+        Materialization stays **lazy**, as ADR 0019 §2 asks: the first
+        command that needs an environment is ``verify`` or ``build``, and
+        a session that never builds should not pay for an SDK fetch.
+
+        Off the event loop, because underneath it hashes a multi-gigabyte
+        package, streams a zstd decompression to disk and untars it. On
+        the loop that would stall every other session, every other
+        connection and the WebSocket heartbeat, which drops unrelated
+        clients after thirty seconds.
+        """
+        existing = self._runtimes.get(session.id)
+        if existing is not None:
+            return existing
+        paths: SessionPaths = session.paths
+        profile = await self._session_environment(session)
+        paths.prepare_backend()
+        try:
+            environment = await asyncio.to_thread(
+                workbench.open_environment,
+                paths.context,
+                work_root=paths.root,
+                config=self._backend_config(),
+                docker=self.driver,
+                # The protocol's own name for this session, so that the
+                # marker §6.3 writes into `work`, this server's logs and
+                # the id a client is holding are one string.
+                session=session.id,
             )
-        container_id = await self.docker.start(
-            image=_pinned(profile.facts),
-            mounts=container.mounts_for(mounts),
-            session_id=session.id,
-            user=container.current_user(),
-            limits=container.ResourceLimits(
-                memory=self.config.container_memory,
-                cpus=self.config.container_cpus,
-                pids=self.config.container_pids,
-            ),
-        )
-        logger.info(
-            "session %s: container %s from %s",
-            session.id,
-            container_id[:12],
-            profile.facts.reference,
-        )
-        return SessionRuntime(
+        except workbench.MCUHomeError as refusal:
+            raise _materialization_refusal(refusal) from refusal
+        runtime = SessionRuntime(
             session_id=session.id,
             image=profile,
-            container_id=container_id,
             paths=paths,
-            trees=trees,
-            patched_layers=patched,
-            # Not `shared`: in this profile the cache is a mount and not a
-            # field, so the request document must not carry one.
-            ccache=None,
+            trees=dict(environment.trees),
+            patched_layers=environment.patched,
+            environment=environment,
+        )
+        self._runtimes[session.id] = runtime
+        logger.info(
+            "session %s: container build environment %s (context %s)",
+            session.id,
+            profile.environment,
+            context_id,
+        )
+        return runtime
+
+    def _backend_config(self) -> workbench.BackendConfig:
+        """This server's configuration, as the orchestrator's own.
+
+        The two lists that are **not** here are the point of the mapping
+        rather than an omission. There is no image: the locked context
+        names it, pinned to a digest. And the compiler cache is offered
+        read-only or not at all — contract §10 makes a shared store
+        read-only for untrusted work, and this server serves contexts it
+        does not trust, so the writable half of the orchestrator's cache
+        layout is deliberately left unmounted.
+        """
+        return workbench.BackendConfig(
+            sdk_sources=tuple(self.config.sdk_sources),
+            jobs=self.config.build_jobs,
+            shared_ccache_dir=self.config.ccache_dir,
+            labels={container.SESSION_LABEL: "1"},
+            memory=self.config.container_memory,
+            cpus=self.config.container_cpus,
+            pids=self.config.container_pids,
+            deadline_seconds=self.config.build_deadline_seconds,
+            cancel_grace_seconds=self.config.cancel_grace_seconds,
         )
 
-    def _arrange_trees(
+    def _prepare_invocation(
         self,
-        profile: ImageProfile,
-        paths: SessionPaths,
-        package: sdkstore.SdkPackage,
-        patched: tuple[str, ...],
-    ) -> tuple[dict[str, TreeEntry], list[container.Mount]]:
-        """Decide every ``trees`` entry and the mounts behind them (§4.1).
+        session: Any,
+        runtime: SessionRuntime,
+        *,
+        action: str,
+        context_id: str,
+        mode: str | None,
+    ) -> InvocationRecord:
+        """The workbench prepares it; this server numbers it and remembers it.
 
-        **The session tree is mounted piece by piece and never
-        wholesale.** One bind mount of the session root would be shorter
-        and it is wrong, for a reason that only shows up when a tree has
-        two paths: the SDK is unpacked into ``<root>/sdk`` and mounted
-        read-only at the path ``describe`` asked for, so a root mount
-        exposes the very same directory writable at ``<root>/sdk`` —
-        and §4.1's ``writable: false`` is "asserted by the backend,
-        never probed by the program", which makes it a claim this server
-        would be making falsely. §9.1 asks for the strongest write
-        protection the profile has, and in this profile that is a
-        read-only bind mount with nothing shadowing it.
-
-        So the container sees exactly what the request document names,
-        each at its own host path: ``context`` read-only, ``work``
-        writable, the per-invocation directories writable (mounted as
-        their parent, because bind mounts are fixed when the container
-        is created and an invocation directory does not exist yet — the
-        parent is a mount, so every ``out``, ``tmp``, request and result
-        created in it later is inside it), the SDK at its target, and
-        the shared cache read-only when there is one. What is *not*
-        visible any more is everything else the session directory holds:
-        the upload spool, ``staging`` and — worth naming — ``downloads``,
-        where ``get-artifact`` builds the archive it is about to stream.
-
-        Three rules and one non-rule.
-
-        **``sdk`` is always supplied**, at the path ``describe``
-        declared for it or at one of this server's choosing when it
-        declared ``null``. It is mounted read-only unless the ``sdk``
-        layer carries patches, in which case the per-session unpacked
-        tree *is* the writable view §6.2 asks for — it dies with the
-        session, so no overlay and no copy is needed to keep it from
-        outliving one.
-
-        **Every patched in-image layer is supplied writable at the path
-        the image reported** (E47). The container's own copy-on-write
-        layer is the view; asserting ``writable: true`` for it is
-        truthful rather than optimistic, because the layer makes it so
-        and the container is discarded at ``close-session``. No mount is
-        involved at all — the tree is already in the image.
-
-        **An unpatched in-image tree is omitted**, which §4.1 explicitly
-        permits: "the program then uses its own".
-
-        And the non-rule: a patched layer the image reports **no** path
-        for gets no entry, because there is nothing to name one at. That
-        is not this backend giving up on §4.1's duty — it is the only
-        honest move, and the contract has an answer for exactly it: a
-        program that finds ``patches/<layer>/`` with no ``trees`` entry
-        "MUST NOT proceed: ``status: "failure"``, ``reason:
-        "error.layer.unknown"``". The pointer goes into ``required``
-        anyway (:meth:`_document`), so a conforming program refuses
-        legibly before it does any work.
+        The split is exactly the one the rebuild draws. The directory,
+        the empty ``out`` and ``tmp``, the events file, the sentinel and
+        the request document are contract duties and belong to the
+        orchestrator. The invocation **id**, the session's record of it
+        and the audience watching it are session-protocol duties and
+        belong here.
         """
-        mounts = [
-            # §9.1: write-protected "with the strongest means its
-            # profile has", which in this profile is the kernel rather
-            # than a promise — and nothing else is mounted over it.
-            container.Mount(source=paths.context, target=containerpaths.CONTEXT, read_only=True),
-            container.Mount(source=paths.work, target=containerpaths.WORK),
-            container.Mount(source=paths.invocations, target=containerpaths.INVOCATIONS),
-        ]
-        sdk_writable = "sdk" in patched
-        sdk_target = profile.tree_path("sdk") or containerpaths.SDK
-        mounts.append(
-            container.Mount(source=package.tree, target=sdk_target, read_only=not sdk_writable)
+        invocation = runtime.environment.prepare(action, mode=mode)
+        session.invocation_counter += 1
+        record = InvocationRecord(
+            id=f"inv-{session.invocation_counter}",
+            session_id=session.id,
+            action=action,
+            directory=invocation.directory,
+            context_id=context_id,
+            patched_layers=runtime.patched_layers,
+            invocation=invocation,
         )
-        trees: dict[str, TreeEntry] = {"sdk": TreeEntry(path=sdk_target, writable=sdk_writable)}
-        for layer in patched:
-            if layer == "sdk":
-                continue
-            declared = profile.tree_path(layer)
-            if declared is None:
-                continue
-            trees[layer] = TreeEntry(path=declared, writable=True)
-        return trees, mounts
+        session.invocations[record.id] = _RUNNING
+        self._records[(session.id, record.id)] = record
+        return record
 
-    def _inside(self, runtime: SessionRuntime, path: Path) -> PurePosixPath | Path:
-        """*path*, as the container spells it — through this session's mounts.
+    async def _supervise(self, runtime: SessionRuntime, record: InvocationRecord) -> int | None:
+        """Run the invocation through the orchestrator, relaying as it goes.
 
-        Three directories of this session are visible in there, each at a
-        path that is the same for every session on every machine
-        (:mod:`mcuhome.model.containerpaths`), so this is a substitution
-        of prefixes and nothing more. It is the reason a build cannot
-        tell this server from a workbench building locally, and the
-        reason the compiler cache is worth keeping at all: Zephyr puts
-        three ``-fmacro-prefix-map=<absolute path>`` options on every
-        compile, so a session directory in here would be a session
-        directory in every cache key.
+        The ladder is the orchestrator's now — the sentinel first,
+        SIGTERM after the grace period, SIGKILL after that, and the
+        deadline entering at the top by touching the same sentinel — and
+        so is draining the event file. What stays here is the wire: every
+        log line is numbered and offered to the session's audience, and
+        every event is relayed verbatim under the frame shape this
+        protocol uses.
 
-        A path under none of the three is a path the container cannot
-        see, and putting one in a request document would produce a
-        refusal the client cannot act on — so it is a defect here, raised
-        as one.
+        Off the event loop for the whole invocation, which is where a
+        build spends its minutes. The relays are called from that thread
+        and reach the loop through
+        :meth:`~asyncio.AbstractEventLoop.call_soon_threadsafe`, because
+        an outbox is not thread-safe and a build log is the one thing
+        written fast enough for that to matter.
         """
-        for host, target in (
-            (runtime.paths.context, containerpaths.CONTEXT),
-            (runtime.paths.work, containerpaths.WORK),
-            (runtime.paths.invocations, containerpaths.INVOCATIONS),
-        ):
-            if path == host:
-                return target
-            if host in path.parents:
-                return target / path.relative_to(host)
-        raise AssertionError(f"{path} is not mounted into the session's container")
+        loop = asyncio.get_running_loop()
 
-    async def _start(self, runtime: SessionRuntime, record: InvocationRecord) -> processes.Process:
-        """``docker exec`` the program: the contract's whole invocation.
+        def on_line(line: str) -> None:
+            loop.call_soon_threadsafe(self._log, record, line)
 
-        Two positional operands after the program's fixed absolute path,
-        and never a flag (§5.1). It runs in the session's own container,
-        which is the trust boundary this profile promises, and as this
-        server's own user so that everything the program writes comes
-        back readable to egress (§9.3).
+        def on_event(event: dict[str, Any]) -> None:
+            frame = protocol.event_frame(event.get("event", ""), _event_payload(record, event))
+            loop.call_soon_threadsafe(lambda: self._publish(record, frame, drop_when_full=True))
+
+        outcome = await asyncio.to_thread(record.invocation.run, on_line=on_line, on_event=on_event)
+        record.local_outcome = outcome
+        return outcome.exit_code
+
+    async def _collect(
+        self, record: InvocationRecord, *, exit_code: int | None
+    ) -> abi.InvocationOutcome:
+        """What the orchestrator judged, as this server's wire vocabulary.
+
+        Nothing is judged twice. §5.3's seven conditions and §9.3's
+        re-hashing of every declared artifact happened inside the
+        orchestrator, which is where they happen for a local build too;
+        this is the adaptation of one outcome shape to the other, so that
+        the verdict frame, the error envelope and the reason-to-code
+        table stay exactly what they were.
         """
-        return await self.docker.invoke(
-            container=str(runtime.container_id),
-            action=record.action,
-            request=self._inside(runtime, record.request),
-            on_line=lambda line: self._log(record, line),
-            user=container.current_user(),
+        del exit_code  # the orchestrator's outcome carries its own
+        local = record.local_outcome
+        if local is None:
+            return abi.InvocationOutcome(
+                action=record.action,
+                exit_code=None,
+                result=None,
+                problems=("the invocation did not run",),
+            )
+        return abi.InvocationOutcome(
+            action=local.action,
+            exit_code=local.exit_code,
+            result=None if local.result is None else abi.ResultDocument(local.result),
+            successful=local.successful,
+            problems=tuple(local.problems),
+            violation=local.violation,
+            artifacts=tuple(local.artifacts),
         )
 
     async def _release_runtime(self, runtime: SessionRuntime) -> None:
-        """Reap the session's container. Never raises.
+        """Reap the container. That, and not a signal, is what stops a build.
 
-        It is also the only thing that actually reaps a program that
-        ignored both the cancel sentinel and SIGTERM: killing a ``docker
-        exec`` client never reached the process inside the container, and
-        removing the container does. One session is one container, so
-        there is always that hammer.
+        Killing a ``docker exec`` client never stopped the process inside
+        the container, so this is the rung the ladder ends at — and it is
+        the orchestrator's, because the container is.
         """
-        await self.docker.remove(str(runtime.container_id))
+        environment = runtime.environment
+        if environment is None:
+            return
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(environment.close)
+
+
+def _materialization_refusal(refusal: Exception) -> SessionError:
+    """One of the orchestrator's typed refusals, as this protocol says it.
+
+    The orchestrator refuses in words, because its first caller is a
+    person at a terminal; the session protocol refuses in codes, because
+    its caller is a program deciding whether to try another server. The
+    translation is a table of **types** and not of messages — matching on
+    wording is how a rephrased sentence becomes a wrong error code — and
+    the words are carried into the details, where they are the most
+    useful thing in the frame.
+
+    Anything unrecognized stays ``error.internal`` by not being caught
+    here: an orchestrator failure this server has no code for is a defect
+    on this side, and dressing it as a client-facing refusal would send a
+    client looking for a mistake it did not make.
+    """
+    if isinstance(refusal, workbench.SdkUnavailable):
+        # The pin, and **not** the directories that were searched: those
+        # are this operator's filesystem, and a client that pinned a
+        # package this server does not have has no use for the paths it
+        # is not in. The orchestrator carries them because a person at a
+        # terminal is looking at their own machine; here they stop.
+        return SessionError(
+            "sdk.unavailable",
+            f"This server has no {SDK_PACKAGE_NAME} {refusal.version} whose bytes hash to "
+            f"{refusal.sha256}. Its SDK packages come from directories its operator "
+            "configured, and the url in a context is a hint that is never fetched.",
+            version=refusal.version,
+            sha256=refusal.sha256,
+        )
+    if isinstance(refusal, workbench.EnvironmentUnavailable):
+        code = "version.builder-unsatisfiable"
+    elif isinstance(refusal, workbench.EnvironmentUnusable):
+        code = "version.builder-unavailable"
+    else:
+        raise refusal
+    return SessionError(code, str(refusal.message), problem=str(refusal))
+
+
+def _event_payload(record: InvocationRecord, event: dict[str, Any]) -> dict[str, Any]:
+    """One program event, addressed to a session and otherwise untouched.
+
+    §8: "a backend passes an event whose name it does not know through to
+    its client verbatim, with its fields intact". The two identifiers are
+    added because a client watching one socket may be watching several
+    sessions; nothing else is added, removed or rewritten.
+    """
+    return {"session_id": record.session_id, "invocation_id": record.id, **event}
 
 
 #: The ``reason`` values that end a session rather than an invocation.

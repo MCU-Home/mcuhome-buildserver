@@ -47,13 +47,13 @@ all — that is the allowlist
 (:mod:`mcuhome_buildserver.environments`), checked before any command
 here names the image.
 
-**What the composed argv says, line by line**, is in
-:func:`session_run_command`. Two of its flags are the contract's and the
-rest is this backend's policy, which §11 leaves free: ``--network=none``
-because §9.1 forbids the network during an invocation and this is the
-only mechanism that makes the statement checkable rather than asserted,
-and ``--init`` because a build spawns hundreds of short-lived children
-and PID 1 has to reap them.
+**Starting a container is not here any more.** The session's build
+environment is the workbench's orchestrator's — the same object a local
+build gets — so the ``docker run`` that creates it, the ``docker exec``
+that is the invocation and the ``docker rm`` that ends it are composed
+there, once, for both. What is left here is discovery: is there a
+runtime, which images does this host have, fetch one, and what does an
+image say about itself before a session is answered.
 """
 
 from __future__ import annotations
@@ -63,7 +63,7 @@ import logging
 import os
 import re
 import shlex
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -90,7 +90,6 @@ from mcuhome_buildserver.processes import (
 
 __all__ = [
     "CONTRACT_LABEL",
-    "IDLE_COMMAND",
     "PROGRAM",
     "TOOLCHAIN_LABEL",
     "ZEPHYR_LABEL",
@@ -99,10 +98,8 @@ __all__ = [
     "ImageFacts",
     "Mount",
     "Process",
-    "ResourceLimits",
     "describe_run_command",
     "run_docker",
-    "session_run_command",
     "spawn_docker",
 ]
 
@@ -114,15 +111,6 @@ logger = logging.getLogger(__name__)
 #: fixed at container creation, and the invocation is resolved without a
 #: shell — so there is no lookup to fall back on.
 PROGRAM = "/mcuhome/run"
-
-#: What the session's container runs as its main process. Contract §2.2
-#: makes starting the container the backend's business — ``docker run``
-#: overrides both ``ENTRYPOINT`` and ``CMD``, an image must not depend on
-#: its own, and the image "MUST provide a POSIX shell at ``/bin/sh``" so
-#: that there is always a command to name. This is that command, and it
-#: is deliberately POSIX rather than ``sleep infinity``: the contract
-#: promises a POSIX shell, not GNU coreutils.
-IDLE_COMMAND = ("/bin/sh", "-c", "while :; do sleep 86400; done")
 
 #: How this server labels the containers it starts. A **container**
 #: label, not an image one: contract §2.1 governs image labels and this
@@ -415,64 +403,6 @@ class Docker:
     # Containers
     # ----------------------------------------------------------------
 
-    async def start(
-        self,
-        *,
-        image: str,
-        mounts: Sequence[Mount],
-        session_id: str,
-        user: str | None = None,
-        limits: ResourceLimits | None = None,
-    ) -> str:
-        """Start the session's container and answer its id.
-
-        One session is one container instance is the trust boundary
-        (contract §1.2), and the container is discarded at
-        ``close-session`` — which is what makes E47's writable view free:
-        the image's own trees are writable inside the container by
-        construction and cannot outlive the session that patched them.
-        """
-        argv = session_run_command(
-            docker=self.program,
-            image=image,
-            mounts=mounts,
-            session_id=session_id,
-            user=user,
-            limits=limits,
-        )
-        completed = await self._run(*argv[1:])
-        identity = completed.output.strip().splitlines()[-1:] or [""]
-        if not completed.ok or _CONTAINER_ID.fullmatch(identity[0]) is None:
-            raise _no_runtime(
-                self.program,
-                f"could not start a container for this session ({_first_line(completed.output)})",
-            )
-        return identity[0]
-
-    async def invoke(
-        self,
-        *,
-        container: str,
-        action: str,
-        request: Path,
-        on_line: LineSink,
-        user: str | None = None,
-    ) -> Process:
-        """``docker exec`` the program: the contract's whole invocation.
-
-        Exactly two positional operands after the program — the action
-        and an absolute path to the request document — and never a flag
-        (§5.1). This argv is frozen and never grows: extensibility runs
-        through the request document, because an unknown JSON field
-        costs an older program nothing while a new argv operand breaks
-        every third-party container that does not know it.
-        """
-        argv = [self.program, "exec"]
-        if user is not None:
-            argv += ["--user", user]
-        argv += [container, PROGRAM, action, str(request)]
-        return await self._spawn(argv, on_line=on_line)
-
     async def describe(
         self,
         *,
@@ -512,23 +442,6 @@ class Docker:
         if completed.status != 0:
             return None
         return completed.output
-
-    async def remove(self, container: str) -> None:
-        """Reap the container. Never raises.
-
-        ``--force`` because the session's lifetime is over and the
-        program's result document is not a client deliverable at this
-        point (E39): ``close-session`` on a busy session sets the stop
-        signal first, and the guarantee that the result is still written
-        orders the *program's* shutdown rather than promising anybody a
-        document. Never raises because every caller is already closing
-        something and a failed cleanup must not become the news.
-        """
-        completed = await self._run("rm", "--force", "--volumes", container)
-        if not completed.ok:
-            logger.warning(
-                "could not remove container %s: %s", container, _first_line(completed.output)
-            )
 
 
 def _first_line(output: str) -> str:
@@ -624,105 +537,6 @@ def _facts_from(reference: str, data: dict[str, Any]) -> ImageFacts:
     )
 
 
-@dataclass(frozen=True)
-class ResourceLimits:
-    """What one session's container may consume, as ``docker run`` flags.
-
-    Contract §1.2 lists "per-session resource limits and disk quota"
-    among the ``container`` profile's guarantees and §9.1 makes them the
-    backend's "to set and to enforce", and this is the whole of the
-    setting: three flags on the run that creates the container, because
-    a limit applied anywhere else is a limit a build can step around.
-
-    ``memory`` is why :func:`~mcuhome_buildserver.abi.request_document`
-    can leave ``limits.memory_bytes`` out and still be truthful — the
-    runtime enforces the number rather than the program being asked to
-    respect it, which is what "advisory to the program, enforcement is
-    the backend's" means when the backend has a kernel behind it.
-
-    ``pids`` bounds the fork bomb a hostile context's build script is,
-    and ``cpus`` is unset by default on purpose: a build server's whole
-    job is to compile, ``limits.jobs`` already bounds the parallelism
-    the program asks for, and an operator who wants a hard CPU ceiling
-    on top of it says so.
-    """
-
-    memory: str | None = None
-    cpus: str | None = None
-    pids: int | None = None
-
-    def to_arguments(self) -> list[str]:
-        argv: list[str] = []
-        if self.memory:
-            argv += ["--memory", self.memory]
-        if self.cpus:
-            argv += ["--cpus", self.cpus]
-        if self.pids is not None:
-            argv += ["--pids-limit", str(self.pids)]
-        return argv
-
-
-def session_run_command(
-    *,
-    docker: str,
-    image: str,
-    mounts: Sequence[Mount],
-    session_id: str,
-    user: str | None = None,
-    limits: ResourceLimits | None = None,
-) -> list[str]:
-    """The ``docker run`` that gives a session its container.
-
-    Separate from :meth:`Docker.start` so that the argv can be asserted
-    without running anything, which is how this server's suite reads it:
-    the composed command is the interface between the contract and the
-    runtime, and it is worth pinning line by line.
-
-    * ``--detach`` because the container is the session's *place* for the
-      whole session — invocations are ``docker exec`` into it, and how a
-      backend keeps its container running between invocations is
-      explicitly not part of the contract (§2.2).
-    * ``--init`` because a build spawns hundreds of short-lived children
-      and PID 1 has to reap them.
-    * ``--network=none`` because §9.1 forbids the network during an
-      invocation, and because it is the only way that statement can be
-      checked rather than asserted: a step that fetches something
-      succeeds on the machine that has a network and fails on the one
-      that does not.
-    * ``--user`` because everything the program writes lands on a bind
-      mount this server has to read back — ``out``, ``work``, the result
-      document — and a build that left root-owned files behind would
-      make egress (§9.3) a permissions problem.
-    * ``--memory``, ``--pids-limit`` and optionally ``--cpus``, because
-      §1.2's ``container`` row promises "per-session resource limits"
-      and §9.1 makes them the backend's to set. They go on the *run*
-      that creates the container rather than on the exec that uses it:
-      a limit on the exec bounds one process tree, and a limit on the
-      container bounds the session.
-    * The mount **targets are the same for every session**, on this
-      machine and on any other (:mod:`mcuhome.model.containerpaths`).
-      §4 fixes no mount points and forbids a *program* from depending on
-      one; a backend choosing the same ones every time is the convention
-      §4 permits and §10.1 explains — the compiler cache is keyed on the
-      compile command line, into which Zephyr puts three absolute paths,
-      so a session directory in the target would be a session directory
-      in every cache key. The sources stay this session's own, and the
-      tree is mounted piece by piece rather than wholesale, which is what
-      makes the request document's paths *exactly* the set the container
-      can see.
-    """
-    argv = [docker, "run", "--detach", "--init", "--network=none"]
-    if user is not None:
-        argv += ["--user", user]
-    argv += (limits or ResourceLimits()).to_arguments()
-    argv += ["--label", f"{SESSION_LABEL}={session_id}"]
-    for mount in mounts:
-        argv += ["--volume", mount.to_argument()]
-    argv.append(image)
-    argv += list(IDLE_COMMAND)
-    return argv
-
-
 def describe_run_command(
     *,
     docker: str,
@@ -765,22 +579,3 @@ def current_user() -> str | None:
     if getuid is None or getgid is None:  # pragma: no cover - not POSIX
         return None
     return f"{getuid()}:{getgid()}"
-
-
-def mounts_for(entries: Iterable[Mount]) -> tuple[Mount, ...]:
-    """Bind mounts ordered so that a nested one wins over its parent.
-
-    Docker applies bind mounts in the order it is given them, so a mount
-    that sits inside another has to come *after* it or the outer one
-    buries it — which, for a read-only mount under a writable one, is
-    §9.1's kernel-enforced write protection silently not happening.
-
-    The backend no longer relies on that nesting for anything: it mounts
-    the pieces of a session tree individually rather than mounting the
-    tree and carving read-only holes out of it, precisely because the
-    hole is only as good as the ordering. This ordering stays because it
-    costs nothing and because a mount set that *does* nest — an SDK the
-    image asks for under a path the backend also supplies — must not
-    depend on the caller's list order to be correct.
-    """
-    return tuple(sorted(entries, key=lambda mount: len(mount.target.parts)))

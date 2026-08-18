@@ -242,7 +242,7 @@ class SessionPaths:
       lets it be handed over *writable* when the ``sdk`` layer carries
       patches without an overlay and without anybody else's tree being
       at risk.
-    * ``invocations/<id>/`` is the **backend-owned per-invocation
+    * ``inv/<id>/`` is the **backend-owned per-invocation
       directory** of §5.1 step 1, holding ``out/``, ``tmp/``, the
       request document, the result document, the events file and the
       cancel sentinel. It is outside the context, which is exactly what
@@ -282,7 +282,11 @@ class SessionPaths:
 
     @property
     def invocations(self) -> Path:
-        return self.root / "invocations"
+        # Spelled `inv` because the orchestrator that creates the
+        # per-invocation directories spells it that way, and one layout
+        # is one fewer thing for the two sides to disagree about. The
+        # name is host-side and no document fixes it.
+        return self.root / "inv"
 
     @property
     def downloads(self) -> Path:

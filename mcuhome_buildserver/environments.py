@@ -55,6 +55,7 @@ from mcuhome_buildserver.errors import SessionError
 
 __all__ = [
     "check_allowed",
+    "digest_reference",
     "repository_of",
 ]
 
@@ -110,3 +111,25 @@ def check_allowed(reference: str, *, allowed: Iterable[str], what: str) -> None:
         repository=repository,
         allowed=sorted(listed),
     )
+
+
+def digest_reference(reference: str) -> str:
+    """*reference* as ``repository@digest`` — the name docker reports back.
+
+    A pinned reference carries a tag *and* a digest, which docker
+    resolves without complaint but never *reports*: what an image
+    inspect lists are the names it has, and those are repo tags and repo
+    digests, never a mixture. So a lookup that has to recognize its own
+    answer asks by the half that appears in ``RepoDigests``.
+
+    A reference with no digest answers as itself: the caller is asking
+    about something that was never pinned, and inventing a spelling for
+    it would be worse than passing the one it was given.
+    """
+    try:
+        parsed = parse_reference(reference, default_registry=DOCKER_HUB)
+    except Exception:  # noqa: BLE001 - a name the caller will fail on anyway
+        return reference
+    if parsed.digest is None:
+        return reference
+    return f"{parsed.repository}@{parsed.digest}"

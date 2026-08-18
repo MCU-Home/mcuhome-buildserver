@@ -472,17 +472,21 @@ def test_an_expired_lease_takes_the_context_with_it(tmp_path) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_this_server_consumes_the_model_and_no_other_half_of_the_family() -> None:
-    """ADR 0020 decision 4, checked rather than remembered.
+def test_this_server_calls_the_workbench_and_never_the_compiler() -> None:
+    """The edge that reversed, and the one that did not.
 
-    "The build server recomputes a context ID from bytes it received off
-    a socket and must carry no build logic to do it." The temptation is
-    concrete and it is right next door: ``mcuhome.workbench.contextdir``
-    already has a context-directory walker, a manifest emitter and a
-    verifier, and importing it would delete most of
-    :mod:`mcuhome_buildserver.contextstore`. It would also make this
-    server carry the build half of the product it exists to keep at
-    arm's length, so the rule is a syntax check and not a habit.
+    This server used to carry the *whole* driving half of the build
+    contract, so the rule was that it consumed the vocabulary
+    (``mcuhome.model``) and neither of the halves built on it. It is an
+    orchestrator no longer: a session's build environment is the
+    workbench's, which is the entire point — a fix to how a container is
+    driven is one fix rather than two.
+
+    What has not moved, and is what this test is now for, is the other
+    edge. ``mcuhome.compiler`` is the program that runs **inside** the
+    build container. A build server that imported it would be carrying a
+    toolchain it exists to keep at arm's length, and the container it
+    drives would no longer be the only thing that compiles.
     """
     import ast
     from pathlib import Path
@@ -497,11 +501,30 @@ def test_this_server_consumes_the_model_and_no_other_half_of_the_family() -> Non
             elif isinstance(node, ast.ImportFrom):
                 names = [node.module or ""]
             offenders += [
-                f"{source.name}: {name}"
-                for name in names
-                if name.startswith(("mcuhome.workbench", "mcuhome.compiler"))
+                f"{source.name}: {name}" for name in names if name.startswith("mcuhome.compiler")
             ]
     assert offenders == []
+
+
+def test_importing_this_server_does_not_load_the_compiler() -> None:
+    """And it holds at run time, not only in the syntax tree.
+
+    The syntax check above cannot see a dynamic import, and the
+    workbench has one on purpose: it resolves ``mcuhome.compiler``
+    through ``importlib`` for the build methods that need a toolchain.
+    Reaching it from here would mean this server had asked for one.
+    """
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys, mcuhome_buildserver.app, mcuhome_buildserver.backend;"
+        "print('mcuhome.compiler' in sys.modules)"
+    )
+    answer = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+    )
+    assert answer.stdout.strip() == "False", answer.stdout
 
 
 def test_the_context_id_vectors_hold_on_this_side() -> None:

@@ -116,9 +116,11 @@ async def test_the_session_container_is_started_with_the_contracts_two_flags(
     assert "--network=none" in started
     assert "--init" in started
     assert "--user" in started
-    # The image is named by digest, never by tag: a tag carries no
-    # compatibility meaning and no identity (ADR 0018 §7).
-    assert IMAGE_REFERENCE in started
+    # The image is named with the digest it was pinned to. A tag carries
+    # no compatibility meaning and no identity (ADR 0018 §7); it rides
+    # along inside the pinned reference as the only human-readable part
+    # of it, and docker binds to the digest either way.
+    assert any(IMAGE_DIGEST in argument for argument in started)
     # The container's main process is the backend's to choose, and the
     # image must not depend on its own ENTRYPOINT or CMD (§2.2).
     assert started[-3:] == ["/bin/sh", "-c", "while :; do sleep 86400; done"]
@@ -1196,6 +1198,14 @@ async def test_the_shared_cache_is_offered_read_only_and_keyed_by_program_id(
     """
     from mcuhome_buildserver.app import ServerState, create_app
 
+    # The store's per-program subdirectory is the operator's to create,
+    # and it has to be there before the session starts. Nothing creates
+    # it: it is offered read-only, so an empty one behaves exactly like
+    # no mount, and a backend that made it would be claiming a cache
+    # nobody warmed.
+    store = cached.ccache_dir / "org.mcuhome.build-container"
+    store.mkdir(parents=True, exist_ok=True)
+
     state = ServerState(cached)
     client = await aiohttp_client(create_app(state))
     async with client.ws_connect("/ws", headers=auth()) as ws:
@@ -1203,7 +1213,6 @@ async def test_the_shared_cache_is_offered_read_only_and_keyed_by_program_id(
         await call(ws, "verify", {"session_id": session_id}, frame_id="v")
         await collect(ws, until="invocation.verdict")
 
-    store = cached.ccache_dir / "org.mcuhome.build-container"
     started = next(argv for argv in docker.calls if "--detach" in argv)
     assert f"{store}:{containerpaths.CCACHE_SHARED}:ro" in _volumes(started)
     # Mounted, never stated: an image configures ccache itself (§10.1),
@@ -1531,14 +1540,19 @@ async def test_nothing_filesystem_heavy_runs_on_the_event_loop(
     """E45's archive and E48's SDK, off the loop.
 
     ``acquire_sdk`` hashes a multi-gigabyte package, streams a full zstd
-    decompression to disk and untars it; ``harden`` re-hashes every
-    artifact of a build; ``build_archive`` tars and compresses them all
-    and then re-reads the spool. All three sat on the event loop, in the
-    path of commands that promise to answer immediately — and the
-    endpoint's thirty-second heartbeat means a long enough stall drops
-    *unrelated* clients' connections.
+    decompression to disk and untars it; ``build_archive`` tars and
+    compresses a build's artifacts and then re-reads the spool. Both sat
+    on the event loop, in the path of commands that promise to answer
+    immediately — and the endpoint's thirty-second heartbeat means a
+    long enough stall drops *unrelated* clients' connections.
+
+    Re-hashing the artifacts is no longer on this list because it is no
+    longer this server's: §9.3's egress check happens inside the
+    orchestrator, in the same worker thread as the build itself. What
+    stays here is the second one, at download time — the session tree is
+    writable between the end of an invocation and ``get-artifact``.
     """
-    from mcuhome_buildserver import artifacts, sdkstore
+    from mcuhome_buildserver import artifacts
 
     threads: dict[str, threading.Thread] = {}
 
@@ -1549,8 +1563,14 @@ async def test_nothing_filesystem_heavy_runs_on_the_event_loop(
 
         return wrapper
 
-    monkeypatch.setattr(sdkstore, "acquire_sdk", record("sdk", sdkstore.acquire_sdk))
-    monkeypatch.setattr(artifacts, "harden", record("harden", artifacts.harden))
+    from mcuhome.workbench import orchestrator
+
+    # The SDK is acquired by the orchestrator now, inside the call that
+    # materializes the environment — which is the call this server makes
+    # off the loop. Instrumenting it there rather than here is the same
+    # assertion about the same bytes: hashing a multi-gigabyte package,
+    # streaming a zstd decompression to disk and untarring it.
+    monkeypatch.setattr(orchestrator, "acquire_sdk", record("sdk", orchestrator.acquire_sdk))
     monkeypatch.setattr(artifacts, "build_archive", record("archive", artifacts.build_archive))
 
     async with client.ws_connect("/ws", headers=auth()) as ws:
@@ -1569,7 +1589,7 @@ async def test_nothing_filesystem_heavy_runs_on_the_event_loop(
             if frame.get("id") == "g":
                 break
 
-    assert set(threads) == {"sdk", "harden", "archive"}
+    assert set(threads) == {"sdk", "archive"}
     for name, thread in threads.items():
         assert thread is not threading.main_thread(), f"{name} ran on the event loop"
 
@@ -2055,7 +2075,7 @@ async def test_close_session_kills_the_container_before_it_deletes_the_tree(
     and it also made the sentinel meaningless: it existed for the few
     microseconds between two statements.
     """
-    from mcuhome_buildserver import container
+    from mcuhome.workbench import orchestrator
 
     docker.run_program = lambda action, request, on_line: FakeProcess(0, hang=True)
     async with client.ws_connect("/ws", headers=auth()) as ws:
@@ -2065,15 +2085,17 @@ async def test_close_session_kills_the_container_before_it_deletes_the_tree(
         paths = session.paths
 
         seen: list[tuple[str, bool, bool]] = []
-        real_run = docker.run
+        real_answer = docker.answer
 
-        async def recording(argv):
+        def recording(argv, on_line=None):
             if argv[1] == "rm":
                 sentinel = paths.invocation("inv-1") / "cancel"
                 seen.append(("rm", paths.root.exists(), sentinel.exists()))
-            return await real_run(argv)
+            return real_answer(argv, on_line)
 
-        monkeypatch.setattr(container, "run_docker", recording)
+        # The container is the orchestrator's, so the removal goes
+        # through its seam and not through this server's own.
+        monkeypatch.setattr(orchestrator, "_run_command", recording)
         await call(ws, "close-session", {"session_id": session_id}, frame_id="x")
 
     assert seen == [("rm", True, True)], "the tree was still there and the signal was set"
@@ -2190,9 +2212,12 @@ async def test_the_pinned_image_is_invoked_by_digest_and_not_by_tag(client, conf
     started = next(
         argv for argv in docker.calls if argv[:2] == ["docker", "run"] and "--detach" in argv
     )
-    # The image is the last argument before the container's own command.
-    assert f"{IMAGE}@{IMAGE_DIGEST}" in started
-    assert not any(argument.startswith(f"{IMAGE}:") for argument in started)
+    # Every spelling of the image in that argv carries the digest, and
+    # none is a bare tag: a container started by tag alone could be other
+    # bytes than the ones the manifest attributes the firmware to.
+    named = [argument for argument in started if argument.startswith(IMAGE)]
+    assert named
+    assert all(IMAGE_DIGEST in argument for argument in named)
 
 
 async def test_describe_is_asked_once_per_image_digest(client, config, docker) -> None:
@@ -2352,7 +2377,10 @@ async def test_an_image_pulled_after_the_lock_does_not_take_over_the_session(
     started = next(
         argv for argv in docker.calls if argv[:2] == ["docker", "run"] and "--detach" in argv
     )
-    assert IMAGE_REFERENCE in started, "the image the manifest names"
+    named = [argument for argument in started if argument.startswith(IMAGE)]
+    assert named and all(IMAGE_DIGEST in argument for argument in named), (
+        "the image the manifest names"
+    )
     assert newer not in started and f"{IMAGE}@sha256:{'e' * 64}" not in started
     recorded = YAML(typ="safe", pure=True).load((context / "manifest.yaml").read_text())
     assert recorded["build_environment"] == IMAGE_REFERENCE_FORMAT3
@@ -2377,13 +2405,22 @@ async def test_an_image_that_went_away_after_the_lock_is_a_typed_refusal(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config, **{"model/device-model.json": MODEL})
         _extra_image(docker, "zephyr-4.4.2-r1", release="4.4.2", digest="e", identity="d")
-        del docker.images[IMAGE_REFERENCE]
+        # Removed the way docker removes an image: every name it had
+        # goes with it, and it stops being listed.
+        for name in [key for key in docker.images if key.startswith(f"{IMAGE}:zephyr-4.4.0")]:
+            del docker.images[name]
+        docker.images.pop(IMAGE_REFERENCE, None)
+        docker.images.pop(IMAGE_REFERENCE_FORMAT3, None)
+        docker.listed = [name for name in docker.listed if "zephyr-4.4.0" not in name]
         frame = await call(ws, "build", {"session_id": session_id}, frame_id="b")
 
     error = frame["error"]
     assert error["code"] == "version.builder-unavailable"
     assert error["retryable"] is False
-    assert error["details"]["environment"] == IMAGE_REFERENCE
+    # The pin as the context spells it, tag included: it is what the
+    # client wrote and what its manifest records, so it is what an
+    # operator will go looking for.
+    assert error["details"]["environment"] == IMAGE_REFERENCE_FORMAT3
     assert error["details"]["digest"] == IMAGE_DIGEST
     detached = [
         argv for argv in docker.calls if argv[:2] == ["docker", "run"] and "--detach" in argv

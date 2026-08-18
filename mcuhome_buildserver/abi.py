@@ -41,6 +41,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from mcuhome.model.artifacts import Artifact
+
 __all__ = [
     "ARTIFACT_ROLES",
     "REASONS",
@@ -51,7 +53,6 @@ __all__ = [
     "STATUS_FAILURE",
     "STATUS_SUCCESS",
     "STATUS_UNSUPPORTED",
-    "Artifact",
     "InvocationOutcome",
     "ResultDocument",
     "TreeEntry",
@@ -156,26 +157,6 @@ class TreeEntry:
 
     def to_dict(self) -> dict[str, Any]:
         return {"path": str(self.path), "writable": self.writable}
-
-
-@dataclass(frozen=True)
-class Artifact:
-    """One entry of ``artifacts[]``, as the program declared it.
-
-    ``root``, ``path``, ``role`` and ``hashes`` are mandatory in every
-    entry, and an entry missing any of the four "is not resolvable, and
-    a consumer MUST skip it exactly as it skips an unknown ``root``"
-    (§5.4). :func:`declared_artifacts` does the skipping, so anything
-    that reaches this class has all four.
-    """
-
-    root: str
-    path: str
-    role: str
-    sha256: str
-
-    def to_wire(self) -> dict[str, Any]:
-        return {"root": self.root, "path": self.path, "role": self.role, "sha256": self.sha256}
 
 
 @dataclass

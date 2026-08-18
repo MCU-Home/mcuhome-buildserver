@@ -8,6 +8,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **This server is no longer an orchestrator.** A session's build
+  environment is the workbench's — `mcuhome.workbench.api.open_environment`,
+  the same object a local build gets — and this server keeps what a
+  *protocol* has and a build does not: which images this host serves,
+  whether a client may run the one it pinned, invocation ids, the
+  audience watching them, replay, admission, and the verdict frame. The
+  driving half it used to own (composing the `docker run`, the request
+  document, the mounts, the liveness ladder, §5.3's judgement) existed
+  twice; a fix to how a container is driven is one fix now.
+- The `container` profile's own hooks are gone with it, and so is the
+  container plumbing behind them: `session_run_command`, `ResourceLimits`,
+  `mounts_for` and `Docker.start`/`invoke`/`remove`. What is left in
+  `container.py` is discovery — is there a runtime, which images does
+  this host have, fetch one, what does an image say about itself.
+- The per-session layout spells the invocation directories `inv/` rather
+  than `invocations/`, which is what the orchestrator that creates them
+  calls it. Host-side, and no document fixes it.
+- The **subprocess profile is untouched** and still drives its own
+  child. It is not a container, so it falls out of the container
+  contract altogether rather than moving with it.
+- The orchestrator's typed refusals are translated into this protocol's
+  codes by a table of **types**, not of messages: `sdk.unavailable`,
+  `version.builder-unsatisfiable`, `version.builder-unavailable`.
+  Anything else stays `error.internal`, because an orchestrator failure
+  this server has no code for is a defect on this side and dressing it
+  as a client-facing refusal would send a client looking for a mistake
+  it did not make. The SDK refusal carries the pin and **not** the
+  directories that were searched: those are the operator's filesystem.
+
 ### Added
 
 - **An allowlist of build-environment repositories** (`--allow-environment`,

@@ -40,92 +40,6 @@ def test_a_read_only_mount_says_so_and_a_writable_one_does_not() -> None:
     assert Mount(Path("/a"), Path("/b"), read_only=True).to_argument() == "/a:/b:ro"
 
 
-def test_a_nested_mount_comes_after_the_parent_it_sits_inside() -> None:
-    """Docker applies bind mounts in the order it is given them.
-
-    A mount that sits inside another has to come after it, or the outer
-    one buries it — which, for a read-only mount under a writable one,
-    is §9.1's kernel-enforced write protection silently not happening.
-
-    The backend no longer *relies* on that nesting: it mounts the pieces
-    of a session tree individually rather than carving read-only holes
-    out of one big writable mount, precisely because the hole is only as
-    good as the ordering. This stays because a mount set that does nest
-    must not depend on the caller's list order to be correct.
-    """
-    ordered = container.mounts_for(
-        [
-            Mount(Path("/s/context"), Path("/s/context"), read_only=True),
-            Mount(Path("/s"), Path("/s")),
-            Mount(Path("/s/sdk/inner"), Path("/s/sdk/inner")),
-        ]
-    )
-    assert [str(mount.target) for mount in ordered] == ["/s", "/s/context", "/s/sdk/inner"]
-
-
-def test_the_session_container_command_is_the_backends_to_choose() -> None:
-    """§2.2: ``docker run`` overrides both ``ENTRYPOINT`` and ``CMD``, a
-    conforming image "MUST NOT depend on its own", and it "MUST provide a
-    POSIX shell at ``/bin/sh``" so that there is always a command to
-    name. This is that command — POSIX, not ``sleep infinity``, because
-    the contract promises a shell rather than GNU coreutils."""
-    argv = container.session_run_command(
-        docker="docker",
-        image="example@sha256:" + "a" * 64,
-        mounts=[Mount(Path("/s"), Path("/s"))],
-        session_id="s-1",
-        user="1000:1000",
-    )
-    assert argv[:5] == ["docker", "run", "--detach", "--init", "--network=none"]
-    assert argv[5:7] == ["--user", "1000:1000"]
-    assert "--volume" in argv and "/s:/s" in argv
-    assert argv[-4] == "example@sha256:" + "a" * 64
-    assert argv[-3:] == list(container.IDLE_COMMAND)
-
-
-def test_the_session_container_is_given_the_resource_limits_it_promises() -> None:
-    """§1.2's ``container`` row promises "per-session resource limits and
-    disk quota" and §9.1 makes them "the backend's to set and to
-    enforce" — and nothing was set.
-
-    They go on the ``run`` that creates the container rather than on the
-    ``exec`` that uses it: an exec limit bounds one process tree, and the
-    promise is about the session. ``--memory`` is also what makes the
-    request document's silence about ``limits.memory_bytes`` honest — the
-    runtime enforces the number, so the program is not asked to.
-    """
-    argv = container.session_run_command(
-        docker="docker",
-        image="i",
-        mounts=[],
-        session_id="s-1",
-        limits=container.ResourceLimits(memory="8g", cpus="2.5", pids=4096),
-    )
-    assert argv[argv.index("--memory") + 1] == "8g"
-    assert argv[argv.index("--cpus") + 1] == "2.5"
-    assert argv[argv.index("--pids-limit") + 1] == "4096"
-
-
-def test_an_unset_resource_limit_is_not_a_flag_with_no_value() -> None:
-    """``--cpus`` is unset by default, and unset means the flag is absent.
-
-    ``limits.jobs`` already bounds the parallelism a conforming program
-    asks for, so a hard CPU ceiling on top of it is an operator's choice
-    rather than a safety property — and a default of "" passed to docker
-    would be an argument error rather than an absence.
-    """
-    argv = container.session_run_command(
-        docker="docker",
-        image="i",
-        mounts=[],
-        session_id="s-1",
-        limits=container.ResourceLimits(memory="8g", cpus=None, pids=None),
-    )
-    assert "--cpus" not in argv
-    assert "--pids-limit" not in argv
-    assert "--memory" in argv
-
-
 def test_the_describe_container_is_composed_line_by_line_too() -> None:
     """``describe`` is an invocation, so §9.1 applies to it unchanged.
 
@@ -151,64 +65,6 @@ def test_the_describe_container_is_composed_line_by_line_too() -> None:
         "describe",
         "/probe/x/request.json",
     ]
-
-
-async def test_the_exec_carries_the_user_the_run_does() -> None:
-    """§9.3 is a permissions problem otherwise.
-
-    "Everything the program writes lands on a bind mount this server has
-    to read back … a build that left root-owned files behind would make
-    egress a permissions problem" — and it is the *exec* that writes
-    them, not the idle main process the container was started with.
-    """
-    spawned: list[list[str]] = []
-
-    async def spawner(argv, *, on_line):
-        spawned.append(list(argv))
-        return None
-
-    docker = Docker("docker", spawner=spawner)
-    await docker.invoke(
-        container="c" * 64,
-        action="build",
-        request=Path("/s/invocations/inv-1/request.json"),
-        on_line=lambda line: None,
-        user="1000:1000",
-    )
-    assert spawned[0][:4] == ["docker", "exec", "--user", "1000:1000"]
-
-
-async def test_a_container_that_does_not_start_is_a_typed_refusal() -> None:
-    """The third pre-start refusal, and the one with no test.
-
-    A daemon that dies between ``send-context`` and ``build`` answers
-    the ``run`` non-zero, and the image profile is already cached by
-    then so nothing else refuses first. ``builder.runtime-unavailable``
-    and retryable, because nothing about the context is wrong.
-    """
-    refused = Completed(status=1, output="docker: Error response from daemon: no space left\n")
-    docker = Docker("docker", runner=_runner([refused]))
-    with pytest.raises(SessionError) as excinfo:
-        await docker.start(image="i", mounts=[], session_id="s-1")
-    assert excinfo.value.code == "builder.runtime-unavailable"
-    assert excinfo.value.to_envelope()["retryable"] is True
-
-    # And an answer that is not a container id is the same refusal: every
-    # later command puts this string in an argv.
-    nonsense = Completed(status=0, output="Unable to find image 'i' locally\n")
-    with pytest.raises(SessionError):
-        await Docker("docker", runner=_runner([nonsense])).start(
-            image="i", mounts=[], session_id="s-1"
-        )
-
-
-def test_the_container_carries_the_label_that_finds_it_again() -> None:
-    """Backend policy, which §11 leaves free, and it earns its place:
-    a server that is killed outright leaves its containers behind, and
-    there is deliberately no startup sweep — two servers on one host is a
-    configuration, and a sweep would reap the other's live sessions."""
-    argv = container.session_run_command(docker="docker", image="i", mounts=[], session_id="s-42")
-    assert "org.mcuhome.build-server.session=s-42" in argv
 
 
 async def test_no_docker_binary_and_no_daemon_are_told_apart() -> None:
@@ -365,11 +221,3 @@ async def test_a_partial_inspect_answer_never_mis_attributes_an_image() -> None:
         "a:1": "sha256:" + "a" * 64,
         "c:1": "sha256:" + "c" * 64,
     }
-
-
-async def test_removing_a_container_never_raises() -> None:
-    """Every caller is already closing something, and a cleanup that
-    turned a refusal into the news would tell the client the wrong
-    story."""
-    docker = Docker("docker", runner=_runner([Completed(status=1, output="No such container")]))
-    await docker.remove("deadbeefcafe")

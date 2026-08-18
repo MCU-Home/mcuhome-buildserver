@@ -36,6 +36,7 @@ import hashlib
 import io
 import json
 import tarfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -43,6 +44,7 @@ from typing import Any
 import pytest
 import zstandard
 from mcuhome.model.buildimage import CONTRACT_LABEL, TOOLCHAIN_LABEL, ZEPHYR_LABEL
+from mcuhome.workbench import orchestrator
 from ruamel.yaml import YAML
 
 from mcuhome_buildserver import container
@@ -187,6 +189,37 @@ class FakeProcess:
             self.kill()
 
 
+class _Driven:
+    """A scripted program, as the orchestrator's spawn seam answers one.
+
+    The orchestrator's handle is **synchronous** — it is driven from a
+    worker thread, where blocking is the point — so this wraps the
+    suite's :class:`FakeProcess` rather than replacing it: the scripted
+    behaviour a test wants (finishes, hangs, ignores SIGTERM) is stated
+    in one place and read by both profiles' seams.
+    """
+
+    output = ""
+
+    def __init__(self, process: FakeProcess) -> None:
+        self._process = process
+
+    def poll(self) -> int | None:
+        """``None`` while the scripted program is still hanging."""
+        return None if self._process._hang else self._process._code
+
+    def wait(self) -> int | None:
+        while self._process._hang:
+            time.sleep(0.005)
+        return self._process._code
+
+    def terminate(self) -> None:
+        self._process.terminate()
+
+    def kill(self) -> None:
+        self._process.kill()
+
+
 @dataclass
 class FakeDocker:
     """Docker as this suite has it: argv in, scripted answers out.
@@ -221,6 +254,11 @@ class FakeDocker:
     #: difference.
     pullable: dict[str, dict[str, Any]] = field(default_factory=dict)
     pulls: list[str] = field(default_factory=list)
+    #: Scripted programs currently running in a container, so that
+    #: removing it can end them — which is what a real ``docker rm
+    #: --force`` does and the whole reason teardown is the ladder's last
+    #: rung.
+    running: list[Any] = field(default_factory=list)
     containers: list[str] = field(default_factory=list)
     #: ``container target -> host source``, from the mounts of the
     #: ``docker run`` that created the session's container.
@@ -242,6 +280,10 @@ class FakeDocker:
         # digest a context pins it with, and the tag `image ls` lists.
         self.images.setdefault(IMAGE_REFERENCE, inspected)
         self.images.setdefault(f"{IMAGE}:{image_tag}", inspected)
+        # And under the full pinned spelling, which is what docker
+        # actually resolves and what a context carries: tag *and* digest
+        # in one reference.
+        self.images.setdefault(IMAGE_REFERENCE_FORMAT3, inspected)
         self.listed = self.listed or [f"{IMAGE}:{image_tag}"]
         #: §2.2.1's static self-description: the default fake image
         #: carries none, so the backend exercises the invoke-describe
@@ -257,6 +299,17 @@ class FakeDocker:
     # -- the two seam functions ------------------------------------
 
     async def run(self, argv):
+        """The discovery seam: asked from verb handlers, on the loop."""
+        return self.answer(argv)
+
+    def answer(self, argv, on_line=None):
+        """The same docker, answered synchronously.
+
+        The orchestrator drives a container from a worker thread and its
+        seam is therefore synchronous, while this server's own discovery
+        happens on the event loop and its seam is not. One fake serves
+        both, because they are one docker.
+        """
         self.calls.append(list(argv))
         rest = list(argv[1:])
         # A runtime that is not there is not there for every command, not
@@ -302,6 +355,16 @@ class FakeDocker:
             return container.Completed(status=0, output=identity + "\n")
         if rest[:1] == ["rm"]:
             self.removed.append(rest[-1])
+            # Removing a container ends what was running in it, which is
+            # the whole reason the ladder's last rung is a teardown and
+            # not a signal: killing a `docker exec` client never reached
+            # the process inside. A fake that let a scripted program
+            # outlive its container would make that rung untestable —
+            # and would hang every test that ends a session while a
+            # build is still running, which is most of them.
+            for process in self.running:
+                process.kill()
+            self.running.clear()
             return container.Completed(status=0, output="")
         raise AssertionError(f"the fake docker was asked something unexpected: {argv}")
 
@@ -353,6 +416,25 @@ class FakeDocker:
             cache = view["ccache"]
             view["ccache"] = {**cache, "path": str(self.host(cache["path"], required=False))}
         return view
+
+    def drive(self, argv, on_line=None):
+        """The orchestrator's spawn seam: synchronous, already finished.
+
+        A scripted program runs in the caller's own thread, so the
+        handle it answers with has an exit status from the start and the
+        liveness ladder walks over a process that is done. The tests
+        that are about the ladder script one that is not — in the
+        workbench's own suite, where the ladder lives.
+        """
+        argv = list(argv)
+        self.calls.append(argv)
+        assert argv[1] == "exec", f"only an invocation is spawned: {argv}"
+        request_path = self.host(argv[-1])
+        request = json.loads(request_path.read_text())
+        self.invocations.append(Invocation(action=argv[-2], argv=argv, request=request))
+        process = self.run_program(argv[-2], self.host_view(request), on_line or (lambda _: None))
+        self.running.append(process)
+        return _Driven(process)
 
     async def spawn(self, argv, *, on_line):
         self.calls.append(list(argv))
@@ -543,10 +625,21 @@ BUILD_REPORT = {
 
 @pytest.fixture(autouse=True)
 def docker(monkeypatch) -> FakeDocker:
-    """Docker, stubbed at the seam, for **every** test in this suite."""
+    """Docker, stubbed at **every** seam, for every test in this suite.
+
+    Four of them, because two different things drive one docker: this
+    server's own discovery (asynchronous, on the event loop) and the
+    orchestrator's driving of a container (synchronous, in a worker
+    thread). A suite that stubbed only its own would have the
+    orchestrator start real containers — which is exactly the defect
+    this fixture exists against, one layer further down than it used to
+    be.
+    """
     fake = FakeDocker()
     monkeypatch.setattr(container, "run_docker", fake.run)
     monkeypatch.setattr(container, "spawn_docker", fake.spawn)
+    monkeypatch.setattr(orchestrator, "_run_command", fake.answer)
+    monkeypatch.setattr(orchestrator, "_spawn_command", fake.drive)
     return fake
 
 

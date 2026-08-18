@@ -327,11 +327,19 @@ as a process and not loaded as a library.
 the one it runs in**. It MUST reject, typed, any session whose context
 requires a Zephyr line that build environment does not carry" (§1.2).
 
+**This is the one profile that cannot honour a context's pin**, and it
+says so rather than pretending. A context names the exact image its
+firmware is compiled in; here there is no image, because the host *is*
+the build environment. So what it compares is the nearest true question
+it can answer: the Zephyr line the **device model** was resolved against
+against the line this host carries. A container profile never asks that
+— it matches the pinned digest, which is stronger than any line.
+
 The line this environment carries is **discovered, never configured**,
 and it is discovered from the program: `describe` answers
 `program.trees.zephyr.version` (§7.1.1), west's spelling of it loses its
-leading `v` exactly as the build container's own `org.mcuhome.zephyr`
-label does, and the release is reduced to a line by the same function
+leading `v` exactly as a build container's own
+`org.mcuhome.build-environment.zephyr.version` label does, and the release is reduced to a line by the same function
 the container profile reads its labels through. A configuration knob for
 it would let an operator declare a line their filesystem does not carry,
 which is the exact claim the refusal exists against — and a constant in
@@ -340,10 +348,10 @@ the operator left out, true only while the program is the default one.
 `--program` is precisely the case where it would not be: a third party's
 binary over a build environment this server installed nothing of.
 
-A context requiring another line is `version.builder-unsatisfiable`,
-naming the line required and the lines served — the same code and the
-same details the container profile answers when no image on the host
-carries the line. A program that names **no** usable Zephyr version is
+A model resolved against another line is `version.builder-unsatisfiable`,
+naming the line required and the lines served — the same code the
+container profile answers with when it does not have the image a context
+pins. A program that names **no** usable Zephyr version is
 refused at discovery instead (`version.builder-unavailable`), so
 `capabilities` answers an empty inventory and `send-context` refuses:
 absence is never read as compatible (§2.1.1). That is also what a host
@@ -358,14 +366,13 @@ that exists in the `subprocess` profile":
 
 - `capabilities` lists **one entry per served line**, with the program's
   `id:version` as its reference, `digest: null` (there are no bytes to
-  fetch) and the `org.mcuhome.contract` and `org.mcuhome.zephyr` labels.
-  `org.mcuhome.toolchain` is **absent** — the coupling labels are
-  properties of an image, and this server cannot state the toolchain
-  identity of a host it did not build.
-- `manifest.yaml`'s `container:` block records `image: <program id>`,
-  `tag: <program version>`, `digest: null`. §3.2 makes the block "the
-  record of which build environment answered this context's requirement",
-  and that is what it is here.
+  fetch) and the contract and Zephyr labels. The toolchain label is
+  **absent** — the coupling labels are properties of an image, and this
+  server cannot state the toolchain identity of a host it did not build.
+- `send-context` answers `build_environment: <program id>:<version>`.
+  That is a statement about this host and not a resolution: `manifest.yaml`
+  repeats the client's own pin, here as everywhere, and what this field
+  tells a client is precisely that its pin was **not** what ran.
 
 ### Configuring the program
 
@@ -566,15 +573,15 @@ somebody wrote down.
    context must be locked, or the verb refuses before doing anything.
 2. **The context is re-measured.** Every file is re-hashed against the
    `files` list in the `manifest.yaml` this server wrote, and the three
-   pins in that manifest — `zephyr`, `mcuhome.package.sha256`,
-   `target.board` — are compared against the ones `send-context`
-   accepted. A disagreement is `context.integrity-mismatch` naming every
+   pins in that manifest — `build_environment`,
+   `mcuhome.package.sha256`, `target.board` — are compared against the
+   ones `send-context` accepted. A disagreement is `context.integrity-mismatch` naming every
    offending path, and it does **not** poison the session: nothing was
    applied to any tree. Contexts are small, so this runs before every
    invocation rather than once at the lock.
 3. **The container, lazily.** On the first working command of a session:
-   the context's Zephyr line is answered out of the inventory again and
-   the chosen image is named by digest from there on, `describe` is
+   the image the context pins is looked for in the inventory again — by
+   digest, which is also how it is named from there on — `describe` is
    asked (once per image per server start, then cached) and cross-checked
    against the §2.1 labels, the SDK package is found by `(version, sha256)` and
    unpacked into the session's own directory, the mounts are composed

@@ -21,33 +21,39 @@ classifiers = [
   "Topic :: Home Automation",
 ]
 
-# `mcuhome-model` is the one MCUHome dependency this server has, and the
-# only one it may ever have (ADR 0020 decision 4): the shared vocabulary
-# — the context format and the frozen context-ID rule of ADR 0018 §6,
-# which ADR 0019 §8 obliges this side to recompute from received bytes.
-# That rule is frozen precisely so both sides of the contract compute
-# the same value, so it must be one implementation shared, never two
-# that agree by inspection. The distribution exists since the E35
-# migration; it is dependency-free by construction (a property its own
-# packaging tests pin), so this line pulls in exactly the vocabulary and
-# nothing behind it. Not on PyPI while the repositories are private —
-# requirements-dev.txt installs it from the sibling checkout.
+# `mcuhome-workbench` is the MCUHome dependency this server has, and it
+# is a reversal: the rule used to be `mcuhome-model` and nothing else,
+# so that a build server "recomputes a context ID from bytes it received
+# off a socket and carries no build logic to do it". The rule outlived
+# the arrangement it protected. This server no longer orchestrates
+# anything: a session's build environment is the workbench's — the same
+# object a local build gets — and the alternative to depending on it was
+# a second implementation of the whole driving half of the build
+# contract, which is what there was, and which two green suites could
+# not keep in step.
 #
-# `ruamel.yaml` and `zstandard` are this server's own, and both exist
-# because `mcuhome-model` deliberately carries no dependencies: it is
-# the package that must be identical on both sides of the contract, so
-# it ships the format and the hash rule and neither a parser nor a
-# codec. `context.yaml` arrives as YAML and `manifest.yaml` is written
-# as YAML, so a parser and an emitter are needed here; the reference
-# emitter lives in `mcuhome.workbench.contextdir` and importing it is
-# what ADR 0020 decision 4 forbids. `zstandard` is the transport: the
-# context archive is tar.zst (E41), chosen for family consistency with
-# the SDK package the same contract pins, and the streaming decompressor
-# is what lets an ingress cap refuse a decompression bomb mid-stream
+# What has **not** reversed is the other edge. `mcuhome-compiler` is the
+# program that runs *inside* a build container; a build server that
+# imported it would carry a toolchain it exists to keep at arm's length,
+# and the container it drives would stop being the only thing that
+# compiles. The workbench reaches the compiler only through a dynamic
+# import for the build methods that need one, so nothing here loads it —
+# and `tests/test_freeze.py` pins both halves of that sentence, in the
+# syntax tree and at run time.
+#
+# `mcuhome-model` comes along behind the workbench and is still what the
+# frozen context-ID rule of ADR 0018 §6 lives in — one implementation
+# shared, never two that agree by inspection.
+#
+# `ruamel.yaml` and `zstandard` are this server's own. `context.yaml`
+# arrives as YAML and `manifest.yaml` is written as YAML, so a parser
+# and an emitter are needed here; `zstandard` is the transport, because
+# the context archive is tar.zst (E41) and the streaming decompressor is
+# what lets an ingress cap refuse a decompression bomb mid-stream
 # instead of after it has landed.
 dependencies = [
   "aiohttp>=3.10,<4",
-  "mcuhome-model",
+  "mcuhome-workbench",
   "ruamel.yaml>=0.18",
   "zstandard>=0.22",
 ]

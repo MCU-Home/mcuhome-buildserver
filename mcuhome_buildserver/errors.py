@@ -111,6 +111,11 @@ REGISTRY: dict[str, ErrorCode] = _seed(
         retryable=False,
         summary="an upload exceeded an ingress cap (size, entry count, depth), enforced streaming",
     ),
+    ErrorCode(
+        "policy.environment-denied",
+        retryable=False,
+        summary="the context pins a build environment from a repository this server does not run",
+    ),
     # session.* — the session machinery.
     ErrorCode(
         "session.unknown",

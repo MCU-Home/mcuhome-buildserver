@@ -46,6 +46,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from mcuhome.model.buildimage import IMAGE_REPOSITORY
+
+from mcuhome_buildserver.environments import repository_of
 from mcuhome_buildserver.security import DEFAULT_PAIR_FILE, read_token_file
 from mcuhome_buildserver.sessions import (
     DEFAULT_IDLE_TIMEOUT,
@@ -348,6 +351,27 @@ class Config:
     container_cpus: str | None = None
     container_pids: int | None = DEFAULT_CONTAINER_PIDS
 
+    #: The build environments this server is willing to run, as
+    #: repositories — no tag, no digest. **Always enforced**, and not a
+    #: consequence of :attr:`auto_pull`: a context's environment pin is
+    #: client-supplied, and the image found for it is matched by digest
+    #: alone, so without a list of repositories a pin decides which of
+    #: this host's images gets started with a session's mounts under it.
+    #: Defaults to MCUHome's own build container, which is what this
+    #: server exists to run; stating the option at all replaces that
+    #: default rather than adding to it, because an operator who lists
+    #: their own images must also be able to stop serving ours.
+    allowed_environments: tuple[str, ...] = (IMAGE_REPOSITORY,)
+
+    #: Fetch an allowed build environment this host does not have yet.
+    #: On by default: the environment is pinned to a digest and its
+    #: repository is on the list above, so there is exactly one set of
+    #: bytes that answers and fetching it is a convenience rather than a
+    #: decision. ``False`` is the server whose images an operator places
+    #: deliberately — an air-gapped one, or one that will not spend a
+    #: gigabyte of transfer on a client's say-so.
+    auto_pull: bool = True
+
     #: Where SDK packages are found, in search order (E48). ADR 0019's
     #: amendment fixes the order — "a local directory first, then
     #: ``packages.mcuhome.org``, then any other external source" — and
@@ -563,6 +587,19 @@ def _env_int(env: Mapping[str, str], name: str) -> int | None:
         raise SystemExit(f"{ENV_PREFIX + name} must be a whole number, not {raw!r}.") from None
 
 
+def _env_flag(env: Mapping[str, str], name: str) -> bool | None:
+    """A yes/no environment variable, or ``None`` when it is not set."""
+    raw = env.get(ENV_PREFIX + name)
+    if raw is None or not raw.strip():
+        return None
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise SystemExit(f"{ENV_PREFIX + name} must be yes or no, not {raw!r}.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mcuhome-build-server",
@@ -712,6 +749,28 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--allow-environment",
+        action="append",
+        metavar="REPOSITORY",
+        dest="allowed_environments",
+        help=(
+            "build-environment repository this server may run, without tag or digest "
+            "(repeatable). Stating it replaces the default, which is MCUHome's own "
+            f"build container ({IMAGE_REPOSITORY}). A context pinning any other "
+            "repository is refused before the image is touched"
+        ),
+    )
+    parser.add_argument(
+        "--no-auto-pull",
+        action="store_false",
+        dest="auto_pull",
+        default=None,
+        help=(
+            "never fetch a build environment; serve only images already on this host. "
+            "The allowlist above applies either way"
+        ),
+    )
+    parser.add_argument(
         "--ccache-dir",
         type=Path,
         metavar="PATH",
@@ -834,6 +893,41 @@ def load_config(
             if item.strip()
         ]
 
+    environments = list(args.allowed_environments or ())
+    if env.get(ENV_PREFIX + "ALLOW_ENVIRONMENTS"):
+        environments += [
+            item.strip()
+            for item in env[ENV_PREFIX + "ALLOW_ENVIRONMENTS"].split(",")
+            if item.strip()
+        ]
+    # An empty list is the operator asking this server to run nothing,
+    # which is a configuration mistake rather than a hardening step —
+    # every build would refuse and the message would name an empty
+    # allowlist. Saying so at startup beats saying it once per client.
+    for entry in environments:
+        repository = repository_of(entry)
+        if entry.startswith(repository) and entry != repository:
+            raise SystemExit(
+                f"--allow-environment takes a repository, not {entry!r}: no tag and no "
+                "digest. A tag moves and a digest would have to be relisted on every "
+                f"release — write {repository!r} instead."
+            )
+        if repository != entry:
+            # Docker's own shorthand for its own registry. Spelled out
+            # here rather than accepted quietly, so that the list an
+            # operator reads back is the list this server compares.
+            raise SystemExit(
+                f"--allow-environment wants the registry named too: write {repository!r} "
+                f"rather than {entry!r}."
+            )
+    allowed_environments = tuple(dict.fromkeys(environments)) or (IMAGE_REPOSITORY,)
+
+    auto_pull = args.auto_pull
+    if auto_pull is None:
+        auto_pull = _env_flag(env, "AUTO_PULL")
+    if auto_pull is None:
+        auto_pull = True
+
     limits: dict[str, int] = {}
     for attribute in _LIMIT_ATTRIBUTES:
         value = getattr(args, attribute, None)
@@ -892,6 +986,8 @@ def load_config(
         allowed_origins=tuple(dict.fromkeys(origins)),
         log_level=args.log_level or env.get(ENV_PREFIX + "LOG_LEVEL") or "INFO",
         allowed_patch_layers=tuple(dict.fromkeys(patch_layers)),
+        allowed_environments=allowed_environments,
+        auto_pull=auto_pull,
         context_root=context_root,
         docker=args.docker or env.get(ENV_PREFIX + "DOCKER") or DEFAULT_DOCKER,
         backend_profile=backend_profile,

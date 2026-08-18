@@ -83,6 +83,7 @@ from mcuhome_buildserver import (
     abi,
     artifacts,
     container,
+    environments,
     errors,
     events,
     processes,
@@ -1260,8 +1261,27 @@ class ContainerBackend(SessionBackend):
         this server can actually drive.
         """
         del context  # a digest answers itself; nothing is read off the bytes
+        # First, and before any `docker` command names this image: every
+        # gate below costs a container, so a conformance check cannot be
+        # what decides whether a stranger's image may run
+        # (:mod:`mcuhome_buildserver.environments`).
+        environments.check_allowed(
+            pins.build_environment.reference,
+            allowed=self.config.allowed_environments,
+            what="the context",
+        )
         await self.docker.require_runtime()
         facts = _find_pinned_image(await self.docker.inventory(), pin=pins.build_environment)
+        # And again on what the digest actually found. An image is
+        # matched by digest alone, so a context may name a listed
+        # repository while its pin belongs to an image from somewhere
+        # else entirely — checking only the client's spelling would be
+        # checking a string the client chose.
+        environments.check_allowed(
+            facts.reference,
+            allowed=self.config.allowed_environments,
+            what="the image its digest found",
+        )
         # Memoized per image, because `describe` costs a container start
         # and its answer is a property of the image — so the key has to
         # name bytes, or the memo starts answering for an image that no

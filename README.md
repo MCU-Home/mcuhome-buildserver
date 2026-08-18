@@ -103,6 +103,8 @@ the command line wins. `--help` lists them all.
 | `--pair-file` | `/share/mcuhome/build-server.token` | where the token is published for a same-host App pair (written only if the directory exists) |
 | `--allowed-origin` | none | accepted browser origin for the WebSocket upgrade (repeatable) |
 | `--allow-patch-layer` | none | allow build-context patches for a layer (`sdk`, `zephyr`, `chip`, `mcuboot`, or an `x-` name); repeatable; unlisted layers are denied |
+| `--allow-environment` | `ghcr.io/mcu-home/build-container` | build-environment repository this server may run, without tag or digest; repeatable. Stating it **replaces** the default. `container` profile only |
+| `--no-auto-pull` | fetches | never fetch a build environment; serve only what is already on this host. The allowlist above applies either way |
 | `--sdk-source` | none | directory holding `mcuhome-sdk-<version>.tar.zst`; repeatable and searched in order. With none configured, every working action refuses `sdk.unavailable` |
 | `--backend-profile` | `container` | which profile of contract §1.2 serves: `container` or `subprocess` |
 | `--program` | the installed compiler | `subprocess` profile only: the executable implementing the invocation ABI |
@@ -278,6 +280,46 @@ documents, the SDK verified against its pin, the event and log relay,
 egress hardening, the verdict and the artifact download are
 `SessionBackend`'s and are shared verbatim. §9.1 says of that list that
 "neither shape moves a duty from this list onto the program".
+
+### Which build environments this server runs
+
+A context names its build environment itself, pinned to a digest, and
+that pin **comes from the client**. `--allow-environment` is the list of
+repositories this server is willing to run, and it is always enforced —
+it is not a consequence of whether fetching is switched on.
+
+It has to be, because every other gate costs a container. Reading an
+image's static self-description is `docker run <image> cat
+/mcuhome/describe.json`, and a `cat` argument does not displace an
+image's own `ENTRYPOINT`; `describe` starts the program on purpose. By
+the time labels are read, the image has run — and a label is a string
+anybody can put in a Dockerfile, which is why the contract calls labels
+"a pre-start hint". So the allowlist is checked first, before any
+`docker` command names the image.
+
+It is checked **twice**, against the two different claims a pin makes:
+
+- the reference the context states — what the client *says*;
+- the repository of the image its digest actually found — what the pin
+  *is*. An image is matched by digest alone, so a context can name a
+  listed repository while its digest belongs to an image from somewhere
+  else entirely, and a check on the client's spelling would be a check
+  on a string the client chose.
+
+Entries are whole repositories (`registry/path`), compared exactly. No
+tags, because a tag moves; no digests, because they would have to be
+relisted on every release; no wildcards, because `ghcr.io/*` reads as
+"our images" and means "everybody's".
+
+This is also what makes `--no-auto-pull`'s default — fetching — a
+convenience question rather than a trust one: the reachable set is the
+operator's own list either way, and within it a pinned digest names
+exactly one set of bytes. A server whose images an operator places
+deliberately switches fetching off; the allowlist does not change.
+
+The `subprocess` profile has no allowlist and needs none: it starts no
+image, honours no pin, and answers with the environment it runs in
+(below).
 
 ### What the `subprocess` profile does not promise
 
@@ -855,6 +897,10 @@ release.
 Patch policy is configuration (`--allow-patch-layer`, deny by default):
 the server's patch configuration **is** the policy, and `capabilities`
 advertises it per layer so a client fails fast instead of mid-session.
+
+Environment policy is configuration in the same way (`--allow-environment`,
+see above): a context pinning a repository this server does not run is
+`policy.environment-denied`, refused before the image is touched.
 
 **A build container's own failures reach this envelope through one
 explicit table.** The contract deliberately does not freeze that mapping

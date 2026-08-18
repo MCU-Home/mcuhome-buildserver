@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **An allowlist of build-environment repositories** (`--allow-environment`,
+  default `ghcr.io/mcu-home/build-container`), always enforced and
+  independent of whether fetching is switched on. A context's environment
+  pin is client-supplied and an image is matched by digest alone, so
+  without it a pin decides which of a host's images gets started with a
+  session's mounts under it. Checked **before any `docker` command names
+  the image**, because every other gate costs a container: reading an
+  image's static self-description runs it, and `describe` runs its
+  program on purpose — a conformance check cannot be what decides
+  whether a stranger's image may execute. Checked twice, against the
+  reference the context states and against the repository its digest
+  actually found. Refusal: `policy.environment-denied`.
+- `--no-auto-pull`, for a server whose images an operator places
+  deliberately. Fetching is the default: inside the allowlist a pinned
+  digest names exactly one set of bytes.
+
 ### Changed
 
 - **This server no longer chooses a build environment; it finds the one

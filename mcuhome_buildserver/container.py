@@ -6,11 +6,13 @@
 composes argv, it runs it, and it says what came back; it knows nothing
 about sessions, contexts or the invocation ABI. That split is what makes
 the rest of the backend testable without a container runtime, and it is
-the same shape the reference workbench backend uses
-(``mcuhome/compiler/container.py``) — which this server may read and may
-never import: that module is the **workbench-side** backend of the same
-contract, and a build server importing it would make the fat half of the
-product a dependency of the thin one (ADR 0003, ADR 0020 decision 4).
+the same shape the workbench's own orchestrator uses
+(``mcuhome/workbench/orchestrator.py`` in mcu-home/mcuhome) — which this
+server may read and, today, does not import: that module drives the same
+contract from a host, and the two are the same lifecycle written for two
+worlds (a session state machine over a socket here, one blocking drive
+there). Which of the two survives is the open question of the rebuild;
+until it is answered, this stays this server's own.
 
 **Two impure functions, and everything goes through them.**
 :func:`run_docker` runs a short command to completion and answers its

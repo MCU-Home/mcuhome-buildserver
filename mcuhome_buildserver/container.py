@@ -65,7 +65,16 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from mcuhome.model.context import ContainerResolution
+# The three image labels of contract §2.1 are **pre-start scheduling
+# data**: they let this server recognize a build environment before
+# paying for a container start. They are not authoritative about what the
+# program can do — ``describe`` is — which is why
+# :mod:`mcuhome_buildserver.backend` cross-checks them against it before
+# relying on them. Imported rather than spelled: the names belong to the
+# contract, and the repository that publishes an environment writes
+# exactly these strings onto it, so a second copy here is how one side
+# starts looking for a label the other stopped writing.
+from mcuhome.model.buildimage import CONTRACT_LABEL, TOOLCHAIN_LABEL, ZEPHYR_LABEL
 
 from mcuhome_buildserver.errors import SessionError
 from mcuhome_buildserver.processes import (
@@ -102,15 +111,6 @@ logger = logging.getLogger(__name__)
 #: fixed at container creation, and the invocation is resolved without a
 #: shell — so there is no lookup to fall back on.
 PROGRAM = "/mcuhome/run"
-
-#: The three labels of contract §2.1. They are **pre-start scheduling
-#: data**: they let this server pick an image before paying for a
-#: container start. They are not authoritative about what the program can
-#: do — ``describe`` is — which is why :mod:`mcuhome_buildserver.backend`
-#: cross-checks them against it before relying on them.
-CONTRACT_LABEL = "org.mcuhome.contract"
-ZEPHYR_LABEL = "org.mcuhome.zephyr"
-TOOLCHAIN_LABEL = "org.mcuhome.toolchain"
 
 #: What the session's container runs as its main process. Contract §2.2
 #: makes starting the container the backend's business — ``docker run``
@@ -314,7 +314,7 @@ class Docker:
     async def inventory(self) -> tuple[ImageFacts, ...]:
         """Every local image that claims contract conformance.
 
-        The filter is the ``org.mcuhome.contract`` label, which is what
+        The filter is the ``org.mcuhome.build-environment.contract`` label, which is what
         §2.1 calls it: pre-start scheduling data. It is a *hint* here in
         the strongest sense — an image lands in this list for carrying a
         label, and what it can actually do is settled by ``describe``
@@ -536,6 +536,17 @@ def _string_list(value: Any) -> list[str]:
     return [str(entry) for entry in value] if isinstance(value, list) else []
 
 
+def _repository_of(reference: str) -> str:
+    """*reference* with any digest and tag removed, spelled as docker spells it.
+
+    A tag is what follows the last colon when that tail carries no slash
+    — a colon inside a registry's ``host:port`` is not one.
+    """
+    name, _, _ = reference.partition("@")
+    head, colon, tail = name.rpartition(":")
+    return head if colon and "/" not in tail else name
+
+
 def _facts_from(reference: str, data: dict[str, Any]) -> ImageFacts:
     """One ``docker image inspect`` object, as facts.
 
@@ -559,15 +570,19 @@ def _facts_from(reference: str, data: dict[str, Any]) -> ImageFacts:
 
     A repository with a tag but no pushed digest therefore gets
     ``digest=None``, which is the honest answer for it and the same one
-    a never-pushed image gets:
-    :meth:`~mcuhome.model.context.ContainerResolution.reference` then
-    names it by the tag this host lists it under, which is a name that
-    does resolve.
+    a never-pushed image gets. Such an image is still identifiable —
+    :attr:`ImageFacts.image_id` is what a context pinned on this host
+    names it by — it is simply not identifiable anywhere else.
     """
     config = data.get("Config")
     labels = config.get("Labels") if isinstance(config, dict) else None
     digests = data.get("RepoDigests")
-    repository = ContainerResolution.from_reference(reference, digest=None).image
+    # The repository half of the listed reference, with tag and any
+    # digest taken off — the key a RepoDigests entry has to match.
+    # Deliberately *not* expanded to a fully qualified name: docker elides
+    # `docker.io/` on both sides of this comparison, and normalizing one
+    # side would stop a Hub image from ever matching its own digest.
+    repository = _repository_of(reference)
     digest = None
     if isinstance(digests, list):
         for entry in digests:

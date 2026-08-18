@@ -24,9 +24,8 @@ from mcuhome_buildserver.app import ServerState, create_app
 from mcuhome_buildserver.config import Config
 from tests.conftest import (
     CONTEXT_YAML,
-    IMAGE,
-    IMAGE_DIGEST,
-    ZEPHYR_LINE,
+    IMAGE_LABELS,
+    IMAGE_REFERENCE_FORMAT3,
     auth,
     base_context,
     call,
@@ -81,10 +80,11 @@ async def test_send_context_accepts_a_base_context_and_answers_its_pins(client) 
         "format": sessions.CONTEXT_FORMAT_MAX,
     }
     assert body["pins"]["mcuhome"]["package"]["sha256"] == "a" * 64
-    assert body["pins"]["zephyr"] == ZEPHYR_LINE
+    # Format 3: the client pins the build environment with full reference + digest
+    assert body["pins"]["build_environment"].startswith(
+        "ghcr.io/mcu-home/build-container:zephyr-4.4.0-r10@sha256:"
+    )
     assert body["pins"]["target"] == {"board": "nrf7002dk/nrf5340/cpuapp"}
-    # The pins are what the client sent, and it sent no container (E61).
-    assert "container" not in body["pins"]
 
 
 async def test_send_context_answers_the_serving_container(client) -> None:
@@ -108,9 +108,9 @@ async def test_send_context_answers_the_serving_container(client) -> None:
 
     assert set(frame["payload"]) == {"session_id", "context", "pins", "container"}
     serving = frame["payload"]["container"]
-    assert serving["image"] == IMAGE
-    assert serving["tag"] == "zephyr-4.4.0-r4"
-    assert serving["digest"] == IMAGE_DIGEST
+    # Format 3: the serving container is named by build_environment (reference with digest)
+    # The server normalizes to just repository@digest, the digest is what identifies the image
+    assert serving["build_environment"] == f"ghcr.io/mcu-home/build-container@sha256:{'b' * 64}"
     assert serving["contract"] == 1
     assert serving["program"] == "org.mcuhome.build-container"
     assert serving["actions"] == ["describe", "verify", "build"]
@@ -119,17 +119,15 @@ async def test_send_context_answers_the_serving_container(client) -> None:
 async def test_a_context_requiring_a_line_this_host_lacks_is_refused(client, docker) -> None:
     """``version.builder-unsatisfiable``, at the moment the pins arrive.
 
-    The line is answered out of this host's **local** image inventory and
-    nothing is pulled, so a line that is not here is a final answer
-    rather than a fetch this server declined to make. Refusing at
-    ``send-context`` is the useful moment: the client can go to a server
-    that serves the line, without having paid for a lock — and the
-    context is discarded, so nothing of it is left in a session that
-    could never have built it.
+    Format 3: the client pins the build environment with a full reference.
+    The server looks for the pinned image in its local inventory. If not
+    found, it is a final answer (not retryable) rather than a fetch this
+    server declined to make. Refusing at ``send-context`` is the useful
+    moment: the client can go to a server that serves the image, without
+    having paid for a lock.
 
-    The details name both sides, which is what makes the refusal
-    actionable without an operator: the line required, and the lines this
-    server actually offers.
+    The details name both sides: the reference required (what the client
+    pinned) and the references this server actually has.
     """
     docker.images.clear()
     docker.listed = []
@@ -140,57 +138,52 @@ async def test_a_context_requiring_a_line_this_host_lacks_is_refused(client, doc
     error = frame["error"]
     assert error["code"] == "version.builder-unsatisfiable"
     assert error["retryable"] is False
-    assert error["details"]["required"] == ZEPHYR_LINE
+    assert (
+        error["details"]["required"]
+        == f"ghcr.io/mcu-home/build-container:zephyr-4.4.0-r10@sha256:{'b' * 64}"
+    )
     assert error["details"]["available"] == []
 
 
 async def test_a_context_requiring_another_line_than_the_inventory_serves(client, docker) -> None:
-    """The same refusal when this host has images, of the wrong line.
+    """Format 3: the client pins a specific image digest.
 
-    "A container that does not carry a named label does not qualify —
-    absence is never read as compatible" (§2.1.1), and neither is a
-    label of another line. The offered lines travel in the details so the
-    client can see what it *could* have asked for.
-
-    **Lines, and not the label values they were read off.** The image
-    carries the release ``4.5.0``; what is reported is ``4.5``, which is
-    what a client would put in a context's ``zephyr``. Echoing the label
-    back would offer a frozen point release — the thing ADR 0013's "a
-    line, never a frozen point release" forbids — under a field name
-    both ADR 0019 and the error registry spell "the lines available".
+    When this host has images of the same repository but with different
+    digests (different releases), and the pinned digest is not available,
+    the server refuses. The offered references travel in the details so the
+    client or operator can see what is actually available.
     """
-    for facts in docker.images.values():
-        facts["Config"]["Labels"]["org.mcuhome.zephyr"] = "4.5.0"
+    # Clear all images and add only a different release
+    docker.images.clear()
+    docker.listed = []
+
+    other_digest = "sha256:" + "e" * 64
+    other_tag = "zephyr-4.4.2-r1"
+    other_ref = f"ghcr.io/mcu-home/build-container:{other_tag}"
+    other_digest_ref = f"ghcr.io/mcu-home/build-container@{other_digest}"
+
+    docker.images[other_digest_ref] = {
+        "Id": "sha256:" + "d" * 64,
+        "RepoTags": [other_ref],
+        "RepoDigests": [other_digest_ref],
+        "Config": {"Labels": dict(IMAGE_LABELS)},
+    }
+    docker.images[other_ref] = docker.images[other_digest_ref]
+    docker.listed = [other_ref]
+
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         frame = await send_archive(ws, "send-context", session_id, base_context())
 
     error = frame["error"]
     assert error["code"] == "version.builder-unsatisfiable"
-    assert error["details"]["required"] == ZEPHYR_LINE
-    assert error["details"]["available"] == ["4.5"]
-
-
-async def test_a_prerelease_label_is_not_reported_as_a_line_available(client, docker) -> None:
-    """A suffixed release serves no line, so it offers the client nothing.
-
-    ``4.5.0-rc1`` is a legal ``org.mcuhome.zephyr`` value (§2.1.1) and
-    :func:`~mcuhome.model.toolchain.satisfies_line` matches it against no
-    line at all, its own included. Reporting it as "available" would hand
-    the client a value it cannot use in any spelling: ``4.5.0-rc1`` fails
-    ``validate_zephyr_line`` on the way in, and ``4.5``/``4.5.0`` fail the
-    match against the label. So it is simply not among the lines served,
-    and an inventory of nothing but pre-releases serves nothing.
-    """
-    for facts in docker.images.values():
-        facts["Config"]["Labels"]["org.mcuhome.zephyr"] = "4.5.0-rc1"
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id = await open_session(ws)
-        frame = await send_archive(ws, "send-context", session_id, base_context())
-
-    error = frame["error"]
-    assert error["code"] == "version.builder-unsatisfiable"
-    assert error["details"]["available"] == []
+    # The required field contains the full reference the client pinned (with tag and digest)
+    assert (
+        error["details"]["required"]
+        == f"ghcr.io/mcu-home/build-container:zephyr-4.4.0-r10@sha256:{'b' * 64}"
+    )
+    # Available should list what references the server has
+    assert len(error["details"]["available"]) > 0
 
 
 async def test_a_container_runtime_that_is_down_is_retryable(client, docker) -> None:
@@ -872,14 +865,17 @@ def test_the_context_root_falls_back_to_state_and_then_to_the_temporary_dir() ->
     ("what", "document"),
     [
         ("duplicate keys", CONTEXT_YAML + "target:\n  board: other\n"),
-        ("an anchor", CONTEXT_YAML.replace("context: 2", "context: &c 2\nalias: *c")),
-        ("no pins at all", "context: 2\n"),
-        ("a second document", CONTEXT_YAML + "---\ncontext: 2\n"),
+        ("an anchor", CONTEXT_YAML.replace("context: 3", "context: &c 3\nalias: *c")),
+        ("no pins at all", "context: 3\n"),
+        ("a second document", CONTEXT_YAML + "---\ncontext: 3\n"),
         ("a python tag", CONTEXT_YAML + "extra: !!python/object/apply:os.system ['id']\n"),
-        ("a wrong format version", CONTEXT_YAML.replace("context: 2", "context: 9")),
+        ("a wrong format version", CONTEXT_YAML.replace("context: 3", "context: 9")),
         (
-            "a zephyr line that is not one",
-            CONTEXT_YAML.replace(f"zephyr: '{ZEPHYR_LINE}'", "zephyr: v4.4.0"),
+            "a build_environment that is not one",
+            CONTEXT_YAML.replace(
+                f"build_environment: {IMAGE_REFERENCE_FORMAT3}",
+                "build_environment: not-a-reference",
+            ),
         ),
         (
             "a prefixed package hash",
@@ -1863,16 +1859,16 @@ def test_the_two_informational_pin_fields_may_be_empty(tmp_path) -> None:
     """
     document = tmp_path / "context.yaml"
     document.write_text(
-        "context: 2\n"
+        "context: 3\n"
         "mcuhome:\n"
         "  constraint: ''\n"
         "  version: 2.4.0\n"
         "  package: {url: '', sha256: '" + "a" * 64 + "'}\n"
-        "zephyr: '4.4'\n"
+        f"build_environment: ghcr.io/mcu-home/build-container:zephyr-4.4.0-r10@sha256:{'b' * 64}\n"
         "target: {board: nrf7002dk/nrf5340/cpuapp}\n",
         encoding="utf-8",
     )
-    pins = contextstore.parse_context_yaml(document, expected_version=2, max_bytes=65536)
+    pins = contextstore.parse_context_yaml(document, expected_version=3, max_bytes=65536)
     assert pins.sdk.constraint == ""
     assert pins.sdk.url == ""
     assert pins.sdk.version == "2.4.0"
@@ -1886,14 +1882,14 @@ def test_a_version_that_is_not_a_version_is_refused_at_the_pins(tmp_path) -> Non
     for hostile in ("../../../etc/x", "a/b", ".hidden", "", "x" * 80):
         document = tmp_path / "context.yaml"
         document.write_text(
-            "context: 2\n"
+            "context: 3\n"
             "mcuhome:\n"
             "  constraint: ''\n"
             f"  version: '{hostile}'\n"
             "  package: {url: '', sha256: '" + "a" * 64 + "'}\n"
-            "zephyr: '4.4'\n"
+            f"build_environment: {IMAGE_REFERENCE_FORMAT3}\n"
             "target: {board: nrf7002dk/nrf5340/cpuapp}\n",
             encoding="utf-8",
         )
         with pytest.raises(protocol.ProtocolError):
-            contextstore.parse_context_yaml(document, expected_version=2, max_bytes=65536)
+            contextstore.parse_context_yaml(document, expected_version=3, max_bytes=65536)

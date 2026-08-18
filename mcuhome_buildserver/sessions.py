@@ -165,8 +165,8 @@ SESSION_PROTOCOL_VERSION = 2
 #: pin-shaped `container` block it needs — for documents no client
 #: writes. `mcuhome-model` dropped the format outright, so accepting it
 #: here is not even possible any more.
-CONTEXT_FORMAT_MIN = 2
-CONTEXT_FORMAT_MAX = 2
+CONTEXT_FORMAT_MIN = 3
+CONTEXT_FORMAT_MAX = 3
 
 #: The session profiles. The profile drives admission, TTL, idle
 #: timeout and the per-profile resource budget; commands outside the
@@ -1248,7 +1248,7 @@ def capabilities_payload(state: Any, containers: list[dict[str, Any]]) -> dict[s
     id, because there is no session yet to carry.
 
     ``containers`` is real since the container backend landed: every
-    local image carrying the ``org.mcuhome.contract`` label, with its
+    local image carrying the ``org.mcuhome.build-environment.contract`` label, with its
     reference, its repo digest and its three §2.1 labels — which is
     ADR 0019 §2's "tag + digest + contract labels". The labels are
     pre-start scheduling data and are answered as such: an image is in
@@ -1667,11 +1667,11 @@ async def send_context(state: Any, connection: Any, command: Command) -> dict[st
             )
             recheck_patch_policy(paths.context, frozenset(state.config.allowed_patch_layers))
             context_yaml_sha256 = sha256_file(entry)
-            # Selection last, and inside the same guard: a Zephyr line
-            # this host cannot serve makes the whole send-context a
+            # The environment last, and inside the same guard: an image
+            # this host does not have makes the whole send-context a
             # refusal, so the context goes with it rather than sitting in
-            # a session that can never build against it.
-            image = await state.backend.resolve_image(pins)
+            # a session that can never build.
+            image = await state.backend.resolve_image(pins, paths.context)
         except BaseException:
             session.discard_context()
             raise
@@ -2107,9 +2107,6 @@ async def lock_context(state: Any, connection: Any, command: Command) -> dict[st
         identity = freeze_context(
             paths,
             session.pins,
-            # What `send-context` selected for this context's zephyr
-            # line. The freeze records the choice; it never makes one.
-            container=session.image.resolution,
             context_yaml_sha256=session.context_yaml_sha256,
         )
         # Kept, because attribution always uses the id this server

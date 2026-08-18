@@ -34,10 +34,13 @@ from tests.conftest import (
     CONTEXT_YAML,
     IMAGE,
     IMAGE_DIGEST,
+    IMAGE_LABELS,
+    IMAGE_REFERENCE_FORMAT3,
     ZEPHYR_LINE,
     auth,
     base_context,
     call,
+    context_yaml,
     device_model,
     make_archive,
     send_archive,
@@ -99,6 +102,7 @@ async def test_the_id_is_the_models_rule_over_the_bytes_received(client) -> None
     files = {"model/device-model.json": MODEL, "keys/signing.pub": b"public key"}
     expected = context_id(
         sdk_sha256=SDK_SHA256,
+        environment_digest=IMAGE_DIGEST,
         board=BOARD,
         files=[
             ContextFile(path=path, sha256=hashlib.sha256(data).hexdigest())
@@ -146,7 +150,9 @@ async def test_an_empty_context_has_an_identity_and_may_be_locked(client) -> Non
     beyond existence, ``keys/signing.pub`` above all, are checked by
     ``build``, which is where the contract scopes them.
     """
-    expected = context_id(sdk_sha256=SDK_SHA256, board=BOARD, files=())
+    expected = context_id(
+        sdk_sha256=SDK_SHA256, environment_digest=IMAGE_DIGEST, board=BOARD, files=()
+    )
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         frame = await send_and_lock(ws, session_id, base_context())
@@ -154,31 +160,51 @@ async def test_an_empty_context_has_an_identity_and_may_be_locked(client) -> Non
     assert frame["payload"]["context_id"] == expected
 
 
-async def test_a_model_of_another_line_than_the_context_requires_is_refused(client) -> None:
-    """The invariant §3.3's exclusion of ``zephyr`` from the ID rests on.
+async def test_two_contexts_differing_only_in_their_environment_get_two_identities(
+    client, docker
+) -> None:
+    """What replaced the model-versus-context cross-check, and why it is better.
 
-    The line is left out of the hash as "redundancy, not identity",
-    because it is provably inside the hashed device model. Nothing made
-    that provable: ``context.yaml`` is outside the integrity list by
-    construction, so a context requiring 4.5 beside a model resolved
-    against 4.4 has **the same ID** as the honest one — same files, same
-    SDK hash, same board. On a server holding images of both lines the
-    two would build in different containers, and both artifacts would be
-    attributed to that one ID, and both would pass ``verify``.
+    Under the format this replaced, the environment was outside the hash
+    and the required Zephyr line was a field of ``context.yaml`` — which
+    is outside the integrity list by construction. Two contexts with
+    byte-identical files and two different required lines therefore had
+    **one** ID, built in containers of two different lines, and both
+    passed ``verify``; a server-side cross-check against the model was
+    what kept that honest.
 
-    Refused at the freeze, which is the moment the identity is issued.
+    Now the environment is the hash's own input, so the two contexts are
+    two contexts and nothing has to be cross-checked to make it so. This
+    is that property, measured on this server: the same bytes, one pin
+    changed, two identities.
     """
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id = await open_session(ws)
-        frame = await send_and_lock(
-            ws, session_id, base_context(**{"model/device-model.json": device_model("4.5")})
-        )
+    other_digest = "sha256:" + "d" * 64
+    other = IMAGE_REFERENCE_FORMAT3.replace(IMAGE_DIGEST, other_digest)
+    # A second conforming environment on this host, so that both pins can
+    # actually be served and the only difference left is the digest.
+    second = f"{IMAGE}:zephyr-4.4.0-r11"
+    docker.images[second] = {
+        "Id": "sha256:" + "7" * 64,
+        "RepoTags": [second],
+        "RepoDigests": [f"{IMAGE}@{other_digest}"],
+        "Config": {"Labels": dict(IMAGE_LABELS)},
+    }
+    docker.listed = [*docker.listed, second]
 
-    error = frame["error"]
-    assert error["code"] == "context.integrity-mismatch"
-    assert error["details"]["paths"] == ["zephyr vs model/device-model.json"]
-    assert error["details"]["required"] == ZEPHYR_LINE
-    assert error["details"]["stated"] == "4.5"
+    identities = []
+    for pin in (IMAGE_REFERENCE_FORMAT3, other):
+        async with client.ws_connect("/ws", headers=auth()) as ws:
+            session_id = await open_session(ws)
+            frame = await send_and_lock(
+                ws,
+                session_id,
+                base_context(**{"context.yaml": context_yaml(build_environment=pin)}),
+            )
+            identities.append(frame)
+
+    assert all("payload" in frame for frame in identities), identities
+    first, second = (frame["payload"]["context_id"] for frame in identities)
+    assert first != second
 
 
 async def test_a_model_stating_the_required_line_locks_normally(client) -> None:
@@ -213,12 +239,11 @@ async def test_the_manifest_repeats_the_pins_and_adds_the_list_and_the_id(client
     its own: the document that carries an identity carries the inputs
     that identity was computed from" (ADR 0018's amendment).
 
-    Seven keys, exactly as build-container contract §3.2 draws them. The
-    seventh is ``zephyr``, the requirement the context stated; the
-    ``container`` block beside it is no longer a repeat of anything the
-    client sent but this server's own answer to it (E61), and the two
-    stand side by side for the same reason intent and resolution always
-    have in this document.
+    Six keys, exactly as build-container contract §3.2 draws them. The
+    sixth is ``build_environment``, and it is a **repeat**: the client
+    pinned it, this server records what it was handed. That is the whole
+    difference the format made here — the manifest gained nothing this
+    server decided, so two servers handed one context write one manifest.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
@@ -232,21 +257,15 @@ async def test_the_manifest_repeats_the_pins_and_adds_the_list_and_the_id(client
     assert set(manifest) == {
         "context",
         "mcuhome",
-        "zephyr",
-        "container",
+        "build_environment",
         "target",
         "files",
         "id",
     }
     assert manifest["context"] == sessions.CONTEXT_FORMAT_MAX
-    # The requirement, repeated verbatim from context.yaml…
-    assert manifest["zephyr"] == ZEPHYR_LINE
-    # …and this server's answer to it, which no client sent.
-    assert manifest["container"] == {
-        "image": IMAGE,
-        "tag": "zephyr-4.4.0-r4",
-        "digest": IMAGE_DIGEST,
-    }
+    # Verbatim from context.yaml, digest included: this server chose none
+    # of it and may not, because the digest is a hashed identity input.
+    assert manifest["build_environment"] == IMAGE_REFERENCE_FORMAT3
     assert manifest["mcuhome"]["constraint"] == "^2.3.6"
     assert manifest["target"] == {"board": BOARD}
     assert manifest["id"] == frame["payload"]["context_id"]
@@ -288,7 +307,7 @@ async def test_no_hash_in_the_manifest_is_wrapped_across_two_lines(client, state
 
     assert paths is not None
     text = (paths.context / "manifest.yaml").read_text(encoding="utf-8")
-    assert f"digest: {IMAGE_DIGEST}" in text
+    assert f"build_environment: {IMAGE_REFERENCE_FORMAT3}" in text
     assert f"id: {frame['payload']['context_id']}" in text
     assert f"sha256: {SDK_SHA256}" in text
     assert all(len(line) < 200 for line in text.splitlines()), "no runaway line either"
@@ -549,6 +568,7 @@ def test_the_model_keeps_both_context_documents_out_of_the_hash() -> None:
     for path in ("context.yaml", "manifest.yaml"):
         try:
             context_id(
+                environment_digest=IMAGE_DIGEST,
                 sdk_sha256=SDK_SHA256,
                 board=BOARD,
                 files=[ContextFile(path=path, sha256="c" * 64)],

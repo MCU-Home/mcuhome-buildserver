@@ -77,8 +77,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from mcuhome.model import containerpaths
-from mcuhome.model.context import ContainerResolution
-from mcuhome.model.toolchain import line_of, satisfies_line
+from mcuhome.model.context import EnvironmentPin
 
 from mcuhome_buildserver import (
     abi,
@@ -217,46 +216,36 @@ class ProgramProfile:
         return found if isinstance(found, str) else None
 
     @property
-    def resolution(self) -> ContainerResolution:
-        """This environment as ``manifest.yaml``'s ``container:`` records it.
+    def environment(self) -> str:
+        """How **this host** names the environment serving the session.
 
         The one thing a profile has to answer for itself, because it is
-        the one thing ``describe`` does not answer: §3.2 makes the block
-        "the record of which build environment answered this context's
-        requirement", and what an environment is *called* is exactly what
-        the two profiles do not share.
+        the one thing ``describe`` does not answer: what an environment
+        is *called* is exactly what the two profiles do not share. It no
+        longer goes into ``manifest.yaml`` — the client's pin does — so
+        this is a statement about this server, for a client that wants to
+        know what its pin was answered with.
         """
         raise NotImplementedError
 
     def to_wire(self) -> dict[str, Any]:
         """What ``send-context`` answers about the serving environment.
 
-        Since E61 this is a **resolution and not an echo**: the context
-        named no container, so every field here is something this server
-        decided. ``image`` and ``tag`` joined for exactly that reason —
-        under the digest-pinned format the client already knew them
-        because it had sent them, and now it does not. They are the same
-        three names ``manifest.yaml`` carries, so what a client reads off
-        this answer and what it reads off the manifest it gets back are
-        the same fields with the same values.
+        ``build_environment`` is now an **acknowledgement**: the context
+        pinned one image, this server found it, and this is the name that
+        image answers to here. It is worth answering even though the
+        client already knows what it asked for — the two spellings differ
+        (a client may pin an image the server lists under another tag),
+        and in the ``subprocess`` profile there is no image at all, which
+        this is the field that says.
 
-        ``digest`` may be ``null``, for an image built on this host and
-        never pushed — and is ``null`` always in the ``subprocess``
-        profile, where there is no image at all. That is a fact about the
-        environment rather than a gap: it names no bytes a client could
-        fetch, and saying so is the honest half of E60's promise that
-        these field names mean something.
-
-        The four fields after the resolution come out of ``describe``,
-        which is authoritative, rather than out of an image's labels,
-        which are a pre-start hint that is cross-checked against it — so
-        they are answered here once, for both profiles.
+        The four fields after it come out of ``describe``, which is
+        authoritative, rather than out of an image's labels, which are a
+        pre-start hint that is cross-checked against it — so they are
+        answered here once, for both profiles.
         """
-        resolution = self.resolution
         return {
-            "image": resolution.image,
-            "tag": resolution.tag,
-            "digest": resolution.digest,
+            "build_environment": self.environment,
             "contract": self.program.get("contract"),
             "program": self.identity,
             "version": self.program.get("version"),
@@ -288,15 +277,9 @@ class ImageProfile(ProgramProfile):
     facts: container.ImageFacts
 
     @property
-    def resolution(self) -> ContainerResolution:
-        """This image as ``manifest.yaml`` records it (E61).
-
-        The answer this server gave to the context's ``zephyr``
-        requirement, in the manifest's own vocabulary — so the freeze
-        writes a value it was handed rather than one it assembles from
-        docker's spelling.
-        """
-        return ContainerResolution.from_reference(self.facts.reference, digest=self.facts.digest)
+    def environment(self) -> str:
+        """How this host names the image: by digest where it has one."""
+        return _pinned(self.facts)
 
 
 @dataclass
@@ -442,8 +425,17 @@ class SessionBackend:
         """The build environments this server can serve, for ``capabilities``."""
         raise NotImplementedError
 
-    async def resolve_image(self, pins: ContextPins) -> ProgramProfile:
-        """The environment that serves a context's Zephyr line, or a refusal."""
+    async def resolve_image(self, pins: ContextPins, context: Path) -> ProgramProfile:
+        """The environment this context is built in, or a refusal.
+
+        *context* is the directory the bytes landed in. A container
+        profile answers out of *pins* alone — the pin is a digest and
+        that is the whole question — while the ``subprocess`` profile,
+        which cannot honour a digest at all, reads the model's Zephyr
+        line out of it. The parameter is here rather than on one
+        implementation because a session calls this without knowing
+        which profile it is talking to.
+        """
         raise NotImplementedError
 
     async def _session_environment(self, session: Any) -> ProgramProfile:
@@ -548,7 +540,7 @@ class SessionBackend:
             "session %s: %s build environment %s (context %s)",
             session.id,
             self.profile,
-            profile.resolution.reference(),
+            profile.environment,
             context_id,
         )
         return runtime
@@ -658,7 +650,7 @@ class SessionBackend:
                 "declaration of an action set there is.",
                 action=action,
                 actions=sorted(runtime.image.actions),
-                digest=runtime.image.resolution.digest,
+                environment=runtime.image.environment,
             )
         if runtime.busy:
             # One invocation at a time per `work` (§9.1). Pre-registry,
@@ -1245,8 +1237,8 @@ class ContainerBackend(SessionBackend):
             return []
         return [facts.to_wire() for facts in found]
 
-    async def resolve_image(self, pins: ContextPins) -> ImageProfile:
-        """The image that serves a context's Zephyr line, described and gated.
+    async def resolve_image(self, pins: ContextPins, context: Path) -> ImageProfile:
+        """The image the context pins, found on this host, described and gated.
 
         Called from ``send-context``, which is where ADR 0019's
         amendment puts container discovery: "``send-context`` answers
@@ -1255,23 +1247,21 @@ class ContainerBackend(SessionBackend):
         pins in hand does the backend know *which* container serves the
         session.
 
-        **This server chooses; the context only requires** (E61). The
-        requirement is ``pins.zephyr``, a Zephyr release line; the
-        candidates are the images of :meth:`~container.Docker.inventory`
-        — the same set ``capabilities`` announces, so a client that read
-        that answer and a server that acts on it are looking at one list
-        — and the choice among them is :func:`_select_image`. Nothing is
-        pulled, so an unsatisfiable line is a final answer and not a
-        deferred fetch.
+        **The client chose; this server finds or refuses.** The context
+        names one image, pinned to a digest, and it is hashed into the
+        context's identity — so an image "of the same line" is not a
+        substitute for it, and there is nothing here to select. Nothing
+        is pulled either, so an image this host does not have is a final
+        answer rather than a deferred fetch.
 
-        Four gates, in the order that makes each one's refusal legible:
-        the runtime is there; some image on this host carries the
-        required line; ``describe`` answers and answers conformingly; and
-        what ``describe`` said is something this server can actually
-        drive.
+        Three gates, in the order that makes each one's refusal legible:
+        the runtime is there; this host has the pinned image;
+        ``describe`` answers, answers conformingly, and says something
+        this server can actually drive.
         """
+        del context  # a digest answers itself; nothing is read off the bytes
         await self.docker.require_runtime()
-        facts = _select_image(await self.docker.inventory(), line=pins.zephyr)
+        facts = _find_pinned_image(await self.docker.inventory(), pin=pins.build_environment)
         # Memoized per image, because `describe` costs a container start
         # and its answer is a property of the image — so the key has to
         # name bytes, or the memo starts answering for an image that no
@@ -1436,11 +1426,10 @@ class ContainerBackend(SessionBackend):
             raise SessionError(
                 "version.builder-unavailable",
                 f"The build container {pinned} this session was answered with is no longer "
-                "on this host. It is the image send-context chose for this context's Zephyr "
-                "line and the one lock-context recorded as what built it, so the session "
-                "refuses rather than building in another image and recording this one.",
-                image=profile.resolution.image,
-                tag=profile.resolution.tag,
+                "on this host. It is the image the context pins and the one its identity is "
+                "computed over, so the session refuses rather than building in another "
+                "image and reporting this one.",
+                environment=pinned,
                 digest=profile.facts.digest,
             )
         return profile
@@ -1460,15 +1449,12 @@ class ContainerBackend(SessionBackend):
         mounts are composed, and the container is started with the
         resource limits §1.2 promises for this profile.
 
-        The image is not re-selected here — :meth:`_session_environment`
-        has already turned the session's own choice into a presence check
-        — because a second selection would re-open exactly what
-        ``manifest.yaml`` records: an operator pulling a newer release of
-        the same line between the lock and the first ``build`` would have
-        the build run in an image the manifest does not name, silently,
-        with no downstream check able to notice. The recorded resolution
-        is outside the ID by design and outside the per-invocation
-        re-check's pin list.
+        The image is not looked up again here —
+        :meth:`_session_environment` has already turned the context's pin
+        into a presence check — and there is nothing to look it up *by*
+        that could differ: the pin is a digest, so "the image this
+        context names" cannot come to mean other bytes between the lock
+        and the first ``build``.
         """
         assert isinstance(profile, ImageProfile)  # noqa: S101 - resolve_image's own type
         trees, mounts = self._arrange_trees(profile, paths, package, patched)
@@ -1753,70 +1739,47 @@ def _wire_status(outcome: abi.InvocationOutcome) -> str:
     return abi.STATUS_FAILURE
 
 
-def _select_image(
-    inventory: tuple[container.ImageFacts, ...], *, line: str
+def _find_pinned_image(
+    inventory: tuple[container.ImageFacts, ...], *, pin: EnvironmentPin
 ) -> container.ImageFacts:
-    """Which of this server's build containers serves *line*, or a refusal.
+    """The image this context is pinned to, out of what this host has.
 
-    The backend half of E61: a context requires a Zephyr line and this
-    picks the image that answers it. Candidates are exactly what
-    ``capabilities`` announces — every local image carrying the
-    ``org.mcuhome.contract`` label — and the property compared is the
-    ``org.mcuhome.zephyr`` coupling label, which §2.1.1 makes the image's
-    own statement of what it builds against. The match itself is
-    ``mcuhome-model``'s :func:`~mcuhome.model.toolchain.satisfies_line`,
-    borrowed for the reason the ID rule is borrowed: the local build
-    method matches the same requirement against an image on a developer's
-    machine, and two spellings of "this container serves 4.4" is how the
-    two start disagreeing about one container.
+    Matched on the **digest and nothing else**. A reference is a name and
+    names move; the digest is what the context's identity is computed
+    over, so an image that answers to the right name with other bytes is
+    not the pinned environment and building in it would attribute the
+    firmware to a context that does not describe it.
 
-    **The choice among several is the newest release of the line**, ties
-    broken by the reference string. It has to be deterministic — two
-    sessions sending one context to one server must build in one image,
-    or the manifests they get back describe different builds — and of the
-    deterministic rules available, "the newest patch release of the
-    required line" is the one ADR 0013 already argues for: "a line, never
-    a frozen point release — patch releases with security backports are
-    always taken".
+    Two digests can match, and both are legitimate. A **repository
+    digest** is what an image pulled from a registry carries, and it is
+    the portable case. An **image ID** is what an image built on a
+    machine and never pushed has instead, and a client on this same host
+    pins one of those by its ID — which is why a build server and its
+    client sharing a machine can use a container neither of them could
+    fetch.
 
-    An image whose label is absent, unparseable, or of another line is
-    simply not a candidate: "a container that does not carry a named
-    label does not qualify — absence is never read as compatible"
-    (§2.1.1).
+    Candidates are the images of :meth:`~container.Docker.inventory` —
+    the same set ``capabilities`` announces, so a client that read that
+    answer and a server that acts on it are looking at one list.
     """
-    candidates = [
-        facts
-        for facts in inventory
-        if satisfies_line(facts.labels.get(container.ZEPHYR_LABEL, ""), line=line)
-    ]
-    if not candidates:
-        # **Lines, not labels.** ADR 0019's amendment names this field
-        # "the lines actually served" and the error registry repeats it,
-        # so it carries what a client could actually put in a context's
-        # `zephyr`: a label states a *release*, and echoing releases back
-        # under the name of lines offers values that either pin a frozen
-        # point release (which ADR 0013 forbids) or, for a pre-release
-        # like `4.5.0-rc1`, satisfy no line at all — including their own.
-        # `line_of` is the reduction and `satisfies_line`'s own inverse,
-        # so every entry here is a line some image on this host serves.
-        offered = sorted(
-            {
-                served
-                for facts in inventory
-                if (served := line_of(facts.labels.get(container.ZEPHYR_LABEL, ""))) is not None
-            },
-            key=lambda entry: tuple(int(part) for part in entry.split(".")),
-        )
-        raise SessionError(
-            "version.builder-unsatisfiable",
-            f"No build container on this server carries Zephyr {line}. This server "
-            "answers a context's Zephyr line out of the images it already has and pulls "
-            f"nothing, so the {line} line has to be on this host before a context "
-            "requiring it can build.",
-            required=line,
-            available=offered,
-        )
-    return max(candidates, key=lambda facts: (_release_key(facts), facts.reference))
+    for facts in inventory:
+        if pin.digest in (facts.digest, facts.image_id):
+            return facts
+    # **What this host could build**, so the answer is actionable rather
+    # than only negative: every environment it has, named the way the
+    # client would have to name one. ADR 0019's amendment calls the field
+    # "the lines available"; under a pinned environment the equivalent
+    # fact is the set of environments, and a client cannot act on a line
+    # any more because a line is not what it sends.
+    offered = sorted({facts.reference for facts in inventory})
+    raise SessionError(
+        "version.builder-unsatisfiable",
+        f"This server does not have the build environment {pin.reference}. It builds "
+        "in the exact image a context pins and pulls nothing, so the image has to be "
+        "on this host before a context naming it can build.",
+        required=pin.reference,
+        available=offered,
+    )
 
 
 def _pinned(facts: container.ImageFacts) -> str:
@@ -1830,13 +1793,13 @@ def _pinned(facts: container.ImageFacts) -> str:
     ``docker`` call this backend makes about a chosen image names it by
     digest **wherever the image has one**.
 
-    Where it has none it is named by the tag ``inventory`` listed, and
-    that window stays open: an image built on this host and never pushed
-    carries no repo digest, which is why the manifest records
-    ``digest: null`` for it (§3.2). The format declares that window
-    rather than hiding it — such an image names no bytes anybody could
-    fetch, and there is nothing to pin it with that a client could ever
-    check.
+    Where it has none it is named by the tag ``inventory`` listed: an
+    image built on this host and never pushed carries no repo digest.
+    That is a narrower window than it reads: the *pin* such an image is
+    matched against is its docker ID, which is content-addressed and
+    changes on every rebuild, so a rebuild between the lock and the
+    build makes :meth:`~SessionBackend._session_environment` refuse
+    rather than silently building in the new bytes.
 
     The digest is the one docker paired with *this* reference's own
     repository (:func:`~mcuhome_buildserver.container._facts_from`), so
@@ -1846,20 +1809,14 @@ def _pinned(facts: container.ImageFacts) -> str:
     pulls nothing, an unresolvable name is a session that cannot build.
 
     The tag is **not** thrown away: it stays on ``facts.reference``,
-    which is how this host lists the image and what the manifest records
-    beside the digest.
+    which is how this host lists the image and how a log names it.
     """
-    return ContainerResolution.from_reference(facts.reference, digest=facts.digest).reference()
-
-
-def _release_key(facts: container.ImageFacts) -> tuple[int, ...]:
-    """A candidate's Zephyr release, ordered numerically.
-
-    Only ever called on a candidate :func:`_select_image` already
-    accepted, so the label is a suffix-free dotted number by
-    construction and there is nothing here to refuse.
-    """
-    return tuple(int(part) for part in facts.labels[container.ZEPHYR_LABEL].strip().split("."))
+    if not facts.digest:
+        return facts.reference
+    name, _, _ = facts.reference.partition("@")
+    head, colon, tail = name.rpartition(":")
+    repository = head if colon and "/" not in tail else name
+    return f"{repository}@{facts.digest}"
 
 
 def _not_conforming(facts: container.ImageFacts, problem: str) -> SessionError:
@@ -1927,7 +1884,7 @@ def _label_problem(program: dict[str, Any], facts: container.ImageFacts) -> str 
     "A backend MUST verify them against ``describe`` and MUST NOT rely
     on a label ``describe`` contradicts", and §7.1.1 goes further for
     the one label that has a counterpart in the block: ``program.contract``
-    "MUST equal the ``org.mcuhome.contract`` label; where the two
+    "MUST equal the ``org.mcuhome.build-environment.contract`` label; where the two
     disagree, ``describe`` is authoritative and the disagreement is a
     contract violation against the image".
 

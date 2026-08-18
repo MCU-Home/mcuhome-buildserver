@@ -42,6 +42,7 @@ from typing import Any
 
 import pytest
 import zstandard
+from mcuhome.model.buildimage import CONTRACT_LABEL, TOOLCHAIN_LABEL, ZEPHYR_LABEL
 from ruamel.yaml import YAML
 
 from mcuhome_buildserver import container
@@ -50,18 +51,15 @@ from mcuhome_buildserver.config import Config
 
 TOKEN = "test-token-000000000000000000000000"
 
-#: The Zephyr line the shared ``context.yaml`` requires — satisfied by
-#: the image below, whose ``org.mcuhome.zephyr`` label says ``4.4.0``.
-#: A *requirement*, not a pin: a context names no container since E61,
-#: and the server answers this line out of its own inventory.
+#: The Zephyr line and revision the build image has — spelled in its label.
+#: The client pins the full reference with digest.
 ZEPHYR_LINE = "4.4"
-
-#: A context.yaml that parses: the format version, the pin blocks spelled
-#: the one legal way (build-container contract §3.3.1), the Zephyr line
-#: the build container has to carry, and the informational fields that
-#: travel into manifest.yaml with them.
+IMAGE_REVISION = "r10"
+IMAGE_REFERENCE_FORMAT3 = (
+    f"ghcr.io/mcu-home/build-container:zephyr-4.4.0-{IMAGE_REVISION}@sha256:{'b' * 64}"
+)
 CONTEXT_YAML = f"""\
-context: 2
+context: 3
 created: 2026-08-09T10:00:00Z
 mcuhome:
   constraint: ^2.3.6
@@ -69,7 +67,7 @@ mcuhome:
   package:
     url: https://packages.mcuhome.org/mcuhome-sdk-2.4.0.tar.zst
     sha256: {"a" * 64}
-zephyr: '{ZEPHYR_LINE}'
+build_environment: {IMAGE_REFERENCE_FORMAT3}
 target:
   board: nrf7002dk/nrf5340/cpuapp
 """
@@ -99,18 +97,18 @@ def config(tmp_path: Path) -> Config:
     )
 
 
-#: The image this server selects for the shared ``context.yaml``, and the
+#: The image this server matches for the pinned ``build_environment``, and the
 #: labels contract §2.1 requires of it. Spelled here so that a test that
 #: changes one can see what a conforming image looks like beside it —
-#: the ``org.mcuhome.zephyr`` label above all, which is what makes this
-#: image the answer to :data:`ZEPHYR_LINE`.
+#: the ``org.mcuhome.build-environment.zephyr.version`` label above all,
+#: which is what matches the pin in :data:`IMAGE_REFERENCE_FORMAT3`.
 IMAGE = "ghcr.io/mcu-home/build-container"
 IMAGE_DIGEST = "sha256:" + "b" * 64
 IMAGE_REFERENCE = f"{IMAGE}@{IMAGE_DIGEST}"
 IMAGE_LABELS = {
-    "org.mcuhome.contract": "1",
-    "org.mcuhome.zephyr": "4.4.0",
-    "org.mcuhome.toolchain": "zephyr-sdk-1.0.1",
+    CONTRACT_LABEL: "1",
+    ZEPHYR_LABEL: "4.4.0",
+    TOOLCHAIN_LABEL: "zephyr-sdk-1.0.1",
 }
 
 #: A conforming ``describe`` ``program`` block: every field §7.1.1 makes
@@ -223,20 +221,21 @@ class FakeDocker:
     removed: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        image_tag = f"zephyr-4.4.0-{IMAGE_REVISION}"
         inspected = {
             "Id": "sha256:" + "c" * 64,
             # Both names docker itself reports for one image, because
             # both are what `Docker._inspect` matches its answer back to:
             # the tag `image ls` lists and the repo digest a context pins.
-            "RepoTags": [f"{IMAGE}:zephyr-4.4.0-r4"],
+            "RepoTags": [f"{IMAGE}:{image_tag}"],
             "RepoDigests": [f"{IMAGE}@{IMAGE_DIGEST}"],
             "Config": {"Labels": dict(IMAGE_LABELS)},
         }
         # The same image under both names docker resolves it by: the
         # digest a context pins it with, and the tag `image ls` lists.
         self.images.setdefault(IMAGE_REFERENCE, inspected)
-        self.images.setdefault(f"{IMAGE}:zephyr-4.4.0-r4", inspected)
-        self.listed = self.listed or [f"{IMAGE}:zephyr-4.4.0-r4"]
+        self.images.setdefault(f"{IMAGE}:{image_tag}", inspected)
+        self.listed = self.listed or [f"{IMAGE}:{image_tag}"]
         #: §2.2.1's static self-description: the default fake image
         #: carries none, so the backend exercises the invoke-describe
         #: fallback most tests are about. A test of the static path sets
@@ -532,11 +531,25 @@ def write_sdk_package(directory: Path, version: str, *, entries: dict[str, bytes
     return hashlib.sha256(archive).hexdigest()
 
 
-def context_yaml(*, sdk_sha256: str, version: str = "2.4.0") -> bytes:
-    """A ``context.yaml`` whose SDK pin names a package that exists."""
+def context_yaml(
+    *,
+    sdk_sha256: str = "a" * 64,
+    version: str = "2.4.0",
+    build_environment: str = IMAGE_REFERENCE_FORMAT3,
+) -> bytes:
+    """A ``context.yaml`` with the pins a test wants to move.
+
+    *sdk_sha256* names a package that exists; *build_environment* is the
+    image the client pinned, which is a hashed identity input — so a test
+    that changes it is changing the context's identity, on purpose.
+    """
     return (
         CONTEXT_YAML.replace("sha256: " + "a" * 64, f"sha256: {sdk_sha256}")
         .replace("version: 2.4.0", f"version: {version}")
+        .replace(
+            f"build_environment: {IMAGE_REFERENCE_FORMAT3}",
+            f"build_environment: {build_environment}",
+        )
         .encode()
     )
 
@@ -547,16 +560,16 @@ def device_model(
     """A ``model/device-model.json`` this server's model reader accepts.
 
     Most tests here send a stub under that name, because to this server a
-    context file is bytes to hash and nothing else. The freeze makes one
-    exception and it is the reason this exists: ``zephyr`` is left out of
-    the context ID on the grounds that the line is provably inside the
-    hashed model, so the freeze reads exactly that one field back and
-    compares it. A stub states no line and is passed over; a readable
-    model is what puts the check in play.
+    context file is bytes to hash and nothing else. The ``subprocess``
+    profile makes the one exception and it is the reason this exists: it
+    cannot honour a pinned image at all — the host *is* the environment —
+    so it reads the model's Zephyr line and checks its own against that.
+    A stub states no line and is passed over; a readable model is what
+    puts the check in play.
     """
     return json.dumps(
         {
-            "model_version": 1,
+            "model_version": 2,
             "device": {
                 "name": "test-device",
                 "friendly_name": "Test Device",
@@ -564,7 +577,16 @@ def device_model(
                 "power_source": "mains",
             },
             "network": {"transport": "thread", "matter_enabled": True},
-            "toolchain": {"zephyr_line": zephyr_line, "blob_usage": "auto", "blobs": {}},
+            "toolchain": {
+                "zephyr_line": zephyr_line,
+                "zephyr_constraint": f"~={zephyr_line}.0",
+                "blob_usage": "auto",
+                "blobs": {},
+            },
+            "sources": {
+                "sdk": "sdk/mcuhome-sdk",
+                "build_environment": "ghcr.io/mcu-home/build-container",
+            },
             "hardware": {"buses": [], "peripherals": []},
             "endpoints": [],
             "channels": [],

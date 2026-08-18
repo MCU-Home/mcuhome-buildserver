@@ -188,14 +188,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # This server pulls nothing, by design: it answers a context's
-      # Zephyr line out of the images this host already has, and a
-      # server that fetched one on demand would decide at build time
-      # which environment a context gets. So the image has to be here
-      # first, and the reference comes from the one place that states it
-      # — the same constant the SDK repository tags and a workbench
-      # runs, so no two parties can disagree about what "the build
-      # container" is.
+      # This server pulls nothing, by design: it runs the exact image the
+      # context pins and refuses when it does not have it. So the image
+      # has to be here first, and the reference comes from the one place
+      # that states it — the same constant the SDK repository tags and a
+      # client resolves to, so no two parties can disagree about what
+      # "the build container" is. The client reaches it through the
+      # moving tag; the bytes are the same, which is what makes the pin
+      # it writes match what this pull put here.
       - name: Pull the build container
         run: |
           reference="$(python -c '

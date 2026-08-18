@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **This server no longer chooses a build environment; it finds the one
+  the context pins** — context format **3**, which is the only format it
+  accepts. A context names one image with its digest, that digest is part
+  of the context's identity, and an image "of the same line" is therefore
+  not a substitute for it. The selection that used to happen at
+  `send-context` is gone, and with it the reason the freeze had to be
+  handed a container: everything `manifest.yaml` states now comes from
+  the client's pins or from the files, so two servers handed one context
+  write one manifest.
+- `send-context` answers `build_environment` — how this host names the
+  image it found — in place of the `image`/`tag`/`digest` triple it used
+  to answer with. An acknowledgement rather than a decision.
+- A context this server does not have the image for is
+  `version.builder-unsatisfiable`, with the environments it does have in
+  `available`. It still pulls nothing.
+- The `subprocess` profile checks the Zephyr line of the **device model**
+  against its own, because it is the one profile that cannot honour an
+  image pin at all: the host *is* the build environment.
+- The three image labels are read under their new names
+  (`org.mcuhome.build-environment.*`), imported from `mcuhome-model`
+  rather than spelled here — a second copy is how one side starts looking
+  for a label the other stopped writing.
+
 ### Added
 
 - **A session nobody is attached to is handed to a client that is

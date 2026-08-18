@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from mcuhome.model.buildimage import CONTRACT_LABEL, TOOLCHAIN_LABEL, ZEPHYR_LABEL
 
 from mcuhome_buildserver import processes, sessions
 from mcuhome_buildserver import program as program_seam
@@ -278,7 +279,7 @@ async def test_capabilities_answers_the_one_build_environment_it_serves(client, 
     ADR 0019 §2 asks ``capabilities`` for "available builder images"; in
     this profile there is no image, but the question a client asks is
     what this server can build, and answering nothing would say nothing
-    can be. ``org.mcuhome.toolchain`` is absent because §2.1's coupling
+    can be. The toolchain label is absent because §2.1's coupling
     labels are properties of an image and this backend cannot state the
     toolchain identity of a host it did not build — and §2.1.1's
     "absence is never read as compatible" is the correct reading of that.
@@ -287,12 +288,12 @@ async def test_capabilities_answers_the_one_build_environment_it_serves(client, 
         answer = await call(ws, "capabilities", frame_id="c")
 
     entries = answer["payload"]["containers"]
-    assert [entry["labels"]["org.mcuhome.zephyr"] for entry in entries] == [ZEPHYR_LINE]
+    assert [entry["labels"][ZEPHYR_LABEL] for entry in entries] == [ZEPHYR_LINE]
     entry = entries[0]
     assert entry["digest"] is None
     assert entry["reference"] == "org.mcuhome.build-container:2.4.0"
-    assert entry["labels"] == {"org.mcuhome.contract": "1", "org.mcuhome.zephyr": ZEPHYR_LINE}
-    assert "org.mcuhome.toolchain" not in entry["labels"]
+    assert entry["labels"] == {CONTRACT_LABEL: "1", ZEPHYR_LABEL: ZEPHYR_LINE}
+    assert TOOLCHAIN_LABEL not in entry["labels"]
 
 
 async def test_a_program_that_cannot_describe_answers_an_empty_inventory(
@@ -686,19 +687,21 @@ async def test_a_context_requiring_another_line_is_refused_typed(client, config)
     only accept or refuse (ADR 0019's amendment). The refusal is the
     container profile's own code, with the details that let a client act
     without the operator: the line required, and the lines served.
+
+    In Format 3, the Zephyr line is extracted from the device model, not from
+    context.yaml. So the test sends a model that requires a different line.
     """
-    from tests.conftest import CONTEXT_YAML, make_archive
+    from tests.conftest import buildable_context
 
     sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
-    foreign = (
-        CONTEXT_YAML.replace("sha256: " + "a" * 64, f"sha256: {sha256}")
-        .replace(f"zephyr: '{ZEPHYR_LINE}'", "zephyr: '9.9'")
-        .encode()
-    )
+    # Send a model with a different Zephyr line than what the server has
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = (await open_session(ws))["session"]["id"]
         refused = await send_archive(
-            ws, "send-context", session_id, make_archive({"context.yaml": foreign})
+            ws,
+            "send-context",
+            session_id,
+            buildable_context(sha256, **{"model/device-model.json": device_model("9.9")}),
         )
 
     assert refused["type"] == "error"
@@ -777,10 +780,16 @@ async def test_a_program_over_another_zephyr_line_serves_that_line(client, confi
         announced = await call(ws, "capabilities", frame_id="c")
         sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
         session_id = (await open_session(ws))["session"]["id"]
-        refused = await send_archive(ws, "send-context", session_id, buildable_context(sha256))
+        # Send a context with a model that requires 4.4, which the 4.3 server cannot serve
+        refused = await send_archive(
+            ws,
+            "send-context",
+            session_id,
+            buildable_context(sha256, **{"model/device-model.json": device_model(ZEPHYR_LINE)}),
+        )
 
     entries = announced["payload"]["containers"]
-    assert [entry["labels"]["org.mcuhome.zephyr"] for entry in entries] == ["4.3"]
+    assert [entry["labels"][ZEPHYR_LABEL] for entry in entries] == ["4.3"]
     assert refused["type"] == "error"
     assert refused["error"]["code"] == "version.builder-unsatisfiable"
     assert refused["error"]["details"] == {"required": ZEPHYR_LINE, "available": ["4.3"]}
@@ -815,28 +824,32 @@ async def test_a_program_carrying_no_zephyr_tree_is_refused_at_discovery(
 
 
 async def test_the_manifest_records_the_program_as_what_built_it(client, config, state) -> None:
-    """§3.2's ``container:`` block, filled by a backend that has no image.
+    """Format 3: ``build_environment`` records the client's pinned reference.
 
     "The record of which build environment answered this context's
-    requirement … what reproduces the build years later." Here that is
-    the program's own identity and version, with ``digest: null``,
-    because there is no image and therefore nothing that names fetchable
-    bytes — the value E61 already made first-class for the never-pushed
-    image.
+    requirement … what reproduces the build years later." In the subprocess
+    backend, the client sends a full image reference pinned to a digest,
+    but the subprocess backend cannot fetch or run images — it just runs
+    the local program. The manifest records what the client pinned, and
+    the backend's validation checks if it can serve the required Zephyr
+    line from the device model.
+
+    In Format 3, the manifest contains `build_environment` with the
+    reference the client sent, and no separate `zephyr` field.
     """
     from ruamel.yaml import YAML
+
+    from tests.conftest import IMAGE_REFERENCE_FORMAT3
 
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config, **{"model/device-model.json": device_model()})
         paths = state.sessions.require(session_id).paths
         manifest = YAML(typ="safe", pure=True).load((paths.context / "manifest.yaml").read_text())
 
-    assert manifest["container"] == {
-        "image": "org.mcuhome.build-container",
-        "tag": "2.4.0",
-        "digest": None,
-    }
-    assert manifest["zephyr"] == ZEPHYR_LINE
+    # The manifest records the build_environment that was pinned by the client
+    assert manifest["build_environment"] == IMAGE_REFERENCE_FORMAT3
+    # The context format is 3 in Format 3
+    assert manifest["context"] == 3
 
 
 # --------------------------------------------------------------------------

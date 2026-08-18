@@ -13,7 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from mcuhome.model.context import ContainerResolution
+from mcuhome.model.buildimage import CONTRACT_LABEL, TOOLCHAIN_LABEL, ZEPHYR_LABEL
 
 from mcuhome_buildserver import container
 from mcuhome_buildserver.container import Completed, Docker, Mount
@@ -254,7 +254,9 @@ async def test_the_repo_digest_is_read_and_never_the_image_id() -> None:
         + "c" * 64
         + '", "RepoTags": ["ghcr.io/x:tag"], "RepoDigests": ["ghcr.io/x@sha256:'
         + "d" * 64
-        + '"], "Config": {"Labels": {"org.mcuhome.contract": "1"}}}'
+        + '"], "Config": {"Labels": {"'
+        + CONTRACT_LABEL
+        + '": "1"}}}'
     )
     docker = Docker("docker", runner=_runner([Completed(status=0, output=inspected)]))
     facts = await docker.image("ghcr.io/x:tag")
@@ -279,7 +281,7 @@ async def test_the_digest_taken_is_the_one_of_this_references_own_repository() -
         '"RepoTags": ["ghcr.io/mcu-home/build-container:r6", "registry.local/bc:mirror"], '
         '"RepoDigests": ["registry.local/bc@sha256:' + "b" * 64 + '", '
         '"ghcr.io/mcu-home/build-container@sha256:' + "a" * 64 + '"], '
-        '"Config": {"Labels": {"org.mcuhome.contract": "1"}}}'
+        '"Config": {"Labels": {"' + CONTRACT_LABEL + '": "1"}}}'
     )
     docker = Docker("docker", runner=_runner([Completed(status=0, output=inspected)] * 2))
     ghcr = await docker.image("ghcr.io/mcu-home/build-container:r6")
@@ -287,31 +289,6 @@ async def test_the_digest_taken_is_the_one_of_this_references_own_repository() -
     assert ghcr is not None and mirror is not None
     assert ghcr.digest == "sha256:" + "a" * 64, "not the first entry — the ghcr one"
     assert mirror.digest == "sha256:" + "b" * 64
-
-
-async def test_a_repository_with_no_pushed_digest_reports_none() -> None:
-    """A local alias of a pulled image names no fetchable bytes.
-
-    ``docker tag ghcr.io/…:r6 build-container:local`` adds a repository
-    that was never pushed, so no ``RepoDigests`` entry belongs to it.
-    ``None`` is the honest answer — the same one a never-pushed image
-    gets — and it makes
-    :meth:`~mcuhome.model.context.ContainerResolution.reference` fall
-    back to the tag this host actually lists, which does resolve.
-    """
-    inspected = (
-        '{"Id": "sha256:' + "c" * 64 + '", '
-        '"RepoTags": ["build-container:local"], '
-        '"RepoDigests": ["ghcr.io/mcu-home/build-container@sha256:' + "a" * 64 + '"], '
-        '"Config": {"Labels": {"org.mcuhome.contract": "1"}}}'
-    )
-    docker = Docker("docker", runner=_runner([Completed(status=0, output=inspected)]))
-    facts = await docker.image("build-container:local")
-    assert facts is not None
-    assert facts.digest is None
-    assert ContainerResolution.from_reference(facts.reference, digest=facts.digest).reference() == (
-        "build-container:local"
-    )
 
 
 async def test_the_inventory_reports_only_the_three_contract_labels() -> None:
@@ -331,10 +308,14 @@ async def test_the_inventory_reports_only_the_three_contract_labels() -> None:
         output=(
             '{"Id": "sha256:c", "RepoTags": ["ghcr.io/x:tag"], '
             '"RepoDigests": ["ghcr.io/x@sha256:'
-            + "d"
-            * 64
-            + '"], "Config": {"Labels": {"org.mcuhome.contract": "1", '
-            '"org.mcuhome.zephyr": "4.4.0", "org.mcuhome.toolchain": "zephyr-sdk-1.0.1", '
+            + "d" * 64
+            + '"], "Config": {"Labels": {"'
+            + CONTRACT_LABEL
+            + '": "1", "'
+            + ZEPHYR_LABEL
+            + '": "4.4.0", "'
+            + TOOLCHAIN_LABEL
+            + '": "zephyr-sdk-1.0.1", '
             '"maintainer": "someone@example.org"}}}'
         ),
     )
@@ -343,9 +324,9 @@ async def test_the_inventory_reports_only_the_three_contract_labels() -> None:
     found = await docker.inventory()
     assert len(found) == 1
     assert set(found[0].to_wire()["labels"]) == {
-        "org.mcuhome.contract",
-        "org.mcuhome.zephyr",
-        "org.mcuhome.toolchain",
+        CONTRACT_LABEL,
+        ZEPHYR_LABEL,
+        TOOLCHAIN_LABEL,
     }
     assert runner.calls[0][:4] == ["docker", "image", "ls", "--filter"]
     assert "<none>:<none>" not in runner.calls[1]
@@ -371,7 +352,7 @@ async def test_a_partial_inspect_answer_never_mis_attributes_an_image() -> None:
         return (
             '{"Id": "sha256:' + letter * 4 + '", "RepoTags": ["' + name + '"], '
             '"RepoDigests": ["' + repository + "@sha256:" + letter * 64 + '"], '
-            '"Config": {"Labels": {"org.mcuhome.contract": "1"}}}'
+            '"Config": {"Labels": {"' + CONTRACT_LABEL + '": "1"}}}'
         )
 
     answer = Completed(

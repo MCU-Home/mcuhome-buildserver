@@ -113,9 +113,9 @@ import contextlib
 import logging
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from mcuhome.model.context import ContainerResolution
 from mcuhome.model.toolchain import line_of, normalize_release, satisfies_line
 
 from mcuhome_buildserver import abi, container, processes, sdkstore
@@ -129,7 +129,7 @@ from mcuhome_buildserver.backend import (
     describe_problem,
 )
 from mcuhome_buildserver.config import Config
-from mcuhome_buildserver.contextstore import ContextPins, SessionPaths
+from mcuhome_buildserver.contextstore import ContextPins, SessionPaths, model_zephyr_line
 from mcuhome_buildserver.errors import SessionError
 from mcuhome_buildserver.program import Program, program_argv
 
@@ -151,7 +151,7 @@ def served_lines(profile: ProgramProfile) -> tuple[str, ...]:
     *revision* — MCUHome's own program reports what ``west list`` prints,
     which is the manifest's tag, ``v4.4.0``. §2.1.1's value range has no
     leading ``v``, and MCUHome's own image already normalizes the same
-    way for its ``org.mcuhome.zephyr`` label (the r7 repair: "§2.1.1 asks
+    way for its ``org.mcuhome.build-environment.zephyr.version`` label (the r7 repair: "§2.1.1 asks
     for the version *without* west's leading ``v``").
     :func:`~mcuhome.model.toolchain.normalize_release` is the one place
     that strip happens — exactly one leading ``v`` is dropped and nothing
@@ -192,31 +192,21 @@ class HostProfile(ProgramProfile):
     """
 
     @property
-    def resolution(self) -> ContainerResolution:
-        """This environment as ``manifest.yaml``'s ``container:`` records it.
+    def environment(self) -> str:
+        """How this host names the environment: it is the host.
 
-        §3.2 makes the block "the record of which build environment
-        answered this context's requirement … what reproduces the build
-        years later", and it has three fields. Here the honest filling is
-        the program's own identity and version — the two things §7.1.1
-        makes a program state about itself — with ``digest: null``,
-        because there is no image and therefore nothing that names
-        fetchable bytes. E61 already made ``null`` a first-class value of
-        that field for the never-pushed image, and it says the same thing
-        here: this record names no bytes anybody can pull, and saying so
-        is better than inventing a digest for a filesystem.
-
-        The two ``mcuhome-model`` requires to be non-empty strings are
-        both there: ``id`` is reverse-DNS and mandatory in the block, and
-        ``version`` is the implementation's own — opaque to a backend,
-        which is why it is recorded rather than parsed.
+        There is no image, so the honest answer is the program's own
+        identity and version — the two things §7.1.1 makes a program
+        state about itself. A client reading this learns what it most
+        needs to know here, which is that its pin was **not** what ran:
+        this profile cannot fetch an image and does not pretend to.
         """
         version = self.program.get("version")
-        return ContainerResolution(
-            image=self.identity,
-            tag=version if isinstance(version, str) and version.strip() else "unknown",
-            digest=None,
-        )
+        stated = version if isinstance(version, str) and version.strip() else "unknown"
+        # Spelled like a reference — ``<name>:<version>`` — because that is
+        # the shape of the field it lands in, and because it stays legible
+        # beside a container reference in the same list.
+        return f"{self.identity}:{stated}"
 
 
 class SubprocessBackend(SessionBackend):
@@ -260,7 +250,7 @@ class SubprocessBackend(SessionBackend):
         two lines cannot be described by one entry without dropping a
         line or stating a false one.
 
-        ``org.mcuhome.toolchain`` is **absent, and deliberately**. §2.1's
+        ``org.mcuhome.build-environment.toolchain`` is **absent, and deliberately**. §2.1's
         coupling labels are properties of an *image*; there is none here,
         and this backend cannot state the toolchain identity of a host it
         did not build. §2.1.1's "absence is never read as compatible" is
@@ -277,7 +267,7 @@ class SubprocessBackend(SessionBackend):
             profile = await self._host()
         except SessionError:
             return []
-        reference = profile.resolution.reference()
+        reference = profile.environment
         return [
             {
                 "reference": reference,
@@ -290,7 +280,7 @@ class SubprocessBackend(SessionBackend):
             for line in served_lines(profile)
         ]
 
-    async def resolve_image(self, pins: ContextPins) -> HostProfile:
+    async def resolve_image(self, pins: ContextPins, context: Path) -> HostProfile:
         """The build environment for a context's Zephyr line — or the refusal.
 
         Called from ``send-context``, the same place the container
@@ -309,14 +299,21 @@ class SubprocessBackend(SessionBackend):
         """
         profile = await self._host()
         served = served_lines(profile)
-        if not any(satisfies_line(line, line=pins.zephyr) for line in served):
+        del pins  # a digest is not something this profile can honour
+        required = model_zephyr_line(context)
+        if required is None:
+            # Nothing to compare against: a context whose model cannot be
+            # read does not build, and the program refuses it with a far
+            # better message than a guess made here.
+            return profile
+        if not any(satisfies_line(line, line=required) for line in served):
             raise SessionError(
                 "version.builder-unsatisfiable",
                 f"This build server's own build environment does not carry Zephyr "
-                f"{pins.zephyr}. It runs in the subprocess profile, so it serves exactly "
-                "one build environment — the one it runs in — and cannot answer a context "
-                "requiring another line by choosing something else.",
-                required=pins.zephyr,
+                f"{required}. It runs in the subprocess profile, so it serves exactly "
+                "one build environment — the one it runs in — and cannot fetch the one "
+                "this context pins.",
+                required=required,
                 available=sorted(served),
             )
         return profile

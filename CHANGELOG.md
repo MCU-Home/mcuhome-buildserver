@@ -8,6 +8,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Fetching a build environment worked in none of its three steps, and
+  now does.** Found by running the thing rather than by reading it: an
+  end-to-end build on a host that did not have the image yet. Three
+  defects on one chain, each hidden behind the one before it, and none
+  of them visible to CI — the workflow pulls the image by tag before the
+  job starts, so no job has ever taken this path.
+
+  1. **The session was reaped while the fetch ran.** "Work is not
+     idleness" covered a running invocation and not a context command,
+     and `send-context` is the other long one: it takes the archive and
+     then pulls the image the context pinned, which is over a gigabyte.
+     Observed as "fetching build environment" at one second and "reaped 1
+     expired session" twenty-seven seconds later, on a server whose idle
+     timeout was fifteen — with the client blocked on the very command
+     frame whose work had just been thrown away. The same exemption now
+     covers the handover, where taking the session would have taken the
+     directory an upload was unpacking into with it.
+  2. **What the pull fetched could not be found afterwards.** `docker
+     pull repo:tag@sha256:…` stores the bytes under `repo@sha256:…` and
+     leaves the tag `<none>`, and the inventory listed tags only and
+     dropped every line carrying `<none>`. So the server pulled a
+     gigabyte, looked for it, and reported that it could not fetch it.
+     An untagged image is now asked about by its digest —
+     repository-qualified, because a digest is only a name within its own
+     repository and `RepoDigests` could not be matched otherwise.
+  3. **The next command was refused `session.expired`.** The idle clock
+     counts absent *commands*, and the command that started a hundred
+     seconds of work was sent before it ran, so `lock-context` arrived at
+     a session already a minute past its timeout. The invocation path had
+     this rule already ("finishing work is activity"); the context path
+     now has it too.
+
+  Verified from a cold start: no image on the host, the server fetches
+  it, finds it, freezes the context, builds and signs — 245 seconds
+  against a 15-second idle timeout, no session reaped.
+
 ### Removed
 
 - **The `subprocess` backend profile, and `--backend-profile` with it.**

@@ -646,15 +646,26 @@ def _lease_over(session: Session, now: float) -> str | None:
     ``attach-session`` back without losing anything, which is exactly
     what makes a closed socket unusable as the signal here.
 
-    **A running invocation is work, not idleness**, and the idle half
-    has to know it: a build is *one* command that then takes minutes to
-    hours, during which a well-behaved client sends nothing and only
-    listens. Counting commands alone, a session compiling away looked
-    idle after ten minutes and was reaped under its own build —
-    observed, with the container removed mid-compile and a client left
-    waiting on a verdict that could no longer come. The hard TTL still
-    applies, and so does the invocation's own deadline, so this cannot
-    make a session immortal.
+    **Work is not idleness**, and the idle half has to know it, because
+    the two long things this server does are both *one* command that then
+    takes minutes:
+
+    * **an invocation**, during which a well-behaved client sends nothing
+      and only listens. Counting commands alone, a session compiling away
+      looked idle after ten minutes and was reaped under its own build —
+      observed, with the container removed mid-compile and a client left
+      waiting on a verdict that could no longer come.
+    * **a context command**, which is the same shape and was missed:
+      ``send-context`` receives an archive and then *fetches the build
+      environment the context pinned*, which is over a gigabyte. Observed
+      the same way — "fetching build environment" at one second and
+      "reaped 1 expired session" twenty-seven seconds later, on a server
+      whose idle timeout was fifteen. The client was blocked on the very
+      command frame whose work had just been thrown away.
+
+    The hard TTL still applies, and so do the invocation's own deadline
+    and the upload's (:attr:`Session.idle_timeout` bounds that await), so
+    this cannot make a session immortal.
     """
     if now > session.expires_at:
         return GONE_LEASE
@@ -666,7 +677,22 @@ def _lease_over(session: Session, now: float) -> str | None:
 
 
 def _is_working(session: Session) -> bool:
-    """Whether an invocation of this session is running or being stopped."""
+    """Whether this session has work in flight.
+
+    Two kinds, and they are the two things that take longer than a frame:
+    an invocation that is running or being stopped, and a context command
+    — an upload arriving, or the build environment it pinned being
+    fetched (:func:`_context_work` holds that flag for exactly as long as
+    one is in progress).
+
+    Both callers want the same answer. The reaper must not take a session
+    away from work; the handover must not take one away from a *waiting
+    client*, which would be worse still — the directory goes with it, and
+    a ``send-context`` unpacking into it would be writing into a tree
+    nobody can name any more.
+    """
+    if session.context_busy:
+        return True
     return any(state in _WORKING for state in session.invocations.values())
 
 
@@ -1743,6 +1769,17 @@ def _context_work(session: Session) -> Iterator[None]:
     no registered code means "a context command is already running in
     this session", and inventing one is a protocol decision rather than
     an implementation choice.
+
+    **The flag is also what tells the idle clock this is work** — see
+    :func:`_is_working` — and the session is touched on the way out for
+    the reason the invocation path states about itself: the idle half
+    counts absent *commands*, and the command that started this one was
+    sent before it ran. A ``send-context`` that spent a hundred seconds
+    fetching a build environment would otherwise be acknowledged into a
+    session already a minute past its idle timeout, and the very next
+    verb — ``lock-context``, the one that freezes what just arrived —
+    refused ``session.expired``. Observed exactly so. **Finishing work
+    is activity**, whichever kind of work it was.
     """
     if session.context_busy:
         raise ProtocolError(
@@ -1755,6 +1792,7 @@ def _context_work(session: Session) -> Iterator[None]:
         yield
     finally:
         session.context_busy = False
+        session.touch()
 
 
 def _require_still_ours(session: Session, paths: SessionPaths) -> None:

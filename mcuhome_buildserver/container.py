@@ -335,23 +335,39 @@ class Docker:
         when a context names it.
 
         Two calls rather than one because ``docker image ls`` reports no
-        labels and no digest: it names the references, and one
-        ``image inspect`` over all of them answers the rest.
+        labels: it names the references, and one ``image inspect`` over
+        all of them answers the rest.
+
+        **An image is asked about by its digest where it has no tag**,
+        and that is not a nicety: an image *fetched by a pinned
+        reference* has none. ``docker pull repo:tag@sha256:…`` stores the
+        bytes under ``repo@sha256:…`` and leaves the tag ``<none>``, so
+        listing tags alone made this server pull a gigabyte and then
+        report that it could not fetch it — the pull succeeded, the
+        presence check behind it could not see what had arrived. Observed
+        on a real remote build; CI never saw it because the workflow
+        pulls by tag before the job starts.
+
+        The reference stays **repository-qualified** either way, which is
+        what an image ID would not be: the repository is the key
+        :func:`_facts_from` matches a ``RepoDigests`` entry against, and
+        a digest is only a name within its own repository.
         """
         listed = await self._run(
             "image",
             "ls",
+            "--digests",
             "--filter",
             f"label={CONTRACT_LABEL}",
             "--format",
-            "{{.Repository}}:{{.Tag}}",
+            "{{.Repository}}:{{.Tag}}\t{{.Repository}}@{{.Digest}}",
         )
         if not listed.ok:
             return ()
         references = [
-            line.strip()
-            for line in listed.output.splitlines()
-            if line.strip() and "<none>" not in line
+            reference
+            for reference in (_addressable(line) for line in listed.output.splitlines())
+            if reference is not None
         ]
         if not references:
             return ()
@@ -449,6 +465,22 @@ def _first_line(output: str) -> str:
         if line.strip():
             return line.strip()
     return "no output"
+
+
+def _addressable(line: str) -> str | None:
+    """One ``image ls`` line as a reference to inspect, or nothing.
+
+    Two candidates per line — ``repository:tag`` and
+    ``repository@digest`` — and the tag is preferred because it is what a
+    person recognizes and what ``capabilities`` publishes. ``<none>``
+    is docker's word for "this image has no such name": an untagged image
+    has it in the first, a never-pushed one in the second, and a dangling
+    image in both, which is the only case with nothing to ask about.
+    """
+    for candidate in line.strip().split("\t"):
+        if candidate and "<none>" not in candidate and not candidate.endswith("@"):
+            return candidate
+    return None
 
 
 def _reference_of(data: dict[str, Any], references: Sequence[str]) -> str | None:

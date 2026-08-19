@@ -158,7 +158,9 @@ async def test_the_inventory_reports_only_the_three_contract_labels() -> None:
     reference would find no image and drop out of the answer anyway, so
     the filter could be deleted with the count unchanged.
     """
-    listing = Completed(status=0, output="ghcr.io/x:tag\n<none>:<none>\n")
+    listing = Completed(
+        status=0, output="ghcr.io/x:tag\tghcr.io/x@<none>\n<none>:<none>\t<none>@<none>\n"
+    )
     inspected = Completed(
         status=0,
         output=(
@@ -184,9 +186,42 @@ async def test_the_inventory_reports_only_the_three_contract_labels() -> None:
         ZEPHYR_LABEL,
         TOOLCHAIN_LABEL,
     }
-    assert runner.calls[0][:4] == ["docker", "image", "ls", "--filter"]
+    assert runner.calls[0][:5] == ["docker", "image", "ls", "--digests", "--filter"]
     assert "<none>:<none>" not in runner.calls[1]
     assert runner.calls[1][-1] == "ghcr.io/x:tag"
+
+
+async def test_an_image_with_no_tag_is_asked_about_by_its_digest() -> None:
+    """The pinned fetch's own image, which had no name this could see.
+
+    ``docker pull repo:tag@sha256:…`` stores the bytes under
+    ``repo@sha256:…`` and leaves the tag ``<none>``. Listing tags alone,
+    this server pulled a gigabyte and then reported that it could not
+    fetch it — the pull succeeded and the presence check behind it was
+    blind to what had arrived. Observed on a real remote build.
+
+    The reference stays repository-qualified, which is what makes
+    ``RepoDigests`` matchable: a digest is only a name within its own
+    repository.
+    """
+    digest = "sha256:" + "e" * 64
+    listing = Completed(status=0, output=f"ghcr.io/x:<none>\tghcr.io/x@{digest}\n")
+    inspected = Completed(
+        status=0,
+        output=(
+            '{"Id": "sha256:c", "RepoTags": [], '
+            f'"RepoDigests": ["ghcr.io/x@{digest}"], '
+            '"Config": {"Labels": {"' + CONTRACT_LABEL + '": "1"}}}'
+        ),
+    )
+    runner = _runner([listing, inspected])
+    found = await Docker("docker", runner=runner).inventory()
+
+    assert runner.calls[1][-1] == f"ghcr.io/x@{digest}"
+    assert len(found) == 1
+    # And the digest survives the round trip, which is what a pin is
+    # matched against — an image ID would not have found it.
+    assert found[0].digest == digest
 
 
 async def test_a_partial_inspect_answer_never_mis_attributes_an_image() -> None:

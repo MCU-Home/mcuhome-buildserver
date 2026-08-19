@@ -352,6 +352,22 @@ def test_a_build_that_is_running_detached_keeps_its_session() -> None:
     assert building.state == sessions.STATE_OPEN
 
 
+def test_a_context_command_in_flight_keeps_its_session_too() -> None:
+    """The same rule, for the other long command.
+
+    A ``send-context`` that is fetching the build environment its context
+    pinned takes minutes, and the handover would take the *directory* it
+    is unpacking into with it — worse than the reaper's version of the
+    same mistake, because the work is still arriving.
+    """
+    manager = sessions.SessionManager(max_open=1)
+    fetching = _unattended(manager)
+    fetching.context_busy = True
+
+    assert _refused(manager).code == "session.limit-exceeded"
+    assert fetching.state == sessions.STATE_OPEN
+
+
 def test_the_grace_is_the_time_a_client_has_to_come_back() -> None:
     manager = sessions.SessionManager(max_open=1, reconnect_grace=60.0)
     dropped = _unattended(manager, quiet_for=30.0)

@@ -793,6 +793,60 @@ def test_a_session_running_an_invocation_is_not_idle(tmp_path) -> None:
     assert manager.reap() == (session.id,)
 
 
+def test_a_session_fetching_its_build_environment_is_not_idle(tmp_path) -> None:
+    """The other long command, and the one that was missed.
+
+    ``send-context`` receives an archive and then fetches the build
+    environment the context pinned — over a gigabyte, minutes of it,
+    with the client blocked on the command frame the whole time.
+    Observed on a real remote build: "fetching build environment" at one
+    second, "reaped 1 expired session" twenty-seven seconds later, on a
+    server whose idle timeout was fifteen. The work was thrown away
+    under the client that was waiting for it.
+
+    ``_context_work`` holds the flag for exactly as long as one of the
+    three context verbs is in flight, which is why the exemption is that
+    flag and not a timer of its own.
+    """
+    manager = sessions.SessionManager(ttl=3600.0, idle_timeout=1.0)
+    session = _abandoned(manager, tmp_path)
+    session.last_command_at = time.time() - 60.0
+    session.context_busy = True
+
+    assert manager.reap() == (), "a session fetching an image is not an idle one"
+    assert session.paths.root.exists()
+
+    # And when the command is acknowledged, the idle half applies again.
+    session.context_busy = False
+    assert manager.reap() == (session.id,)
+
+
+def test_a_long_context_command_leaves_its_session_usable(tmp_path) -> None:
+    """Finishing work is activity — the other half of the same rule.
+
+    The idle clock counts absent *commands*, and the command that
+    started this one was sent before it ran. A ``send-context`` that
+    spent a hundred seconds fetching a build environment was
+    acknowledged into a session already past its idle timeout, and the
+    very next verb — ``lock-context``, the one that freezes what just
+    arrived — was refused ``session.expired``. Observed on a real remote
+    build, with the fetched image sitting there unused.
+
+    The invocation path had this rule already (``_drive`` touches when a
+    build ends); the context path did not.
+    """
+    manager = sessions.SessionManager(ttl=3600.0, idle_timeout=15.0)
+    session = _abandoned(manager, tmp_path)
+    session.last_command_at = time.time() - 100.0
+
+    with sessions._context_work(session):
+        pass
+
+    # The session is usable, which is what the client's next verb needs.
+    assert manager.require(session.id) is session
+    assert manager.reap() == ()
+
+
 def test_the_hard_ttl_takes_a_working_session_anyway(tmp_path) -> None:
     """The two halves keep their own meanings.
 

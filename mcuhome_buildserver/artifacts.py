@@ -5,27 +5,17 @@
 Build-container contract §9.3 opens with the reason the whole module
 exists: "``out`` is written by the least trusted component in the system
 and its contents travel over the network onto other people's machines."
-Five duties follow it, and :func:`harden` is all five:
 
-* enumerate ``out`` **without following symlinks** and reject symlinks,
-  hardlinks (``nlink > 1``), devices, FIFOs and sockets;
-* normalize every declared artifact path and enforce strict containment
-  under the named ``root``, skipping any artifact whose ``root`` this
-  version does not know;
-* **re-hash every artifact from the bytes on disk** — declared values
-  are advisory, and the comparison is against the one legal spelling of
-  §3.3.1, never case-insensitive;
-* serve exactly the intersection of declared and verified; files that
-  were not declared are not served, but they are not deleted either —
-  they are diagnostic material;
-* apply size caps during enumeration, from the bytes on disk — an
-  artifact entry declares no size.
-
-The program is forbidden to create links, devices, sockets or FIFOs in
-``out`` at all, and ``out`` path segments are ``[A-Za-z0-9._-]+`` (§9.2).
-That is what makes this an audit rather than a repair: everything below
-refuses, and nothing below rewrites a path into one that would have been
-allowed.
+Its five duties are the orchestrator's when an invocation ends — it is
+what judges the result and re-hashes every declared artifact — and this
+module is the *second* enforcement, at the moment bytes actually leave:
+enumerate without following symlinks, refuse hardlinks, devices, FIFOs
+and sockets, enforce strict containment under the declared ``root``, and
+re-hash while packing. The program is forbidden to create links, devices,
+sockets or FIFOs in ``out`` at all, and ``out`` path segments are
+``[A-Za-z0-9._-]+`` (§9.2). That is what makes this an audit rather than
+a repair: everything below refuses, and nothing below rewrites a path
+into one that would have been allowed.
 
 **Download is an archive, in the format the wire already speaks.** The
 mirror of E41's upload, settled by the product owner as E45: one
@@ -35,14 +25,14 @@ paths; the announced ``sha256`` is the **archive's**, computed at egress
 while the bytes are read off disk, and per-file integrity stays the
 client's own check against the result document it already holds.
 
-**The five duties are enforced twice, and the second time is the one
-that matters.** :func:`harden` runs when an invocation ends;
-:func:`build_archive` runs whenever a client asks, which is arbitrarily
-later and — because the session's container is alive until
-``close-session`` and a later invocation writes into the same tree — on
-a directory that may have changed in between. A check that only ran at
-the earlier moment would be a check on bytes nobody serves: an artifact
-replaced by a symlink after ``harden`` passed would be *followed* at
+**And the second enforcement is the one that matters.** The orchestrator
+verifies when an invocation ends; :func:`build_archive` runs whenever a
+client asks, which is arbitrarily later and — because the session's
+container is alive until ``close-session`` and a later invocation writes
+into the same tree — on a directory that may have changed in between. A
+check that only ran at the earlier moment would be a check on bytes
+nobody serves: an artifact replaced by a symlink after the invocation
+ended would be *followed* at
 download time and its target streamed to the client under a declared
 name. So every member is re-opened with ``O_NOFOLLOW``, re-checked for
 being a regular file with one link, and **re-hashed while it is packed**;
@@ -62,7 +52,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import zstandard
-from mcuhome.model.hashes import sha256_file
 
 from mcuhome_buildserver.abi import Artifact
 from mcuhome_buildserver.errors import SessionError
@@ -70,7 +59,6 @@ from mcuhome_buildserver.errors import SessionError
 __all__ = [
     "Delivery",
     "build_archive",
-    "harden",
     "undeclared",
 ]
 
@@ -96,80 +84,6 @@ class Delivery:
     size: int
     sha256: str
     members: tuple[Artifact, ...]
-
-
-def harden(
-    out: Path,
-    declared: tuple[Artifact, ...],
-    *,
-    max_bytes: int,
-) -> tuple[tuple[Artifact, ...], tuple[str, ...]]:
-    """Verify the declared artifacts against the bytes in ``out``.
-
-    Returns ``(verified, problems)``. *verified* is the intersection of
-    declared and verified, in declaration order, with each artifact's
-    ``sha256`` **replaced by the value re-read from disk** — which is
-    the same value it declared, or it would not be in the list. The
-    replacement is deliberate: everything downstream serves and
-    attributes from this tuple, and carrying a declared hash forward
-    would leave one path through this server on which a client's value
-    was believed.
-
-    *problems* is why an entry did not survive, one sentence each. It
-    is not empty exactly when the intersection is smaller than the
-    declaration, and §5.3's sixth condition is "problems is empty" —
-    "every declared artifact exists as a regular file under its declared
-    ``root`` and re-hashes to its declared value". A build that declared
-    four artifacts and produced three is not a build that delivers
-    three.
-    """
-    verified: list[Artifact] = []
-    problems: list[str] = []
-    for artifact in declared:
-        resolved = _contained(out, artifact.path)
-        if resolved is None:
-            problems.append(f'"{artifact.path}" is not contained in the out directory')
-            continue
-        info = _lstat(resolved)
-        if info is None:
-            problems.append(f'"{artifact.path}" was declared and is not there')
-            continue
-        if not stat.S_ISREG(info.st_mode):
-            problems.append(f'"{artifact.path}" is not a regular file')
-            continue
-        if info.st_nlink > 1:
-            # A hardlink is a second name for bytes that may live
-            # outside `out` entirely, and `lstat` cannot tell which name
-            # came first. §9.2 forbids the program to make one at all.
-            problems.append(f'"{artifact.path}" is a hardlink (nlink {info.st_nlink})')
-            continue
-        if info.st_size > max_bytes:
-            problems.append(
-                f'"{artifact.path}" is {info.st_size} bytes and this server serves at '
-                f"most {max_bytes}"
-            )
-            continue
-        measured = sha256_file(resolved)
-        if measured != artifact.sha256:
-            # The comparison is against the one legal spelling and never
-            # case-insensitive: a declared hash in any other rendering is
-            # a mismatch, not a value to fold. `abi.declared_artifacts`
-            # turns a misrendered one into a problem of its own before it
-            # reaches here, so what is left at this line is a genuine
-            # disagreement about bytes.
-            problems.append(
-                f'"{artifact.path}" hashes to {measured} and was declared as {artifact.sha256}'
-            )
-            continue
-        verified.append(
-            Artifact(
-                root=artifact.root,
-                path=artifact.path,
-                role=artifact.role,
-                sha256=measured,
-            )
-        )
-    return tuple(verified), tuple(problems)
 
 
 def undeclared(out: Path, verified: tuple[Artifact, ...]) -> tuple[str, ...]:

@@ -18,58 +18,10 @@ from pathlib import Path
 import pytest
 
 from mcuhome_buildserver import abi, errors, events
-from mcuhome_buildserver.abi import TreeEntry
 
 # --------------------------------------------------------------------------
-# The request document
+# Writing a request document
 # --------------------------------------------------------------------------
-
-
-def _document(tmp_path: Path, **overrides) -> dict:
-    base = dict(
-        result=tmp_path / "result.json",
-        session="s-1",
-        out=tmp_path / "out",
-        work=tmp_path / "work",
-        tmp=tmp_path / "tmp",
-        context=tmp_path / "context",
-        trees={"sdk": TreeEntry(path=tmp_path / "sdk", writable=False)},
-        jobs=2,
-        deadline_seconds=5400,
-        cancel_grace_seconds=60,
-        events=tmp_path / "events.ndjson",
-        cancel=tmp_path / "cancel",
-    )
-    base.update(overrides)
-    return abi.request_document(**base)
-
-
-def test_an_absent_parameter_is_omitted_and_never_null(tmp_path: Path) -> None:
-    """§5.2: "``null`` never means absent; it is invalid."
-
-    And ``params`` is the field where absence has a *defined* meaning:
-    an absent ``params``, a ``params`` without ``mode`` and ``params:
-    {}`` are the same thing and all three mean ``mode: "clean"``. A
-    backend that wrote ``"params": null`` would have said something the
-    document has no reading for.
-    """
-    document = _document(tmp_path)
-    assert "params" not in document
-    assert "required" not in document
-    assert "ccache" not in document
-    assert None not in document.values()
-
-
-def test_the_preamble_comes_first_and_carries_the_result_path(tmp_path: Path) -> None:
-    """The two fields that exist in every future request format version.
-
-    From the moment a program has read them, "**every** error is a result
-    document, including 'I do not implement this request format
-    version'" — which is the whole reason the preamble is immortal.
-    """
-    document = _document(tmp_path)
-    assert list(document)[:2] == ["request", "result"]
-    assert document["request"] == abi.REQUEST_VERSION
 
 
 def test_the_request_document_is_written_atomically_and_as_utf8(
@@ -448,87 +400,6 @@ def test_the_untrusted_message_loses_its_control_characters(tmp_path: Path) -> N
     )
     assert outcome.result is not None
     assert outcome.result.error_message == "bad[2Jthing"
-
-
-# --------------------------------------------------------------------------
-# Artifact entries
-# --------------------------------------------------------------------------
-
-
-def _entry(**overrides) -> dict:
-    entry = {
-        "root": "out",
-        "path": "firmware.hex",
-        "role": "firmware",
-        "hashes": {"sha256": "a" * 64},
-    }
-    entry.update(overrides)
-    return entry
-
-
-@pytest.mark.parametrize(
-    ("what", "entry"),
-    [
-        ("no root", {"path": "f.hex", "role": "firmware", "hashes": {"sha256": "a" * 64}}),
-        ("no path", {"root": "out", "role": "firmware", "hashes": {"sha256": "a" * 64}}),
-        ("no role", {"root": "out", "path": "f.hex", "hashes": {"sha256": "a" * 64}}),
-        ("no hashes", {"root": "out", "path": "f.hex", "role": "firmware"}),
-        ("hashes without a sha256", _entry(hashes={"blake3": "a" * 64})),
-        ("an unknown root", _entry(root="work")),
-        ("not an object at all", "firmware.hex"),
-    ],
-)
-def test_an_unresolvable_artifact_entry_is_skipped_silently(what: str, entry) -> None:
-    """§5.4: "An entry missing any of the four is not resolvable, and a
-    consumer MUST skip it exactly as it skips an unknown ``root``."
-
-    Silently, and that is the point of the rule: an unknown ``root`` is
-    what makes a second output location addable later without silent
-    mis-resolution, so an entry this version cannot *address* is not an
-    entry it may pass judgement on either.
-    """
-    document = abi.ResultDocument({"artifacts": [entry]})
-    assert abi.declared_artifacts(document) == ((), ()), what
-
-
-@pytest.mark.parametrize(
-    ("what", "entry", "fragment"),
-    [
-        ("an absolute path", _entry(path="/etc/passwd"), "relative path"),
-        ("a parent traversal", _entry(path="../escape"), "relative path"),
-        ("a segment outside the charset", _entry(path="sub dir/f.hex"), "relative path"),
-        ("an uppercase hash", _entry(hashes={"sha256": "A" * 64}), "64 lowercase hex"),
-        ("a prefixed hash", _entry(hashes={"sha256": "sha256:" + "a" * 64}), "64 lowercase hex"),
-        ("a short hash", _entry(hashes={"sha256": "a" * 63}), "64 lowercase hex"),
-    ],
-)
-def test_a_resolvable_entry_that_is_wrong_about_itself_is_a_problem(
-    what: str, entry: dict, fragment: str
-) -> None:
-    """§9.3, and the difference from a skip is the whole of the fix.
-
-    These entries carry all four fields and address ``out``, so they are
-    resolvable — and then say something the contract forbids: a path
-    outside §9.2's charset, or a hash in a rendering §3.3.1 does not
-    have. "A declared hash in any other rendering is a **mismatch**, not
-    a value to fold", and a mismatch is §5.3's sixth condition failing.
-    Dropping them instead reported ``success`` for a build with an
-    artifact silently missing from the delivery, which is the one
-    outcome a client cannot detect.
-    """
-    document = abi.ResultDocument({"artifacts": [entry]})
-    found, problems = abi.declared_artifacts(document)
-    assert found == (), what
-    assert len(problems) == 1, what
-    assert fragment in problems[0], problems
-
-
-def test_a_resolvable_entry_survives_with_all_four_fields() -> None:
-    document = abi.ResultDocument({"artifacts": [_entry(), _entry(path="sub/f.bin")]})
-    found, problems = abi.declared_artifacts(document)
-    assert problems == ()
-    assert [entry.path for entry in found] == ["firmware.hex", "sub/f.bin"]
-    assert found[0].role == "firmware"
 
 
 # --------------------------------------------------------------------------

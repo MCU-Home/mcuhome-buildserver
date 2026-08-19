@@ -1,26 +1,19 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""The invocation ABI: the request document out, the result document back.
+"""The invocation ABI, from this server's side: the result document.
 
-Build-container contract §5, from the backend's side. Nothing here runs
-anything — :mod:`mcuhome_buildserver.container` does that — and nothing
-here knows about sessions. This module writes the document an invocation
-is described by and reads the one it is answered with, and it is the only
-place in this server that knows either shape.
+Build-container contract §5. Nothing here runs anything and nothing here
+knows about sessions; this module reads the document an invocation is
+answered with, and it is the only place in this server that knows that
+shape.
 
-**The request document is written into a backend-owned per-invocation
-directory and never inside the context** (§5.1 step 1, §5.2). That is
-not tidiness: it is what lets ``context`` be a kernel-enforced read-only
-mount, and it removes the data race the fixed path
-``/ctx/.mcuhome/command.json`` had, where two concurrent ``docker exec``
-invocations overwrote each other's document.
-
-**There is no invocation ID in it.** The backend addresses an invocation
-by the ``out``, ``result`` and ``events`` paths it chose for it, so a
-token the program could only echo back would be one more field for a
-third party to get right for nothing. This server's own invocation id
-therefore never crosses the boundary, even though ``get-artifact`` and
-``cancel`` address one.
+**A working invocation's request document is not written here any more.**
+It is the orchestrator's, together with the mounts, the liveness ladder
+and §5.3's judgement — the same code a local build runs. What is left of
+the outbound half is the two-field preamble ``describe`` takes
+(:func:`write_request`), because *that* invocation is this server's own:
+it is how an image proves it can be trusted with a build before any
+session is admitted to it.
 
 **Reading the result is a seven-part question, not a exit code.** §5.3:
 "the backend reads the result document **if it exists**, regardless of
@@ -56,9 +49,7 @@ __all__ = [
     "InvocationOutcome",
     "ResultDocument",
     "TreeEntry",
-    "declared_artifacts",
     "read_result",
-    "request_document",
     "write_request",
 ]
 
@@ -294,82 +285,6 @@ class InvocationOutcome:
 # --------------------------------------------------------------------------
 # The request document
 # --------------------------------------------------------------------------
-
-
-def request_document(
-    *,
-    result: Path,
-    session: str,
-    out: Path,
-    work: Path,
-    tmp: Path,
-    context: Path,
-    trees: dict[str, TreeEntry],
-    jobs: int,
-    deadline_seconds: int,
-    cancel_grace_seconds: int,
-    events: Path,
-    cancel: Path,
-    params: dict[str, Any] | None = None,
-    required: tuple[str, ...] = (),
-    ccache: TreeEntry | None = None,
-) -> dict[str, Any]:
-    """The document one working invocation is described by.
-
-    Every field §5.2 makes mandatory for a working action is a required
-    argument here, so a document missing one cannot be composed:
-    ``session``, ``out``, ``work``, ``tmp``, ``context``, ``trees.sdk``
-    and ``limits.jobs`` on top of the immortal preamble.
-
-    Three choices worth stating, all of them the backend's:
-
-    ``limits.jobs`` is resolved **host-side** and is authoritative. It
-    is not a hint the program may improve on with ``nproc``: the
-    container sees the host CPU count and not the RAM budget, and
-    several concurrent sessions at ``nproc`` jobs each is an
-    out-of-memory kill.
-
-    ``limits.memory_bytes`` is **not written at all**. It is advisory —
-    enforcement is the backend's (§9.1) — and this server enforces
-    memory through the container runtime rather than by asking, so
-    stating a number it does not enforce would be a promise to the
-    program that nothing behind it keeps.
-
-    ``params`` is omitted for an action that has none, which is a
-    decision rather than an absence: an absent ``params``, a ``params``
-    without ``mode`` and ``params: {}`` are the same thing and all three
-    mean ``mode: "clean"``. This server writes the mode explicitly on
-    ``build`` anyway, because it also *demands* the pointer through
-    ``required`` — the value has to be there to be honoured.
-    """
-    document: dict[str, Any] = {
-        # The immortal preamble, first and by name: from here on every
-        # error a program hits is a result document, because `result` is
-        # guaranteed to be a top-level string path in every future
-        # request format version.
-        "request": REQUEST_VERSION,
-        "result": str(result),
-        "session": session,
-        "out": str(out),
-        "work": str(work),
-        "tmp": str(tmp),
-        "context": str(context),
-        "trees": {name: entry.to_dict() for name, entry in sorted(trees.items())},
-        "limits": {
-            "jobs": jobs,
-            "deadline_seconds": deadline_seconds,
-            "cancel_grace_seconds": cancel_grace_seconds,
-        },
-        "events": str(events),
-        "cancel": str(cancel),
-    }
-    if ccache is not None:
-        document["ccache"] = ccache.to_dict()
-    if params:
-        document["params"] = dict(params)
-    if required:
-        document["required"] = list(required)
-    return document
 
 
 def write_request(document: dict[str, Any], path: Path) -> None:
@@ -676,86 +591,3 @@ PROGRAM_FIELDS = ("id", "version", "contract", "request", "result", "actions")
 
 def _program_block_complete(program: dict[str, Any]) -> bool:
     return all(field_name in program for field_name in PROGRAM_FIELDS)
-
-
-def declared_artifacts(document: ResultDocument) -> tuple[tuple[Artifact, ...], tuple[str, ...]]:
-    """The declared artifacts, and what was wrong with the rest.
-
-    **§5.4 and §9.3 treat two different failures here, and they are not
-    the same answer.** Returns ``(resolvable, problems)``.
-
-    *Skipped, silently.* An entry that is "not resolvable" — missing any
-    of ``root``, ``path``, ``role`` or ``hashes``, or naming a ``root``
-    this version does not know. §5.4 is explicit that a consumer "MUST
-    skip it exactly as it skips an unknown ``root``", and that is what
-    makes a second output location addable later without silent
-    mis-resolution: an entry this version cannot address is not an entry
-    it may judge.
-
-    *A problem.* An entry that carries all four fields, addresses ``out``
-    and is still wrong about itself: a ``path`` whose segments are
-    outside ``[A-Za-z0-9._-]+`` (§9.2 forbids the program to produce
-    one), or a ``sha256`` in any rendering other than 64 lowercase hex
-    digits. §9.3: "the comparison is against the one legal spelling of
-    §3.3.1, never case-insensitive: **a declared hash in any other
-    rendering is a mismatch**, not a value to fold." A mismatch is
-    §5.3's sixth condition failing, so these travel back to the caller
-    and fail the invocation instead of quietly shrinking the delivery —
-    a build reported ``success`` with an artifact silently absent is the
-    one delivery a client cannot detect.
-
-    A build whose every entry was skipped declares nothing, and "an
-    absent list is an empty delivery, not a permissive one": it still
-    fails, for having declared nothing servable rather than for having
-    declared something wrong.
-    """
-    entries = document.data.get("artifacts")
-    if not isinstance(entries, list):
-        return (), ()
-    found: list[Artifact] = []
-    problems: list[str] = []
-    for entry in entries:
-        artifact, problem = _artifact(entry)
-        if artifact is not None:
-            found.append(artifact)
-        elif problem is not None:
-            problems.append(problem)
-    return tuple(found), tuple(problems)
-
-
-def _artifact(entry: Any) -> tuple[Artifact | None, str | None]:
-    """One ``artifacts[]`` entry as ``(artifact, problem)``; at most one."""
-    if not isinstance(entry, dict):
-        return None, None
-    root = entry.get("root")
-    path = entry.get("path")
-    role = entry.get("role")
-    hashes = entry.get("hashes")
-    if not isinstance(root, str) or root != ROOT_OUT:
-        return None, None
-    if not isinstance(path, str) or not isinstance(role, str) or not isinstance(hashes, dict):
-        return None, None
-    segments = path.split("/")
-    if not segments or any(_PATH_SEGMENT.fullmatch(part) is None for part in segments):
-        return None, (
-            f'the declared artifact path "{path}" is not a relative path of '
-            "[A-Za-z0-9._-]+ segments under out"
-        )
-    if ".." in segments or "." in segments:
-        # Not redundant with the charset: `.` and `..` are made of
-        # characters the charset allows, so the two checks refuse
-        # different things and only both of them refuse a traversal.
-        return None, (
-            f'the declared artifact path "{path}" is not a relative path under out: it '
-            "carries a . or .. segment"
-        )
-    sha256 = hashes.get("sha256")
-    if not isinstance(sha256, str):
-        return None, None
-    if _SHA256_HEX.fullmatch(sha256) is None:
-        return None, (
-            f'"{path}" declares its sha256 as {sha256!r}, and the one legal spelling is '
-            "64 lowercase hex digits with no prefix — any other rendering is a mismatch, "
-            "not a value to fold"
-        )
-    return Artifact(root=root, path=path, role=role, sha256=sha256), None

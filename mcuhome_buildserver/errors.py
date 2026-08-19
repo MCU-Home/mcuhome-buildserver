@@ -332,10 +332,10 @@ REGISTRY: dict[str, ErrorCode] = _seed(
     # first release made the registry append-only: the prefix names the
     # ROLE, not the deployment. The build container is the builder here,
     # but the builder is not necessarily the build container — in the
-    # subprocess profile there is no container at all, and its build
-    # environment fails under exactly these codes. `builder.failed` says
-    # the one thing a client needs: the thing that was building had an
-    # error; which profile stood behind it is the session's business.
+    # a machine that builds without one has no container at all, and its
+    # build environment fails under exactly these codes. `builder.failed`
+    # says the one thing a client needs: the thing that was building had
+    # an error; what stood behind it is the session's business.
     # This is deliberately not a leftover of the retired terminology —
     # "builder" was retired as a name for the *container*, and these
     # codes never meant the container specifically.

@@ -10,12 +10,11 @@ the build program and reads its result. It has no user interface, no
 configuration tree, no secrets store and no signing key: it knows the
 one device it is currently building and nothing else (ADR 0007).
 
-**Both backend profiles of §1.2 are real.** ``container`` starts one
-container per session and invokes the program in it; ``subprocess`` runs
-the program as a child process in this server's own filesystem, with the
-reduced promises §1.2 names. The operator picks one
-(``--backend-profile``) and ``open-session`` tells the client which it
-got. No verb answers ``session.not-implemented``.
+**Every session builds in a container.** One container per session, no
+network, per-session limits, the session as the trust boundary — and
+``open-session`` says so in ``negotiated.backend_profile``, because that
+answer is what tells a client which promises it is getting. No verb
+answers ``session.not-implemented``.
 
 Module map:
 
@@ -23,20 +22,17 @@ Module map:
 :mod:`mcuhome_buildserver.config`           runtime configuration (CLI + env)
 :mod:`mcuhome_buildserver.server`           process entry point
 :mod:`mcuhome_buildserver.app`              application factory, shared state,
-                                            backend selection, ``/health``
+                                            the backend, ``/health``
 :mod:`mcuhome_buildserver.security`         the bearer token and where it comes from
 :mod:`mcuhome_buildserver.protocol`         the frame envelope and its codec
 :mod:`mcuhome_buildserver.errors`           the session protocol's error envelope
                                             and its append-only code registry
 :mod:`mcuhome_buildserver.sessions`         session protocol v2: sessions and verbs
 :mod:`mcuhome_buildserver.ws`               the ``/ws`` endpoint and the command loop
-:mod:`mcuhome_buildserver.backend`          the backend seam both profiles share,
-                                            and the ``container`` profile on it
-:mod:`mcuhome_buildserver.subprocessbackend` the ``subprocess`` profile
+:mod:`mcuhome_buildserver.backend`          this server's half of one session's
+                                            build: discovery, invocations, egress
 :mod:`mcuhome_buildserver.container`        docker, and the one seam to it
-:mod:`mcuhome_buildserver.program`          the program of the ``subprocess``
-                                            profile, and the one seam to it
-:mod:`mcuhome_buildserver.processes`        child processes, for both profiles
+:mod:`mcuhome_buildserver.processes`        child processes
 ==========================================  ===================================
 """
 

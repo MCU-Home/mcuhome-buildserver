@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **The `subprocess` backend profile, and `--backend-profile` with it.**
+  It served nothing: an image-derived program declares a concrete `sdk`
+  path and the profile refused it for want of a mount namespace, while an
+  installed compiler on a plain host answered `describe` with every tree
+  path `null` and served no Zephyr line at all — measured on both ends,
+  not argued. Building without a container runtime is an *execution* of
+  the workbench's rather than a profile of this server, and it will come
+  back as one. `negotiated.backend_profile` stays on the wire and answers
+  `container`, because the answer is what tells a client which promises
+  it is getting.
+- `subprocessbackend.py`, `program.py` and `sdkstore.py`, the driving
+  half of the backend base class (`_materialize`, `_start`, `_document`,
+  `_prepare`, the liveness ladder and §5.3's judgement), the request
+  document for working invocations, and egress `harden`. Every one of
+  them was a second implementation of something the orchestrator does,
+  kept alive by that profile alone. `SessionBackend` and
+  `ContainerBackend` are one class again.
+- `--program`, which named the executable that profile invoked.
+
 ### Changed
 
 - **This server is no longer an orchestrator.** A session's build

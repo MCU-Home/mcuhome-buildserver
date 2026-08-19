@@ -648,7 +648,7 @@ def write_sdk_package(directory: Path, version: str, *, entries: dict[str, bytes
 
     Returns its SHA-256, which is what a context has to pin: the name
     only makes a candidate findable, and the bytes are what make it the
-    package (:mod:`mcuhome_buildserver.sdkstore`).
+    package.
     """
     directory.mkdir(parents=True, exist_ok=True)
     archive = make_archive(entries or {"mcuhome/__init__.py": b"# the SDK\n"})

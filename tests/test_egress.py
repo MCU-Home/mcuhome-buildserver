@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Egress hardening, the download archive, and the SDK this server fetches.
+"""Egress: what is not served, and the download archive.
 
 Contract §9.3 opens with the reason all of this exists: "``out`` is
 written by the least trusted component in the system and its contents
@@ -21,18 +21,9 @@ from pathlib import Path
 import pytest
 import zstandard
 
-from mcuhome_buildserver import artifacts, sdkstore
+from mcuhome_buildserver import artifacts
 from mcuhome_buildserver.abi import Artifact
 from mcuhome_buildserver.errors import SessionError
-from mcuhome_buildserver.ingress import IngressCaps
-
-CAPS = IngressCaps(
-    compressed_bytes=1 << 20,
-    decompressed_bytes=1 << 20,
-    entries=64,
-    file_bytes=1 << 20,
-    path_depth=8,
-)
 
 
 def _declare(path: str, payload: bytes, role: str = "firmware") -> Artifact:
@@ -50,103 +41,8 @@ def _out(tmp_path: Path, **files: bytes) -> Path:
 
 
 # --------------------------------------------------------------------------
-# §9.3, duty by duty
+# What is not served, and is not deleted either (§9.3)
 # --------------------------------------------------------------------------
-
-
-def test_a_matching_artifact_survives_hardening(tmp_path: Path) -> None:
-    """The happy path of §9.3, and it is named for what it checks.
-
-    It used to be called "…served with the hash read off disk", which it
-    cannot tell apart from "served with the hash it declared": ``harden``
-    has already refused every entry where the two differ by the time it
-    builds the verified tuple, so both readings produce the same value
-    and no assertion here can distinguish them. What the test does show
-    is the condition §5.3 counts — a declared artifact that exists,
-    re-hashes and comes back with no problem beside it.
-    """
-    out = _out(tmp_path, **{"firmware.hex": b"payload"})
-    verified, problems = artifacts.harden(
-        out, (_declare("firmware.hex", b"payload"),), max_bytes=1 << 20
-    )
-    assert problems == ()
-    assert verified[0].sha256 == hashlib.sha256(b"payload").hexdigest()
-
-
-def test_a_symlinked_artifact_is_refused_rather_than_followed(tmp_path: Path) -> None:
-    """ "Enumerate ``out`` **without following symlinks** and reject
-    symlinks."
-
-    The containment walk asks whether any segment *is* a link rather
-    than where the path leads, which is the only question with a safe
-    answer: a ``firmware.hex`` pointing at ``/etc/shadow`` resolves to a
-    contained-looking absolute path only after the link was followed.
-    """
-    out = _out(tmp_path)
-    secret = tmp_path / "secret"
-    secret.write_bytes(b"payload")
-    (out / "firmware.hex").symlink_to(secret)
-    verified, problems = artifacts.harden(
-        out, (_declare("firmware.hex", b"payload"),), max_bytes=1 << 20
-    )
-    assert verified == ()
-    assert problems and "firmware.hex" in problems[0]
-
-
-def test_a_symlinked_directory_on_the_way_is_refused_too(tmp_path: Path) -> None:
-    """Every segment, not only the last: a link one level up is the same
-    escape with one more step in it."""
-    out = _out(tmp_path)
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    (elsewhere / "firmware.hex").write_bytes(b"payload")
-    (out / "images").symlink_to(elsewhere)
-    verified, problems = artifacts.harden(
-        out, (_declare("images/firmware.hex", b"payload"),), max_bytes=1 << 20
-    )
-    assert verified == ()
-    assert problems
-
-
-def test_a_hardlinked_artifact_is_refused(tmp_path: Path) -> None:
-    """ "Reject … hardlinks (``nlink > 1``)".
-
-    A second name for bytes that may live outside ``out`` entirely, and
-    ``lstat`` cannot tell which name came first. §9.2 forbids the
-    program to make one at all.
-    """
-    out = _out(tmp_path, **{"firmware.hex": b"payload"})
-    os.link(out / "firmware.hex", tmp_path / "second-name")
-    verified, problems = artifacts.harden(
-        out, (_declare("firmware.hex", b"payload"),), max_bytes=1 << 20
-    )
-    assert verified == ()
-    assert "hardlink" in problems[0]
-
-
-def test_a_fifo_is_not_a_regular_file(tmp_path: Path) -> None:
-    """ "Regular files only" — a FIFO declared as an artifact would make
-    the egress read block forever on a build container's whim."""
-    out = _out(tmp_path)
-    os.mkfifo(out / "firmware.hex")
-    verified, problems = artifacts.harden(out, (_declare("firmware.hex", b""),), max_bytes=1 << 20)
-    assert verified == ()
-    assert "regular file" in problems[0]
-
-
-def test_the_size_cap_is_applied_from_the_bytes_on_disk(tmp_path: Path) -> None:
-    """ "Apply size caps during enumeration, from the bytes on disk — an
-    artifact entry declares no size."
-
-    ``artifacts[].size`` was struck from the frozen surface, so there is
-    nothing to trust and nothing to compare: the file's own length is
-    the only number there is.
-    """
-    payload = b"x" * 4096
-    out = _out(tmp_path, **{"firmware.bin": payload})
-    verified, problems = artifacts.harden(out, (_declare("firmware.bin", payload),), max_bytes=100)
-    assert verified == ()
-    assert "serves at most 100" in problems[0]
 
 
 def test_undeclared_files_are_not_served_and_not_deleted(tmp_path: Path) -> None:
@@ -158,8 +54,7 @@ def test_undeclared_files_are_not_served_and_not_deleted(tmp_path: Path) -> None
     the two readings of an empty delivery and are not the same news.
     """
     out = _out(tmp_path, **{"firmware.hex": b"a", "zephyr.map": b"b", "logs/west.log": b"c"})
-    verified, _ = artifacts.harden(out, (_declare("firmware.hex", b"a"),), max_bytes=1 << 20)
-    leftovers = artifacts.undeclared(out, verified)
+    leftovers = artifacts.undeclared(out, (_declare("firmware.hex", b"a"),))
     assert leftovers == ("logs/west.log", "zephyr.map")
     assert (out / "zephyr.map").exists()
 
@@ -216,18 +111,16 @@ def test_an_artifact_swapped_for_a_symlink_after_hardening_is_not_followed(
 ) -> None:
     """The blocker: §9.3 enforced at delivery and not only at finish.
 
-    ``harden`` runs when the invocation ends and this runs when the
-    client asks, and in between the session's tree is writable inside a
-    container that outlives the invocation. A ``firmware.hex`` replaced
+    The orchestrator verifies when the invocation ends and this runs
+    when the client asks, and in between the session's tree is writable
+    inside a container that outlives the invocation. A ``firmware.hex`` replaced
     by a link to a host file was followed at download time and its
     target's bytes streamed to the client under the declared name —
     with the archive's own hash matching, because the hash is computed
     over the archive that was built from it.
     """
     out = _out(tmp_path, **{"firmware.hex": b"payload"})
-    declared = _declare("firmware.hex", b"payload")
-    verified, problems = artifacts.harden(out, (declared,), max_bytes=1 << 20)
-    assert problems == () and verified
+    verified = (_declare("firmware.hex", b"payload"),)
 
     outside = tmp_path / "outside"
     outside.write_bytes(b"root:x:0:0 -- a host file outside out/\n")
@@ -260,7 +153,7 @@ def test_a_member_swapped_between_the_check_and_the_open_is_not_followed(
     real one would leave it.
     """
     out = _out(tmp_path, **{"firmware.hex": b"payload"})
-    verified, _ = artifacts.harden(out, (_declare("firmware.hex", b"payload"),), max_bytes=1 << 20)
+    verified = (_declare("firmware.hex", b"payload"),)
     outside = tmp_path / "outside"
     outside.write_bytes(b"payload")
     real = artifacts._contained
@@ -288,10 +181,7 @@ def test_a_directory_on_the_way_that_became_a_link_is_refused_at_delivery(tmp_pa
     link hashing to the declared value does not make it the artifact.
     """
     out = _out(tmp_path, **{"images/firmware.hex": b"payload"})
-    verified, problems = artifacts.harden(
-        out, (_declare("images/firmware.hex", b"payload"),), max_bytes=1 << 20
-    )
-    assert problems == () and verified
+    verified = (_declare("images/firmware.hex", b"payload"),)
 
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
@@ -315,7 +205,7 @@ def test_an_artifact_rewritten_after_hardening_fails_the_re_hash(tmp_path: Path)
     into it rather than a second read of the file afterwards.
     """
     out = _out(tmp_path, **{"firmware.hex": b"payload"})
-    verified, _ = artifacts.harden(out, (_declare("firmware.hex", b"payload"),), max_bytes=1 << 20)
+    verified = (_declare("firmware.hex", b"payload"),)
     (out / "firmware.hex").write_bytes(b"other payload")
 
     with pytest.raises(SessionError) as excinfo:
@@ -334,7 +224,7 @@ def test_an_artifact_hardlinked_after_hardening_is_refused_at_delivery(tmp_path:
     that was actually opened.
     """
     out = _out(tmp_path, **{"firmware.hex": b"payload"})
-    verified, _ = artifacts.harden(out, (_declare("firmware.hex", b"payload"),), max_bytes=1 << 20)
+    verified = (_declare("firmware.hex", b"payload"),)
     os.link(out / "firmware.hex", tmp_path / "second-name")
 
     with pytest.raises(SessionError) as excinfo:
@@ -346,7 +236,7 @@ def test_an_artifact_hardlinked_after_hardening_is_refused_at_delivery(tmp_path:
 def test_an_artifact_deleted_after_hardening_is_refused_at_delivery(tmp_path: Path) -> None:
     """A verified artifact that is simply gone is the same statement."""
     out = _out(tmp_path, **{"firmware.hex": b"payload"})
-    verified, _ = artifacts.harden(out, (_declare("firmware.hex", b"payload"),), max_bytes=1 << 20)
+    verified = (_declare("firmware.hex", b"payload"),)
     (out / "firmware.hex").unlink()
 
     with pytest.raises(SessionError) as excinfo:
@@ -366,175 +256,3 @@ def test_an_empty_delivery_is_an_archive_with_nothing_in_it(tmp_path: Path) -> N
     )
     assert _members(delivery.path) == {}
     assert delivery.size > 0
-
-
-# --------------------------------------------------------------------------
-# The SDK package (E48)
-# --------------------------------------------------------------------------
-
-
-def _package(directory: Path, version: str, entries: dict[str, bytes]) -> str:
-    directory.mkdir(parents=True, exist_ok=True)
-    raw = io.BytesIO()
-    with tarfile.open(fileobj=raw, mode="w") as tar:
-        for name, payload in entries.items():
-            info = tarfile.TarInfo(name)
-            info.size = len(payload)
-            tar.addfile(info, io.BytesIO(payload))
-    archive = zstandard.ZstdCompressor().compress(raw.getvalue())
-    (directory / sdkstore.package_filename(version)).write_bytes(archive)
-    return hashlib.sha256(archive).hexdigest()
-
-
-def test_the_first_source_that_holds_the_package_wins(tmp_path: Path) -> None:
-    """ADR 0019's amendment fixes the order the source list is searched
-    in, and this server implements its first tier: the configured local
-    directories, in the order the operator gave them."""
-    first = tmp_path / "first"
-    second = tmp_path / "second"
-    _package(second, "2.4.0", {"mcuhome/__init__.py": b"second\n"})
-    sha256 = _package(first, "2.4.0", {"mcuhome/__init__.py": b"first\n"})
-    package = sdkstore.acquire_sdk(
-        version="2.4.0",
-        sha256=sha256,
-        sources=(first, second),
-        into=tmp_path / "tree",
-        caps=CAPS,
-        max_bytes=1 << 20,
-    )
-    assert package.source == first / "mcuhome-sdk-2.4.0.tar.zst"
-    assert (package.tree / "mcuhome/__init__.py").read_bytes() == b"first\n"
-
-
-def test_a_pin_no_source_holds_keeps_host_paths_off_the_wire(tmp_path: Path, caplog) -> None:
-    """``sdk.unavailable`` carries what the client can act on, and no
-    host path.
-
-    The version and the pinned hash travel in the envelope — a client can
-    act on those. The directories that were searched are the operator's
-    filesystem layout, and the client that sees this refusal is not the
-    party that can fix a deployment gap, so they stay off the wire and go
-    to the log for the operator who can.
-    """
-    searched = tmp_path / "nowhere"
-    with caplog.at_level("WARNING"), pytest.raises(SessionError) as excinfo:
-        sdkstore.acquire_sdk(
-            version="2.4.0",
-            sha256="a" * 64,
-            sources=(searched,),
-            into=tmp_path / "tree",
-            caps=CAPS,
-            max_bytes=1 << 20,
-        )
-    assert excinfo.value.code == "sdk.unavailable"
-    assert excinfo.value.details["version"] == "2.4.0"
-    assert excinfo.value.details["sha256"] == "a" * 64
-    # No operator host path anywhere in the envelope the client receives.
-    assert "sources" not in excinfo.value.details
-    assert "found" not in excinfo.value.details
-    envelope = excinfo.value.to_envelope()
-    assert str(searched) not in str(envelope)
-    # The operator, who can act on it, reads the searched directory in the log.
-    assert str(searched) in caplog.text
-
-
-def test_the_hash_decides_and_not_the_name(tmp_path: Path) -> None:
-    """§9.1: "the content of ``trees.sdk`` matches the manifest's
-    ``mcuhome.package.sha256``".
-
-    A file named for the right version whose bytes hash to something
-    else is either a corrupted mirror or a package somebody replaced,
-    and both are answers an operator has to see rather than a fallback
-    this server can make.
-    """
-    source = tmp_path / "packages"
-    _package(source, "2.4.0", {"mcuhome/__init__.py": b"real\n"})
-    with pytest.raises(SessionError) as excinfo:
-        sdkstore.acquire_sdk(
-            version="2.4.0",
-            sha256="b" * 64,
-            sources=(source,),
-            into=tmp_path / "tree",
-            caps=CAPS,
-            max_bytes=1 << 20,
-        )
-    assert excinfo.value.code == "sdk.unavailable"
-    assert excinfo.value.details["measured"] != "b" * 64
-
-
-def test_the_package_is_unpacked_with_the_same_safe_extraction(tmp_path: Path) -> None:
-    """§9.1 states the rule once for "whatever transport delivered" an
-    input, and this reuses the ingress extractor rather than restating
-    it: one implementation of "regular files and directories only" in
-    this repository.
-    """
-    source = tmp_path / "packages"
-    source.mkdir()
-    raw = io.BytesIO()
-    with tarfile.open(fileobj=raw, mode="w") as tar:
-        info = tarfile.TarInfo("escape")
-        info.type = tarfile.SYMTYPE
-        info.linkname = "/etc/passwd"
-        tar.addfile(info)
-    archive = zstandard.ZstdCompressor().compress(raw.getvalue())
-    (source / "mcuhome-sdk-2.4.0.tar.zst").write_bytes(archive)
-
-    with pytest.raises(SessionError) as excinfo:
-        sdkstore.acquire_sdk(
-            version="2.4.0",
-            sha256=hashlib.sha256(archive).hexdigest(),
-            sources=(source,),
-            into=tmp_path / "tree",
-            caps=CAPS,
-            max_bytes=1 << 20,
-        )
-    assert excinfo.value.code == "context.unsafe-entry"
-
-
-def test_a_package_that_expands_past_the_cap_is_refused_mid_stream(tmp_path: Path) -> None:
-    """The reason ``_decompress`` streams at all: "a few kilobytes of
-    zstd can expand to gigabytes, and a decompressor that returned its
-    output as one ``bytes`` would have allocated the bomb before any
-    check could run."
-
-    The cap therefore has to fire *during* the decompression, and the
-    spool it was writing into has to be gone afterwards — a refusal that
-    left a half-written expansion on disk would have spent the bytes it
-    refused to spend.
-    """
-    source = tmp_path / "packages"
-    sha256 = _package(source, "2.4.0", {"big.bin": b"z" * (256 * 1024)})
-    into = tmp_path / "tree"
-    with pytest.raises(SessionError) as excinfo:
-        sdkstore.acquire_sdk(
-            version="2.4.0",
-            sha256=sha256,
-            sources=(source,),
-            into=into,
-            caps=CAPS,
-            max_bytes=4096,
-        )
-    assert excinfo.value.code == "policy.ingress-limit-exceeded"
-    assert excinfo.value.details["limit"] == 4096
-    assert not (into.parent / f"{into.name}.tar").exists()
-
-
-def test_an_sdk_package_may_hold_paths_no_context_could(tmp_path: Path) -> None:
-    """The layout whitelist is the *context's* and travels with it.
-
-    An SDK package is a source tree whose shape this server has no
-    business knowing, so the part that varies between the two callers of
-    the extractor is the layout check and nothing else.
-    """
-    source = tmp_path / "packages"
-    sha256 = _package(source, "2.4.0", {"pyproject.toml": b"[project]\n", "docs/index.md": b"#\n"})
-    package = sdkstore.acquire_sdk(
-        version="2.4.0",
-        sha256=sha256,
-        sources=(source,),
-        into=tmp_path / "tree",
-        caps=CAPS,
-        max_bytes=1 << 20,
-    )
-    assert (package.tree / "pyproject.toml").exists()
-    assert (package.tree / "docs/index.md").exists()

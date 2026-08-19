@@ -1,40 +1,30 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""The backend seam, and the container backend standing on it.
+"""The backend: this server's half of one session's build.
 
-Two things live here. :class:`SessionBackend` is everything a backend of
-build-container contract §9 does **whatever profile it serves** — the
-per-invocation directories, the request document, liveness, the event and
-log relay, egress and the verdict. :class:`ContainerBackend` is the
-``container`` profile of §1.2 on top of it: "the backend materializes one
-container per session and invokes the program inside it", with every
-isolation guarantee of ADR 0019 §8 — one session = one container
-instance = the trust boundary, no network, per-session limits. The other
-profile is :class:`~mcuhome_buildserver.subprocessbackend.SubprocessBackend`,
-and it is a sibling rather than a special case: §5's ABI is identical in
-both, so what differs is only how the program is started and how much of
-the environment the kernel keeps apart.
+:class:`SessionBackend` is what one build-server process knows about
+running builds. It is **not** an orchestrator — a session's build
+environment is the workbench's, the same object a local build gets — and
+what stays here is what a *protocol* has and a build does not:
+which images this host can serve, whether a client may run the one it
+pinned, invocation ids, the audience watching them, the replay boundary,
+egress and the verdict frame.
 
 **A backend is never a build environment.** Nothing here compiles
-anything; it starts something, writes a request document, invokes a
-program and reads what came back. That sentence holds in both profiles —
-§1.2 makes it hold — which is precisely why the split above is a base
-class and not two implementations of one interface written twice.
+anything; it materializes an environment, prepares an invocation in it,
+relays what the program says and reads what came back.
 
 The layering, from the outside in:
 
 * :mod:`mcuhome_buildserver.sessions` owns the verbs and the state
   machine and calls into this module through ``state.backend``;
 * this module owns the *lifecycle* — build-environment discovery, the
-  session's runtime, the per-invocation directories, liveness, the event
-  and log relay, and what an invocation is worth at the end of it;
-* :mod:`mcuhome_buildserver.container` owns docker,
-  :mod:`mcuhome_buildserver.program` owns the child process the other
-  profile starts,
-  :mod:`mcuhome_buildserver.abi` owns the two documents,
-  :mod:`mcuhome_buildserver.events` owns the NDJSON stream,
-  :mod:`mcuhome_buildserver.artifacts` owns egress, and
-  :mod:`mcuhome_buildserver.sdkstore` owns the one external input.
+  session's runtime, the invocation record, the event and log relay, and
+  what an invocation is worth at the end of it;
+* :mod:`mcuhome_buildserver.container` owns docker discovery,
+  :mod:`mcuhome_buildserver.abi` owns the result document's vocabulary,
+  :mod:`mcuhome_buildserver.events` owns the NDJSON stream and
+  :mod:`mcuhome_buildserver.artifacts` owns egress.
 
 **Three things the container backend deliberately does not do**, each
 because a decision took the premise away.
@@ -67,13 +57,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import functools
 import logging
-import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 from mcuhome.model.context import EnvironmentPin
@@ -87,13 +75,11 @@ from mcuhome_buildserver import (
     environments,
     errors,
     events,
-    processes,
     protocol,
-    sdkstore,
 )
 from mcuhome_buildserver.abi import Artifact, TreeEntry
 from mcuhome_buildserver.config import Config
-from mcuhome_buildserver.contextstore import ContextPins, SessionPaths, derive_patch_layers
+from mcuhome_buildserver.contextstore import ContextPins, SessionPaths
 from mcuhome_buildserver.errors import SessionError
 from mcuhome_buildserver.processes import LineSink
 
@@ -104,7 +90,6 @@ __all__ = [
     "ACTION_DESCRIBE",
     "ACTION_VERIFY",
     "CONTRACT_VERSION",
-    "ContainerBackend",
     "ImageProfile",
     "InvocationRecord",
     "ProgramProfile",
@@ -125,25 +110,6 @@ ACTION_BUILD = "build"
 #: described by a specification the backend does not have."
 CONTRACT_VERSION = 1
 
-#: How often the event file is polled while an invocation runs. Fast
-#: enough that a client sees phases as they happen, slow enough that a
-#: two-hour build costs a bounded number of stats. It is not a contract
-#: number — §11 leaves liveness and timeout policy explicitly free.
-_POLL_SECONDS = 0.2
-
-#: How long SIGTERM has before SIGKILL. The last rung of the liveness
-#: ladder and the shortest, because by the time it is reached the
-#: program has already ignored a sentinel it agreed to poll and a signal
-#: it agreed to handle.
-_KILL_AFTER_SECONDS = 10.0
-
-#: A ``program.id`` that can be a directory name in the shared ccache
-#: store. §7.1.1 makes the id opaque — "a backend compares it for
-#: equality and does nothing else with it" — so anything that is not
-#: already a safe path segment simply gets no cache rather than a
-#: sanitized name it never claimed.
-_PATH_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
-
 
 # --------------------------------------------------------------------------
 # What a build environment is, and what a session runs on
@@ -163,10 +129,8 @@ class ProgramProfile:
     formats, the action set, where the trees are — is in this one block,
     and none of it is a property of a container.
 
-    What the two profiles add on top is only how the environment is
-    *named*: :class:`ImageProfile` names it by image reference and repo
-    digest, and the subprocess profile names it by the program's own
-    identity, because that is all there is to name.
+    What a subclass adds on top is only how the environment is *named*:
+    :class:`ImageProfile` names it by image reference and repo digest.
     """
 
     #: ``describe``'s ``program`` block, verbatim. Authoritative about
@@ -299,8 +263,7 @@ class SessionRuntime:
     """
 
     session_id: str
-    #: What ``describe`` answered for the environment serving this
-    #: session — an :class:`ImageProfile` in the ``container`` profile.
+    #: What ``describe`` answered for the environment serving this session.
     image: ProgramProfile
     paths: SessionPaths
     #: The ``trees`` block every invocation of this session writes. Fixed
@@ -309,24 +272,13 @@ class SessionRuntime:
     #: container.
     trees: dict[str, TreeEntry]
     patched_layers: tuple[str, ...]
-    container_id: str | None = None
-    #: The ``container`` profile's build environment, which is the
-    #: workbench's and not this server's: it holds the container, the
-    #: session's ``work`` and the trees, and it is what an invocation is
-    #: prepared and run against. ``None`` in the ``subprocess`` profile,
-    #: which drives its own child.
+    #: The build environment, which is the workbench's and not this
+    #: server's: it holds the container, the session's ``work`` and the
+    #: trees, and it is what an invocation is prepared and run against.
     environment: Any = None
-    ccache: TreeEntry | None = None
     #: One invocation at a time per ``work`` (§9.1). The program cannot
     #: check it, so it is a backend duty; this flag is the whole of it.
     busy: bool = False
-    #: The handle of this session's most recent invocation, where the
-    #: profile has to reach it at teardown. The ``container`` profile leaves it
-    #: ``None`` and reaps the container instead — removing that is what
-    #: actually stops a program there, because killing a ``docker exec``
-    #: client never did. The ``subprocess`` profile has no container and
-    #: the child *is* the build, so this is its only address for it.
-    child: processes.Process | None = None
 
 
 @dataclass
@@ -345,13 +297,12 @@ class InvocationRecord:
     #: been applied".
     patched_layers: tuple[str, ...] = ()
     started_at: float = field(default_factory=time.monotonic)
-    #: What the orchestrator judged, in the ``container`` profile, kept
-    #: between :meth:`ContainerBackend._supervise` and its ``_collect``.
+    #: What the orchestrator judged, kept between :meth:`_supervise` and
+    #: :meth:`_collect`.
     local_outcome: Any = None
-    #: The workbench invocation this record stands for, in the
-    #: ``container`` profile. It owns the request document, the sentinel
-    #: and the judgement; this record owns the id, the wire and the
-    #: replay. ``None`` in the ``subprocess`` profile.
+    #: The workbench invocation this record stands for. It owns the
+    #: request document, the sentinel and the judgement; this record owns
+    #: the id, the wire and the replay.
     invocation: Any = None
     #: Filled when the invocation ends. Until then the artifact list is
     #: empty, which is the truthful answer to ``get-artifact``: nothing
@@ -387,7 +338,7 @@ class InvocationRecord:
 
 
 class SessionBackend:
-    """What a backend does, minus how its build environment is started.
+    """Everything one build-server process knows about running builds.
 
     One instance per :class:`~mcuhome_buildserver.app.ServerState`. It
     holds no session state of its own beyond what a build environment
@@ -396,47 +347,41 @@ class SessionBackend:
     different lifetimes: a session exists from ``open-session``, and its
     build environment exists from the first command that needs one.
 
-    **Everything here is profile-independent by construction**, and the
-    list is contract §9.1's own: the per-invocation directory, an empty
-    ``out``, an empty ``tmp``, the session's ``work``, the events file,
-    the request document written atomically, one invocation at a time per
-    ``work``, the SDK verified against the pin, the result document read
-    whenever it exists, egress hardened, the verdict published. §9.1 says
-    of exactly this list that "neither shape moves a duty from this list
-    onto the program", and the two duties that *are* profile-dependent —
-    network isolation and per-session resource limits — are not on it.
+    **It is not an orchestrator.** A session's build environment is the
+    workbench's — the same object a local build gets — and what is left
+    here is what a *protocol* has and a build does not: which images this
+    host can serve, whether a client may run the one it pinned,
+    invocation ids, the audience watching them, the replay boundary and
+    the verdict frame. Everything below :meth:`_prepare_invocation` is
+    the orchestrator's: the request document, the mounts, the liveness
+    ladder, §5.3's judgement.
 
-    A subclass supplies what it can serve (:meth:`inventory`), which
-    environment answers a context's requirement (:meth:`resolve_image`),
-    how an invocation is prepared (:meth:`_prepare_invocation`) and
-    driven (:meth:`_supervise`, :meth:`_collect`), and how the
-    environment is reaped (:meth:`_release_runtime`).
-
-    **The two profiles no longer share the driving half, and that is
-    deliberate.** The ``container`` profile hands a session's build
-    environment to the workbench's orchestrator — the same object a
-    local build gets — so everything below :meth:`_prepare_invocation`
-    is that package's there: the request document, the mounts, the
-    liveness ladder, §5.3's judgement. What is left in *this* class is
-    the ``subprocess`` profile's own driving (:meth:`_materialize`,
-    :meth:`_start`, :meth:`_inside`, :meth:`_document`) together with
-    everything that is about a *session* rather than a build, which both
-    profiles still share: the record, the audience, the verdict frame,
-    the lease.
-
-    That asymmetry lasts exactly as long as the ``subprocess`` profile
-    does. It is not a container, so it falls out of the container
-    contract altogether; when it becomes an execution the workbench
-    knows about, the rest of this class goes with it.
+    **Two seams onto one docker, and they answer different questions.**
+    :attr:`docker` is discovery: is there a runtime, which images are
+    here, fetch one. It is asynchronous because it is asked from verb
+    handlers, on the event loop. :attr:`driver` is the orchestrator's,
+    synchronous, and used only inside a worker thread — because driving a
+    container means blocking on a build. Merging them would mean giving
+    one of the two the other's concurrency shape for nothing; the
+    discovery half goes away when ``capabilities`` is rebuilt.
     """
 
-    #: The backend profile this server declares at ``open-session``
-    #: (contract §1.2). Set by the subclass, because it is the one thing
-    #: about a backend that the wire promises a client.
-    profile = ""
+    #: What this server answers at ``open-session`` as
+    #: ``negotiated.backend_profile``: it builds in containers and is not
+    #: one itself.
+    profile = "container"
 
-    def __init__(self, config: Config) -> None:
+    def __init__(
+        self,
+        config: Config,
+        *,
+        docker: container.Docker | None = None,
+        driver: workbench.Docker | None = None,
+    ) -> None:
         self.config = config
+        self.docker = container.Docker(config.docker) if docker is None else docker
+        self.driver = workbench.Docker(config.docker) if driver is None else driver
+        self._images: dict[str, ImageProfile] = {}
         self._runtimes: dict[str, SessionRuntime] = {}
         self._records: dict[tuple[str, str], InvocationRecord] = {}
         self._tasks: set[asyncio.Task[None]] = set()
@@ -450,849 +395,8 @@ class SessionBackend:
         self._audience: dict[str, dict[Any, tuple[str, int] | None]] = {}
 
     # ----------------------------------------------------------------
-    # What a subclass owns
-    # ----------------------------------------------------------------
-
-    async def inventory(self) -> list[dict[str, Any]]:
-        """The build environments this server can serve, for ``capabilities``."""
-        raise NotImplementedError
-
-    async def resolve_image(
-        self, pins: ContextPins, context: Path, *, on_progress: LineSink | None = None
-    ) -> ProgramProfile:
-        """The environment this context is built in, or a refusal.
-
-        *on_progress* is offered to every profile and used by the one
-        that can fetch: a container backend relays the pull's output
-        through it, and a profile that has nothing to fetch ignores it
-        rather than making the caller ask which kind it is talking to.
-
-        *context* is the directory the bytes landed in. A container
-        profile answers out of *pins* alone — the pin is a digest and
-        that is the whole question — while the ``subprocess`` profile,
-        which cannot honour a digest at all, reads the model's Zephyr
-        line out of it. The parameter is here rather than on one
-        implementation because a session calls this without knowing
-        which profile it is talking to.
-        """
-        raise NotImplementedError
-
-    async def _session_environment(self, session: Any) -> ProgramProfile:
-        """The environment this session was answered with, still available."""
-        raise NotImplementedError
-
-    async def _materialize(
-        self,
-        session: Any,
-        profile: ProgramProfile,
-        paths: SessionPaths,
-        package: sdkstore.SdkPackage,
-        patched: tuple[str, ...],
-    ) -> SessionRuntime:
-        """Arrange the trees, start whatever has to be started, and record it."""
-        raise NotImplementedError
-
-    async def _start(self, runtime: SessionRuntime, record: InvocationRecord) -> processes.Process:
-        """Invoke the program for one invocation (§5.1) and hand back its handle."""
-        raise NotImplementedError
-
-    async def _release_runtime(self, runtime: SessionRuntime) -> None:
-        """Reap the session's build environment. Never raises."""
-        raise NotImplementedError
-
-    def _inside(self, runtime: SessionRuntime, path: Path) -> PurePosixPath | Path:
-        """*path*, as the build environment spells it.
-
-        Every path this server puts in a request document goes through
-        here, because "the directory this server made" and "the path the
-        program is told about" are only the same string in a profile
-        where they are. In this one they are: a subprocess shares this
-        filesystem, so the answer is the path itself.
-        """
-        return path
-
-    # ----------------------------------------------------------------
     # The session's build environment
     # ----------------------------------------------------------------
-
-    async def ensure_runtime(
-        self, session: Any, pins: ContextPins, *, context_id: str
-    ) -> SessionRuntime:
-        """The session's build environment, materialized on first use.
-
-        "Container materialization is **lazy** — the backend may defer
-        creating the container until the first command that needs one"
-        (ADR 0019 §2), and the same laziness is right where there is no
-        container: the SDK package is an expensive fetch and a session
-        that never builds should not pay for it. The first such command
-        is ``verify`` or ``build``, so everything expensive happens here.
-
-        The pins are cross-checked on the way (§9.1): the SDK package
-        really hashes to ``mcuhome.package.sha256``. The other two,
-        ``zephyr`` and ``target.board``, are compared against the pins the
-        session was admitted on by
-        :func:`~mcuhome_buildserver.contextstore.recheck_locked_context`
-        before every invocation, which is the only place a board can be
-        compared to anything on this side.
-
-        **One session, one build environment.** The environment is *not*
-        re-selected here — :meth:`resolve_image` is a
-        ``send-context``-time call only. That is where the choice belongs:
-        it is the moment the pins arrive, and ``lock-context`` writes the
-        chosen environment into ``manifest.yaml``, which §3.2 makes "the
-        record of which build environment answered this context's
-        requirement … the requirement says what was needed, this says what
-        actually ran". What happens here is a **presence check and never a
-        choice** (:meth:`_session_environment`).
-        """
-        existing = self._runtimes.get(session.id)
-        if existing is not None:
-            return existing
-        paths: SessionPaths = session.paths
-        profile = await self._session_environment(session)
-        paths.prepare_backend()
-        patched = derive_patch_layers(paths.context)
-        # Off the event loop: this hashes a multi-gigabyte package,
-        # streams a full zstd decompression to disk and untars it, and
-        # it happens in the path of the first `verify` or `build` — the
-        # commands that promise to "answer immediately" (E46). On the
-        # loop it would stall every other session, every other
-        # connection and the WebSocket heartbeat, which drops unrelated
-        # clients after thirty seconds.
-        package = await asyncio.to_thread(
-            sdkstore.acquire_sdk,
-            version=pins.sdk.version,
-            sha256=pins.sdk.sha256,
-            sources=self.config.sdk_sources,
-            into=paths.sdk,
-            # The operator's own material, not the client's upload — the
-            # SDK gets its own bounds (sdkstore.SDK_CAPS), because E44's
-            # numbers were argued for contexts and holding the operator's
-            # source tree to the client's budget shape makes the two
-            # knobs fight.
-            caps=sdkstore.SDK_CAPS,
-            max_bytes=sdkstore.SDK_MAX_BYTES,
-        )
-        runtime = await self._materialize(session, profile, paths, package, patched)
-        self._runtimes[session.id] = runtime
-        logger.info(
-            "session %s: %s build environment %s (context %s)",
-            session.id,
-            self.profile,
-            profile.environment,
-            context_id,
-        )
-        return runtime
-
-    def _shared_cache(self, profile: ProgramProfile) -> TreeEntry | None:
-        """The shared cache, offered read-only or not at all (§10).
-
-        "Shared backends MUST offer a shared cache read-only for
-        untrusted work; cache warming is a deliberate operator
-        invocation with a writable cache and trusted contexts only." A
-        build server serves untrusted contexts by definition and has no
-        warming verb, so the cache is read-only here with no option to
-        change it, and the program keeps its own primary cache in
-        ``work`` or ``tmp``.
-
-        The store is laid out one subdirectory per implementation, named
-        from ``describe``'s ``program.id`` — §10's own recommendation,
-        "so that two foreign images cannot corrupt each other's store".
-        An identity that is not a usable path segment simply gets no
-        cache: a third-party program is free to call itself anything,
-        and a backend that sanitized the name would be inventing an
-        identity the program did not claim.
-
-        It is profile-independent because §10 is: a cache is a directory,
-        and only the ``container`` profile has to also make it *reachable*
-        by mounting it.
-        """
-        root = self.config.ccache_dir
-        if root is None:
-            return None
-        identity = profile.identity
-        if not _PATH_SEGMENT.fullmatch(identity):
-            logger.warning("no shared cache for program id %r: not a path segment", identity)
-            return None
-        store = root / identity
-        try:
-            store.mkdir(mode=0o700, parents=True, exist_ok=True)
-        except OSError as exc:  # pragma: no cover - an operator's directory
-            logger.warning("no shared cache at %s: %s", store, exc)
-            return None
-        return TreeEntry(path=store, writable=False)
-
-    # ----------------------------------------------------------------
-    # Invocations
-    # ----------------------------------------------------------------
-
-    def attach(
-        self, session_id: str, connection: Any, *, boundary: tuple[str, int] | None = None
-    ) -> None:
-        """Add *connection* to a session's live stream, from *boundary* on.
-
-        *boundary* is ``(invocation id, seq)`` and is what
-        ``attach-session`` sets after it has replayed that invocation's
-        events out of the file: every event of that invocation up to and
-        including that ``seq`` has already been delivered as history, so
-        relaying it live as well would hand the client the same event
-        twice across the boundary it was told to trust. A connection
-        that replayed nothing passes ``None`` and sees everything.
-        """
-        self._audience.setdefault(session_id, {})[connection] = boundary
-
-    def detach(self, connection: Any) -> None:
-        """Drop a closed connection from every session's stream."""
-        for audience in self._audience.values():
-            audience.pop(connection, None)
-
-    def record(self, session_id: str, invocation_id: str) -> InvocationRecord | None:
-        return self._records.get((session_id, invocation_id))
-
-    async def invoke(
-        self,
-        session: Any,
-        connection: Any,
-        *,
-        action: str,
-        pins: ContextPins,
-        context_id: str,
-        mode: str | None = None,
-    ) -> InvocationRecord:
-        """Start one working invocation and answer immediately (E46).
-
-        The verb's answer is ``{invocation_id}`` and nothing else: the
-        completion travels as a typed ``invocation.verdict`` event
-        carrying the status and the artifact list, because a build is
-        minutes to hours long and a command frame that waited for it
-        would make every client's socket a build timer.
-
-        Everything §9.1 requires **before** an invocation happens here,
-        in one place so that the list can be read against the contract:
-        the per-invocation directory, an empty ``out``, an empty
-        ``tmp``, the session's ``work``, the ``events`` file, the
-        request document written atomically, and write protection of
-        ``context`` and of every non-writable tree — the last of which
-        the profile arranges when it materializes the environment, since
-        a mount cannot be added to a running container.
-        """
-        runtime = await self.ensure_runtime(session, pins, context_id=context_id)
-        if action not in runtime.image.actions:
-            # §7.1.1: "A backend MUST NOT invoke an action absent from
-            # the list." The program would answer `unsupported.action`
-            # legibly, which is precisely why there is no reason to make
-            # it: the refusal is already knowable.
-            raise SessionError(
-                "version.builder-unavailable",
-                f'The build environment serving this session does not implement "{action}". '
-                f"It announced {sorted(runtime.image.actions)}, and describe is the only "
-                "declaration of an action set there is.",
-                action=action,
-                actions=sorted(runtime.image.actions),
-                environment=runtime.image.environment,
-            )
-        if runtime.busy:
-            # One invocation at a time per `work` (§9.1). Pre-registry,
-            # for the reason `_context_work` gives about its own guard:
-            # no registered code means "this session is already doing
-            # work", and inventing one is a protocol decision rather
-            # than an implementation choice.
-            raise protocol.ProtocolError(
-                f'Session "{session.id}" is already running an invocation. One invocation '
-                "at a time per session: they share one work directory, and two of them in "
-                "it would build against each other's tree. Cancel it or wait for its "
-                "invocation.verdict event."
-            )
-
-        record = self._prepare_invocation(
-            session, runtime, action=action, context_id=context_id, mode=mode
-        )
-        runtime.busy = True
-        self.attach(session.id, connection)
-        task = asyncio.create_task(
-            self._drive(session, runtime, record), name=f"mcuhome-invocation-{record.id}"
-        )
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
-        return record
-
-    def _prepare_invocation(
-        self,
-        session: Any,
-        runtime: SessionRuntime,
-        *,
-        action: str,
-        context_id: str,
-        mode: str | None,
-    ) -> InvocationRecord:
-        """One invocation's directory, request document and record.
-
-        A profile hook because the two profiles no longer write the
-        request document with the same code: the ``container`` profile
-        has the workbench prepare it — the same code a local build uses —
-        while this one still composes it here. Both answer with a record,
-        because the id, the wire and the replay are this server's either
-        way.
-        """
-        record = self._prepare(session, runtime, action=action, context_id=context_id)
-        abi.write_request(self._document(runtime, record, mode=mode), record.request)
-        return record
-
-    def _prepare(
-        self, session: Any, runtime: SessionRuntime, *, action: str, context_id: str
-    ) -> InvocationRecord:
-        """Everything on disk one invocation needs, before it is started."""
-        session.invocation_counter += 1
-        invocation_id = f"inv-{session.invocation_counter}"
-        directory = runtime.paths.invocation(invocation_id)
-        record = InvocationRecord(
-            id=invocation_id,
-            session_id=session.id,
-            action=action,
-            directory=directory,
-            context_id=context_id,
-            patched_layers=runtime.patched_layers,
-        )
-        directory.mkdir(mode=0o700, parents=True, exist_ok=False)
-        record.out.mkdir(mode=0o700)
-        (directory / "tmp").mkdir(mode=0o700)
-        # The events file is created empty by the backend, because §9.1
-        # says so and because a reader that had to tell "not created
-        # yet" from "no events yet" would be guessing at exactly the
-        # moment a client is watching.
-        record.events.touch(mode=0o600)
-        session.invocations[invocation_id] = _RUNNING
-        self._records[(session.id, invocation_id)] = record
-        return record
-
-    def _document(
-        self, runtime: SessionRuntime, record: InvocationRecord, *, mode: str | None
-    ) -> dict[str, Any]:
-        """The request document for one invocation (§5.2).
-
-        ``required`` is where this server states what it will not have
-        silently ignored. Two kinds of pointer go in it, and only for
-        ``build``:
-
-        * ``/params/mode`` — because the value decides whether a warm
-          workspace was reused, and §5.2 makes the *value* count and not
-          only the pointer: "a program that knows ``/params/mode`` but
-          not the value ``reproducible`` MUST refuse with
-          ``unsupported.required`` rather than accept the job and
-          quietly deliver something else."
-        * ``/trees/<layer>`` for every layer whose patches the context
-          carries — because a build that ignored one would produce an
-          image attributed to a context whose patches never reached a
-          tree, which is the one wrong artifact that looks right.
-
-        ``verify`` demands neither, and that is not an oversight: it
-        "applies no patches and touches no source tree", so demanding
-        that it honour a tree pointer would ask a conforming program to
-        refuse for not using something it is forbidden to use. The tree
-        entries themselves are still supplied — §7.3 says exactly that —
-        because "a view it never writes to is indistinguishable from one
-        it was not given".
-        """
-        params: dict[str, Any] | None = None
-        required: list[str] = []
-        if record.action == ACTION_BUILD:
-            params = {"mode": mode or "clean"}
-            required.append("/params/mode")
-            required += [f"/trees/{layer}" for layer in runtime.patched_layers]
-        inside = functools.partial(self._inside, runtime)
-        return abi.request_document(
-            result=inside(record.result),
-            session=record.session_id,
-            out=inside(record.out),
-            work=inside(runtime.paths.work),
-            tmp=inside(record.directory / "tmp"),
-            context=inside(runtime.paths.context),
-            trees=runtime.trees,
-            jobs=self.config.build_jobs,
-            deadline_seconds=self.config.build_deadline_seconds,
-            cancel_grace_seconds=self.config.cancel_grace_seconds,
-            events=inside(record.events),
-            cancel=inside(record.cancel),
-            params=params,
-            required=tuple(required),
-            ccache=runtime.ccache,
-        )
-
-    async def _drive(self, session: Any, runtime: SessionRuntime, record: InvocationRecord) -> None:
-        """Run the invocation to its end, whatever its end turns out to be.
-
-        Owned by this backend and **not** by the connection that started
-        it, which is the mechanical half of "connection loss is not
-        abandonment": a client may drop its socket, and the build keeps
-        going, keeps writing its events file, and finishes into a record
-        a reattaching client can still read.
-        """
-        exit_code: int | None = None
-        try:
-            exit_code = await self._supervise(runtime, record)
-        except Exception:
-            logger.exception("invocation %s failed to run", record.id)
-        finally:
-            runtime.busy = False
-        outcome = await self._collect(record, exit_code=exit_code)
-        record.outcome = outcome
-        record.artifacts = outcome.artifacts
-        session.invocations[record.id] = _FINISHED
-        # The idle clock counts absent commands, and the command that
-        # started this invocation was sent before it ran: a fifteen-minute
-        # build would end into a session already minutes past its idle
-        # timeout, and the next verb — `get-artifact`, the one that
-        # collects what the build produced — would be refused
-        # `session.expired`. Observed exactly so, on a build that had
-        # just finished linking. Finishing work is activity.
-        session.touch()
-        if outcome.reason in _POISONING:
-            # §6.2 and §6.3: both are terminal for the session, and both
-            # say so in the same words — "the backend MUST refuse every
-            # further working action in that session". `session.poisoned`
-            # is that refusal, and the remedy for either is a new session
-            # with pristine trees and a `work` this server owns.
-            session.poison()
-        self._publish(
-            record,
-            protocol.event_frame("invocation.verdict", self._verdict(outcome, record)),
-        )
-
-    async def _supervise(self, runtime: SessionRuntime, record: InvocationRecord) -> int | None:
-        """Invoke the program, relay what it says, and enforce liveness.
-
-        The ladder, in order and with the reason for each rung:
-
-        1. **The cancel sentinel.** Its *existence* means stop. It is
-           first because it is the only rung that lets the program write
-           a result document — ``status: "cancelled"``, with ``reason``
-           and ``error`` both null, because nothing was diagnosed. It is
-           also the only rung that works identically in both profiles,
-           which is why the contract has it: "a cooperative sentinel is
-           used rather than a signal because killing a ``docker exec``
-           client does not kill the process inside the container, and
-           because the same mechanism works unchanged in the
-           ``subprocess`` profile" (§8).
-        2. **SIGTERM at ``cancel_grace_seconds``**, to whatever
-           :meth:`_start` handed back. **What that reaches is the one
-           thing the two profiles do not share.** In the ``container``
-           profile it is the ``docker exec`` client and *not* the process
-           inside the container — killing an exec client never has been —
-           so the rung buys the server's own file descriptors back. In
-           the ``subprocess`` profile it is the program itself, which is
-           what §1.2 means by "cancellability … remain[s]".
-        3. **SIGKILL**, and then whatever :meth:`_release_runtime` can
-           still reach at ``close-session``.
-
-        The deadline enters the same ladder at the top rather than
-        beside it: ``limits.deadline_seconds`` is advisory to the
-        program and enforced here, and a program that honours it stops
-        itself and says ``error.deadline.exceeded``.
-        """
-        reader = events.EventReader(path=record.events)
-        process = await self._start(runtime, record)
-        waiter = asyncio.ensure_future(process.wait())
-        stopping_at: float | None = None
-        terminated_at: float | None = None
-        deadline = record.started_at + self.config.build_deadline_seconds
-        while not waiter.done():
-            await asyncio.wait({waiter}, timeout=_POLL_SECONDS)
-            self._relay(record, reader)
-            now = time.monotonic()
-            if stopping_at is None and record.cancel.exists():
-                stopping_at = now
-            if stopping_at is None and now >= deadline:
-                logger.warning("invocation %s passed its deadline", record.id)
-                # Suppressed because the directory may already be gone:
-                # `close-session` deletes the session's tree while an
-                # invocation is still running, and a deadline that fired
-                # into that race must not become an exception in the
-                # supervisor — the ladder's next rung reaches the
-                # process either way.
-                with contextlib.suppress(OSError):
-                    record.cancel.touch()
-                stopping_at = now
-            if (
-                terminated_at is None
-                and stopping_at is not None
-                and now >= stopping_at + self.config.cancel_grace_seconds
-            ):
-                process.terminate()
-                terminated_at = now
-            if terminated_at is not None and now >= terminated_at + _KILL_AFTER_SECONDS:
-                process.kill()
-        # One last read, because the program's own `invocation.finished`
-        # is written immediately before the result document and can land
-        # between the last poll and the exit.
-        self._relay(record, reader)
-        if reader.dropped:
-            logger.warning("invocation %s: discarded %d event line(s)", record.id, reader.dropped)
-        return waiter.result()
-
-    async def _collect(
-        self, record: InvocationRecord, *, exit_code: int | None
-    ) -> abi.InvocationOutcome:
-        """Read the result, harden egress, and decide what it was worth.
-
-        §5.3's seventh condition and §9.3's five duties meet here: the
-        document is judged by :func:`~mcuhome_buildserver.abi.read_result`
-        and the artifacts by
-        :func:`~mcuhome_buildserver.artifacts.harden`, and an invocation
-        is successful only if both had nothing to say. That ordering is
-        the contract's — "every declared artifact exists as a regular
-        file under its declared ``root`` and re-hashes to its declared
-        value" is one of the seven conditions, not a step after them.
-
-        Three sources of problem, all of them §5.3's sixth condition
-        read whole: an entry the program declared and got *wrong* (a
-        misrendered hash, a path outside §9.2's charset), an entry whose
-        bytes do not survive ``harden``, and §7.2's delivery rule about
-        what a successful build has to contain. The first of the three
-        is why :func:`~mcuhome_buildserver.abi.declared_artifacts`
-        answers problems at all: an entry it merely dropped would leave
-        a build reported ``success`` with an artifact silently missing.
-
-        The hashing runs off the event loop. ``harden`` re-reads every
-        artifact of the build, which for a firmware set is tens of
-        megabytes and for a symbols-and-map delivery considerably more.
-        """
-        outcome = abi.read_result(
-            path=record.result,
-            action=record.action,
-            exit_code=exit_code,
-            session=record.session_id,
-            context_id=record.context_id,
-            patched_layers=record.patched_layers,
-        )
-        if outcome.result is not None:
-            declared, malformed = abi.declared_artifacts(outcome.result)
-            verified, problems = await asyncio.to_thread(
-                artifacts.harden,
-                record.out,
-                declared,
-                max_bytes=self.config.max_artifact_bytes,
-            )
-            outcome.artifacts = verified
-            problems = malformed + problems + _delivery_problems(record.action, outcome, verified)
-            if problems:
-                outcome.problems = outcome.problems + problems
-                outcome.successful = False
-            leftovers = await asyncio.to_thread(artifacts.undeclared, record.out, verified)
-            if leftovers:
-                # Not served and not deleted: they are diagnostic
-                # material (§9.3), and saying so in the log is the only
-                # way anybody finds out they exist.
-                logger.info(
-                    "invocation %s: %d undeclared file(s) left in out", record.id, len(leftovers)
-                )
-        if outcome.violation is not None:
-            logger.warning(
-                "contract violation against image for invocation %s: %s",
-                record.id,
-                outcome.violation,
-            )
-        return outcome
-
-    def _verdict(self, outcome: abi.InvocationOutcome, record: InvocationRecord) -> dict[str, Any]:
-        """The payload of the ``invocation.verdict`` frame (E46, E58).
-
-        It carries the status and the artifact list, which is what E46
-        asks for, plus the two things a client cannot get anywhere else:
-        the context id **this server** computed — attribution always
-        uses that one, never ``result.context`` — and, on a failure, the
-        session protocol's own error envelope, mapped from the
-        program's ``reason`` through
-        :data:`~mcuhome_buildserver.errors.REASON_CODES`.
-
-        ``status`` is the pessimistic reading. A document that says
-        ``success`` while one of §5.3's seven conditions does not hold
-        is reported as a failure, because "where exit code and document
-        contradict each other, the pessimistic reading wins".
-
-        **The name is this server's own, and no longer the program's**
-        (E58). E46 first called this frame ``invocation.finished``, which
-        is the name contract §8 seeds the event registry with — emitted
-        by the *program*, "once, immediately before the result document
-        is written", while this frame is emitted after that document has
-        been read and judged. Both reach the client, because a relayed
-        event is never dropped, and the only thing that told them apart
-        was the absence of ``seq``: a program that violated §8 by
-        omitting its counter would have had its own announcement read as
-        this server's verdict. The contract is frozen and keeps its
-        event name; the session layer renamed its frame while renaming
-        still cost nothing, so **the discrimination is the name**.
-        ``invocation.finished`` is always the program's, and
-        ``invocation.verdict`` is always this server's — and only the
-        verdict carries ``artifacts``, ``context`` and ``error``.
-        """
-        status = _wire_status(outcome)
-        payload: dict[str, Any] = {
-            "session_id": record.session_id,
-            "invocation_id": record.id,
-            "action": record.action,
-            "status": status,
-            "context": record.context_id,
-            "artifacts": [entry.to_dict() for entry in outcome.artifacts],
-        }
-        if outcome.violation is not None:
-            payload["contract_violation"] = outcome.violation
-        # A cancelled result carries `reason: null` and `error: null`
-        # exactly as a successful one does (§5.4): status cancelled
-        # already says everything there is to say, and an envelope beside
-        # it would be a second spelling of the status.
-        if status in (abi.STATUS_SUCCESS, abi.STATUS_CANCELLED):
-            payload["error"] = None
-            return payload
-        payload["error"] = self._envelope(outcome, record)
-        return payload
-
-    def _envelope(self, outcome: abi.InvocationOutcome, record: InvocationRecord) -> dict[str, Any]:
-        """One failed invocation as the session protocol's error envelope.
-
-        ``builder.crashed`` when there is no result document at all —
-        "an infrastructure failure, not a verdict on the context", and
-        the one code here that is retryable. Otherwise the reason
-        decides, through this server's own table.
-
-        The program's own ``error.retryable`` is carried in the details
-        under a name that says whose promise it is, and it is never the
-        envelope's ``retryable``: that value is the server's, "derived
-        from the server's own registry precisely so the promise cannot
-        be forged".
-        """
-        result = outcome.result
-        if result is None:
-            return errors.envelope(
-                "builder.crashed",
-                "The build container ended without writing a result document. That is an "
-                "infrastructure failure rather than a verdict on the context: an out "
-                "directory with no result at the path the request named is a failed "
-                "invocation by definition, and the same invocation may succeed on a retry.",
-                session_id=record.session_id,
-                invocation_id=record.id,
-                exit_code=outcome.exit_code,
-                problems=list(outcome.problems),
-            )
-        code = errors.from_reason(result.reason)
-        return errors.envelope(
-            code,
-            f"The {record.action} in this session's build container did not succeed. "
-            "The container's own classification and its message are in the details; the "
-            "raw log stream of this invocation carries what it printed.",
-            session_id=record.session_id,
-            invocation_id=record.id,
-            # Verbatim, whatever it is: "unknown values are handled as
-            # their status class and passed through verbatim".
-            reason=result.reason,
-            status=result.declared_status,
-            exit_code=outcome.exit_code,
-            # The one untrusted-text field in the document, stripped of
-            # control characters and bounded by `ResultDocument`.
-            container_message=result.error_message,
-            container_details=result.error_details,
-            # Under a name that says whose promise it is. §5.4.1 forbids
-            # relaying it *as* the envelope's `retryable` and says
-            # nothing against carrying it, and carrying it is the only
-            # way a client sees the program's own opinion of its failure
-            # at all.
-            container_retryable=result.error_retryable,
-            problems=list(outcome.problems),
-        )
-
-    # ----------------------------------------------------------------
-    # The streams
-    # ----------------------------------------------------------------
-
-    def _log(self, record: InvocationRecord, line: str) -> None:
-        """One line of the raw log, with the counter that makes drops visible."""
-        record.log_seq += 1
-        self._publish(
-            record,
-            protocol.log_frame(
-                {
-                    "session_id": record.session_id,
-                    "invocation_id": record.id,
-                    "seq": record.log_seq,
-                    "line": line,
-                }
-            ),
-            drop_when_full=True,
-        )
-
-    def _relay(self, record: InvocationRecord, reader: events.EventReader) -> None:
-        """Relay every new event of the program, verbatim (§8).
-
-        "Unknown names are relayed opaquely — a backend passes an event
-        whose name it does not know through to its client verbatim, with
-        its fields intact, and never drops it, never rewrites it and
-        never treats it as an error." So the payload **is** the
-        program's object, with this server's addressing merged in: a
-        program has no invocation id — the request document deliberately
-        carries none — so ``invocation_id`` cannot collide with anything
-        a program could mean by it.
-        """
-        for line in reader.read():
-            name = events.event_name(line)
-            if name is None:  # pragma: no cover - the reader filtered these
-                continue
-            payload = dict(line)
-            payload["session_id"] = record.session_id
-            payload["invocation_id"] = record.id
-            self._publish(record, protocol.event_frame(name, payload), drop_when_full=True)
-
-    def _publish(
-        self, record: InvocationRecord, frame: dict[str, Any], *, drop_when_full: bool = False
-    ) -> None:
-        """Put one frame on every connection watching this session.
-
-        *drop_when_full* is the difference between the two streams and
-        it is E46's shape read against the transport's. Program events
-        and log lines are offered — dropping the oldest rather than
-        applying backpressure through the log reader and from there into
-        the compiler — and both survive it: the log carries a counter
-        that makes a gap visible, and the events file on disk **is** the
-        replay buffer, so ``attach-session`` can fetch the gap. The
-        ``invocation.verdict`` frame is sent instead, because it is the
-        one frame a client is waiting on and there is no second way to
-        learn it: it is this server's own judgement and is in no events
-        file, so a drop would lose it for good.
-
-        A connection that joined through ``attach-session`` carries a
-        replay boundary, and a frame this server already delivered to it
-        as history is not delivered again as news.
-        """
-        for connection, boundary in tuple(self._audience.get(record.session_id, {}).items()):
-            if _already_replayed(frame, record, boundary):
-                continue
-            if drop_when_full:
-                connection.offer(frame)
-            else:
-                # Tracked rather than fired and forgotten: an untracked
-                # task that is still pending when the loop closes is a
-                # warning nobody can act on, and this one is the frame a
-                # client is waiting for.
-                task = asyncio.ensure_future(connection.send(frame))
-                self._tasks.add(task)
-                task.add_done_callback(self._tasks.discard)
-
-    # ----------------------------------------------------------------
-    # Teardown
-    # ----------------------------------------------------------------
-
-    async def release(self, session_id: str, *, reaped: str | None = None) -> None:
-        """Reap the session's build environment, if it had one. Never raises.
-
-        *reaped* is the half of the lease that ran out, and it is set by
-        the sweep alone: a session this server took away owes its
-        audience an explanation, while ``close-session`` is the client's
-        own act and process shutdown reaches nobody anyway.
-
-        Called from ``close-session``, from the reaper's sweep and from
-        process shutdown — the same three exits the per-session
-        directory has, because the environment and the directory are one
-        thing: in the ``container`` profile the directory *is* the
-        container's mounts, and in the ``subprocess`` profile it is the
-        working area of a child of this process. Either way, something
-        still running against a deleted tree is the one state neither
-        half can recover from.
-        """
-        runtime = self._runtimes.pop(session_id, None)
-        if reaped is not None:
-            self._announce_reaping(session_id, reaped)
-        self._audience.pop(session_id, None)
-        for key in [key for key in self._records if key[0] == session_id]:
-            self._records.pop(key, None)
-        if runtime is None:
-            return
-        await self._release_runtime(runtime)
-
-    def _announce_reaping(self, session_id: str, reaped: str) -> None:
-        """Tell whoever is still listening that this session was taken away.
-
-        A client waits for one frame and one frame only — the
-        ``invocation.verdict`` of the invocation it started — and this
-        server used to drop the audience without sending anything, so a
-        session reaped under a running build left the client waiting on a
-        verdict that could never arrive. The socket stays open, so not
-        even a connection loss ends the wait: measured at 56 minutes
-        before it was killed by hand.
-
-        So the verdict is sent, as a failure carrying the session layer's
-        own ``session.expired`` — the code whose summary has always been
-        "the session's lease or hard TTL ran out and it was reaped".
-        Only for invocations this server never judged: one that already
-        has an outcome has already had its verdict.
-        """
-        for (owner, _), record in list(self._records.items()):
-            if owner != session_id or record.outcome is not None:
-                continue
-            self._publish(
-                record,
-                protocol.event_frame(
-                    "invocation.verdict",
-                    {
-                        "session_id": record.session_id,
-                        "invocation_id": record.id,
-                        "action": record.action,
-                        "status": abi.STATUS_FAILURE,
-                        "context": record.context_id,
-                        "artifacts": [],
-                        "error": errors.envelope(
-                            "session.expired",
-                            f"This session was reaped ({reaped}) while its invocation was "
-                            f"still running, so the build was stopped and its directory "
-                            f"deleted. Nothing was delivered.",
-                            session_id=session_id,
-                            invocation_id=record.id,
-                        ),
-                    },
-                ),
-            )
-
-    async def release_all(self) -> None:
-        for session_id in list(self._runtimes):
-            await self.release(session_id)
-
-
-# --------------------------------------------------------------------------
-# The container backend
-# --------------------------------------------------------------------------
-
-
-class ContainerBackend(SessionBackend):
-    """Everything one build-server process knows about containers.
-
-    It is no longer an orchestrator. A session's build environment is
-    the workbench's — the same object a local build gets — and this
-    class owns what a *protocol* has and a build does not: which images
-    this host can serve, whether a client may run the one it pinned,
-    invocation ids, the audience watching them, and the verdict frame.
-
-    **Two seams onto one docker, and they answer different questions.**
-    :attr:`docker` is discovery: is there a runtime, which images are
-    here, fetch one. It is asynchronous because it is asked from verb
-    handlers, on the event loop. :attr:`driver` is the orchestrator's,
-    synchronous, and used only inside a worker thread — because driving a
-    container means blocking on a build. Merging them would mean giving
-    one of the two the other's concurrency shape for nothing; the
-    discovery half goes away when ``capabilities`` is rebuilt.
-    """
-
-    #: ``container``, and never ``subprocess``: this backend serves
-    #: containers and is not one.
-    profile = "container"
-
-    def __init__(
-        self,
-        config: Config,
-        *,
-        docker: container.Docker | None = None,
-        driver: workbench.Docker | None = None,
-    ) -> None:
-        super().__init__(config)
-        self.docker = container.Docker(config.docker) if docker is None else docker
-        self.driver = workbench.Docker(config.docker) if driver is None else driver
-        self._images: dict[str, ImageProfile] = {}
 
     # ----------------------------------------------------------------
     # Discovery
@@ -1736,6 +840,15 @@ class ContainerBackend(SessionBackend):
                 result=None,
                 problems=("the invocation did not run",),
             )
+        declared = tuple(local.artifacts)
+        leftovers = await asyncio.to_thread(artifacts.undeclared, record.out, declared)
+        if leftovers:
+            # Not served and not deleted: they are diagnostic material
+            # (§9.3), and saying so in the log is the only way anybody
+            # finds out they exist.
+            logger.info(
+                "invocation %s: %d undeclared file(s) left in out", record.id, len(leftovers)
+            )
         return abi.InvocationOutcome(
             action=local.action,
             exit_code=local.exit_code,
@@ -1758,6 +871,405 @@ class ContainerBackend(SessionBackend):
             return
         with contextlib.suppress(Exception):
             await asyncio.to_thread(environment.close)
+
+    # ----------------------------------------------------------------
+    # Invocations
+    # ----------------------------------------------------------------
+
+    def attach(
+        self, session_id: str, connection: Any, *, boundary: tuple[str, int] | None = None
+    ) -> None:
+        """Add *connection* to a session's live stream, from *boundary* on.
+
+        *boundary* is ``(invocation id, seq)`` and is what
+        ``attach-session`` sets after it has replayed that invocation's
+        events out of the file: every event of that invocation up to and
+        including that ``seq`` has already been delivered as history, so
+        relaying it live as well would hand the client the same event
+        twice across the boundary it was told to trust. A connection
+        that replayed nothing passes ``None`` and sees everything.
+        """
+        self._audience.setdefault(session_id, {})[connection] = boundary
+
+    def detach(self, connection: Any) -> None:
+        """Drop a closed connection from every session's stream."""
+        for audience in self._audience.values():
+            audience.pop(connection, None)
+
+    def record(self, session_id: str, invocation_id: str) -> InvocationRecord | None:
+        return self._records.get((session_id, invocation_id))
+
+    async def invoke(
+        self,
+        session: Any,
+        connection: Any,
+        *,
+        action: str,
+        pins: ContextPins,
+        context_id: str,
+        mode: str | None = None,
+    ) -> InvocationRecord:
+        """Start one working invocation and answer immediately (E46).
+
+        The verb's answer is ``{invocation_id}`` and nothing else: the
+        completion travels as a typed ``invocation.verdict`` event
+        carrying the status and the artifact list, because a build is
+        minutes to hours long and a command frame that waited for it
+        would make every client's socket a build timer.
+
+        Everything §9.1 requires **before** an invocation happens here,
+        in one place so that the list can be read against the contract:
+        the per-invocation directory, an empty ``out``, an empty
+        ``tmp``, the session's ``work``, the ``events`` file, the
+        request document written atomically, and write protection of
+        ``context`` and of every non-writable tree — the last of which
+        the profile arranges when it materializes the environment, since
+        a mount cannot be added to a running container.
+        """
+        runtime = await self.ensure_runtime(session, pins, context_id=context_id)
+        if action not in runtime.image.actions:
+            # §7.1.1: "A backend MUST NOT invoke an action absent from
+            # the list." The program would answer `unsupported.action`
+            # legibly, which is precisely why there is no reason to make
+            # it: the refusal is already knowable.
+            raise SessionError(
+                "version.builder-unavailable",
+                f'The build environment serving this session does not implement "{action}". '
+                f"It announced {sorted(runtime.image.actions)}, and describe is the only "
+                "declaration of an action set there is.",
+                action=action,
+                actions=sorted(runtime.image.actions),
+                environment=runtime.image.environment,
+            )
+        if runtime.busy:
+            # One invocation at a time per `work` (§9.1). Pre-registry,
+            # for the reason `_context_work` gives about its own guard:
+            # no registered code means "this session is already doing
+            # work", and inventing one is a protocol decision rather
+            # than an implementation choice.
+            raise protocol.ProtocolError(
+                f'Session "{session.id}" is already running an invocation. One invocation '
+                "at a time per session: they share one work directory, and two of them in "
+                "it would build against each other's tree. Cancel it or wait for its "
+                "invocation.verdict event."
+            )
+
+        record = self._prepare_invocation(
+            session, runtime, action=action, context_id=context_id, mode=mode
+        )
+        runtime.busy = True
+        self.attach(session.id, connection)
+        task = asyncio.create_task(
+            self._drive(session, runtime, record), name=f"mcuhome-invocation-{record.id}"
+        )
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return record
+
+    async def _drive(self, session: Any, runtime: SessionRuntime, record: InvocationRecord) -> None:
+        """Run the invocation to its end, whatever its end turns out to be.
+
+        Owned by this backend and **not** by the connection that started
+        it, which is the mechanical half of "connection loss is not
+        abandonment": a client may drop its socket, and the build keeps
+        going, keeps writing its events file, and finishes into a record
+        a reattaching client can still read.
+        """
+        exit_code: int | None = None
+        try:
+            exit_code = await self._supervise(runtime, record)
+        except Exception:
+            logger.exception("invocation %s failed to run", record.id)
+        finally:
+            runtime.busy = False
+        outcome = await self._collect(record, exit_code=exit_code)
+        record.outcome = outcome
+        record.artifacts = outcome.artifacts
+        session.invocations[record.id] = _FINISHED
+        # The idle clock counts absent commands, and the command that
+        # started this invocation was sent before it ran: a fifteen-minute
+        # build would end into a session already minutes past its idle
+        # timeout, and the next verb — `get-artifact`, the one that
+        # collects what the build produced — would be refused
+        # `session.expired`. Observed exactly so, on a build that had
+        # just finished linking. Finishing work is activity.
+        session.touch()
+        if outcome.reason in _POISONING:
+            # §6.2 and §6.3: both are terminal for the session, and both
+            # say so in the same words — "the backend MUST refuse every
+            # further working action in that session". `session.poisoned`
+            # is that refusal, and the remedy for either is a new session
+            # with pristine trees and a `work` this server owns.
+            session.poison()
+        self._publish(
+            record,
+            protocol.event_frame("invocation.verdict", self._verdict(outcome, record)),
+        )
+
+    def _verdict(self, outcome: abi.InvocationOutcome, record: InvocationRecord) -> dict[str, Any]:
+        """The payload of the ``invocation.verdict`` frame (E46, E58).
+
+        It carries the status and the artifact list, which is what E46
+        asks for, plus the two things a client cannot get anywhere else:
+        the context id **this server** computed — attribution always
+        uses that one, never ``result.context`` — and, on a failure, the
+        session protocol's own error envelope, mapped from the
+        program's ``reason`` through
+        :data:`~mcuhome_buildserver.errors.REASON_CODES`.
+
+        ``status`` is the pessimistic reading. A document that says
+        ``success`` while one of §5.3's seven conditions does not hold
+        is reported as a failure, because "where exit code and document
+        contradict each other, the pessimistic reading wins".
+
+        **The name is this server's own, and no longer the program's**
+        (E58). E46 first called this frame ``invocation.finished``, which
+        is the name contract §8 seeds the event registry with — emitted
+        by the *program*, "once, immediately before the result document
+        is written", while this frame is emitted after that document has
+        been read and judged. Both reach the client, because a relayed
+        event is never dropped, and the only thing that told them apart
+        was the absence of ``seq``: a program that violated §8 by
+        omitting its counter would have had its own announcement read as
+        this server's verdict. The contract is frozen and keeps its
+        event name; the session layer renamed its frame while renaming
+        still cost nothing, so **the discrimination is the name**.
+        ``invocation.finished`` is always the program's, and
+        ``invocation.verdict`` is always this server's — and only the
+        verdict carries ``artifacts``, ``context`` and ``error``.
+        """
+        status = _wire_status(outcome)
+        payload: dict[str, Any] = {
+            "session_id": record.session_id,
+            "invocation_id": record.id,
+            "action": record.action,
+            "status": status,
+            "context": record.context_id,
+            "artifacts": [entry.to_dict() for entry in outcome.artifacts],
+        }
+        if outcome.violation is not None:
+            payload["contract_violation"] = outcome.violation
+        # A cancelled result carries `reason: null` and `error: null`
+        # exactly as a successful one does (§5.4): status cancelled
+        # already says everything there is to say, and an envelope beside
+        # it would be a second spelling of the status.
+        if status in (abi.STATUS_SUCCESS, abi.STATUS_CANCELLED):
+            payload["error"] = None
+            return payload
+        payload["error"] = self._envelope(outcome, record)
+        return payload
+
+    def _envelope(self, outcome: abi.InvocationOutcome, record: InvocationRecord) -> dict[str, Any]:
+        """One failed invocation as the session protocol's error envelope.
+
+        ``builder.crashed`` when there is no result document at all —
+        "an infrastructure failure, not a verdict on the context", and
+        the one code here that is retryable. Otherwise the reason
+        decides, through this server's own table.
+
+        The program's own ``error.retryable`` is carried in the details
+        under a name that says whose promise it is, and it is never the
+        envelope's ``retryable``: that value is the server's, "derived
+        from the server's own registry precisely so the promise cannot
+        be forged".
+        """
+        result = outcome.result
+        if result is None:
+            return errors.envelope(
+                "builder.crashed",
+                "The build container ended without writing a result document. That is an "
+                "infrastructure failure rather than a verdict on the context: an out "
+                "directory with no result at the path the request named is a failed "
+                "invocation by definition, and the same invocation may succeed on a retry.",
+                session_id=record.session_id,
+                invocation_id=record.id,
+                exit_code=outcome.exit_code,
+                problems=list(outcome.problems),
+            )
+        code = errors.from_reason(result.reason)
+        return errors.envelope(
+            code,
+            f"The {record.action} in this session's build container did not succeed. "
+            "The container's own classification and its message are in the details; the "
+            "raw log stream of this invocation carries what it printed.",
+            session_id=record.session_id,
+            invocation_id=record.id,
+            # Verbatim, whatever it is: "unknown values are handled as
+            # their status class and passed through verbatim".
+            reason=result.reason,
+            status=result.declared_status,
+            exit_code=outcome.exit_code,
+            # The one untrusted-text field in the document, stripped of
+            # control characters and bounded by `ResultDocument`.
+            container_message=result.error_message,
+            container_details=result.error_details,
+            # Under a name that says whose promise it is. §5.4.1 forbids
+            # relaying it *as* the envelope's `retryable` and says
+            # nothing against carrying it, and carrying it is the only
+            # way a client sees the program's own opinion of its failure
+            # at all.
+            container_retryable=result.error_retryable,
+            problems=list(outcome.problems),
+        )
+
+    # ----------------------------------------------------------------
+    # The streams
+    # ----------------------------------------------------------------
+
+    def _log(self, record: InvocationRecord, line: str) -> None:
+        """One line of the raw log, with the counter that makes drops visible."""
+        record.log_seq += 1
+        self._publish(
+            record,
+            protocol.log_frame(
+                {
+                    "session_id": record.session_id,
+                    "invocation_id": record.id,
+                    "seq": record.log_seq,
+                    "line": line,
+                }
+            ),
+            drop_when_full=True,
+        )
+
+    def _relay(self, record: InvocationRecord, reader: events.EventReader) -> None:
+        """Relay every new event of the program, verbatim (§8).
+
+        "Unknown names are relayed opaquely — a backend passes an event
+        whose name it does not know through to its client verbatim, with
+        its fields intact, and never drops it, never rewrites it and
+        never treats it as an error." So the payload **is** the
+        program's object, with this server's addressing merged in: a
+        program has no invocation id — the request document deliberately
+        carries none — so ``invocation_id`` cannot collide with anything
+        a program could mean by it.
+        """
+        for line in reader.read():
+            name = events.event_name(line)
+            if name is None:  # pragma: no cover - the reader filtered these
+                continue
+            payload = dict(line)
+            payload["session_id"] = record.session_id
+            payload["invocation_id"] = record.id
+            self._publish(record, protocol.event_frame(name, payload), drop_when_full=True)
+
+    def _publish(
+        self, record: InvocationRecord, frame: dict[str, Any], *, drop_when_full: bool = False
+    ) -> None:
+        """Put one frame on every connection watching this session.
+
+        *drop_when_full* is the difference between the two streams and
+        it is E46's shape read against the transport's. Program events
+        and log lines are offered — dropping the oldest rather than
+        applying backpressure through the log reader and from there into
+        the compiler — and both survive it: the log carries a counter
+        that makes a gap visible, and the events file on disk **is** the
+        replay buffer, so ``attach-session`` can fetch the gap. The
+        ``invocation.verdict`` frame is sent instead, because it is the
+        one frame a client is waiting on and there is no second way to
+        learn it: it is this server's own judgement and is in no events
+        file, so a drop would lose it for good.
+
+        A connection that joined through ``attach-session`` carries a
+        replay boundary, and a frame this server already delivered to it
+        as history is not delivered again as news.
+        """
+        for connection, boundary in tuple(self._audience.get(record.session_id, {}).items()):
+            if _already_replayed(frame, record, boundary):
+                continue
+            if drop_when_full:
+                connection.offer(frame)
+            else:
+                # Tracked rather than fired and forgotten: an untracked
+                # task that is still pending when the loop closes is a
+                # warning nobody can act on, and this one is the frame a
+                # client is waiting for.
+                task = asyncio.ensure_future(connection.send(frame))
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
+
+    # ----------------------------------------------------------------
+    # Teardown
+    # ----------------------------------------------------------------
+
+    async def release(self, session_id: str, *, reaped: str | None = None) -> None:
+        """Reap the session's build environment, if it had one. Never raises.
+
+        *reaped* is the half of the lease that ran out, and it is set by
+        the sweep alone: a session this server took away owes its
+        audience an explanation, while ``close-session`` is the client's
+        own act and process shutdown reaches nobody anyway.
+
+        Called from ``close-session``, from the reaper's sweep and from
+        process shutdown — the same three exits the per-session
+        directory has, because the environment and the directory are one
+        thing: in the ``container`` profile the directory *is* the
+        container's mounts, and in the ``subprocess`` profile it is the
+        working area of a child of this process. Either way, something
+        still running against a deleted tree is the one state neither
+        half can recover from.
+        """
+        runtime = self._runtimes.pop(session_id, None)
+        if reaped is not None:
+            self._announce_reaping(session_id, reaped)
+        self._audience.pop(session_id, None)
+        for key in [key for key in self._records if key[0] == session_id]:
+            self._records.pop(key, None)
+        if runtime is None:
+            return
+        await self._release_runtime(runtime)
+
+    def _announce_reaping(self, session_id: str, reaped: str) -> None:
+        """Tell whoever is still listening that this session was taken away.
+
+        A client waits for one frame and one frame only — the
+        ``invocation.verdict`` of the invocation it started — and this
+        server used to drop the audience without sending anything, so a
+        session reaped under a running build left the client waiting on a
+        verdict that could never arrive. The socket stays open, so not
+        even a connection loss ends the wait: measured at 56 minutes
+        before it was killed by hand.
+
+        So the verdict is sent, as a failure carrying the session layer's
+        own ``session.expired`` — the code whose summary has always been
+        "the session's lease or hard TTL ran out and it was reaped".
+        Only for invocations this server never judged: one that already
+        has an outcome has already had its verdict.
+        """
+        for (owner, _), record in list(self._records.items()):
+            if owner != session_id or record.outcome is not None:
+                continue
+            self._publish(
+                record,
+                protocol.event_frame(
+                    "invocation.verdict",
+                    {
+                        "session_id": record.session_id,
+                        "invocation_id": record.id,
+                        "action": record.action,
+                        "status": abi.STATUS_FAILURE,
+                        "context": record.context_id,
+                        "artifacts": [],
+                        "error": errors.envelope(
+                            "session.expired",
+                            f"This session was reaped ({reaped}) while its invocation was "
+                            f"still running, so the build was stopped and its directory "
+                            f"deleted. Nothing was delivered.",
+                            session_id=session_id,
+                            invocation_id=record.id,
+                        ),
+                    },
+                ),
+            )
+
+    async def release_all(self) -> None:
+        for session_id in list(self._runtimes):
+            await self.release(session_id)
+
+
+# --------------------------------------------------------------------------
+# The container backend
+# --------------------------------------------------------------------------
 
 
 def _materialization_refusal(refusal: Exception) -> SessionError:

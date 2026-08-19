@@ -39,40 +39,14 @@ from dataclasses import dataclass, field
 from aiohttp import web
 
 from mcuhome_buildserver import sessions, ws
-from mcuhome_buildserver.backend import ContainerBackend, SessionBackend
+from mcuhome_buildserver.backend import SessionBackend
 from mcuhome_buildserver.config import Config
 from mcuhome_buildserver.contextstore import prepare_context_root
 from mcuhome_buildserver.security import STATE_KEY, AuthThrottle, auth_middleware
-from mcuhome_buildserver.subprocessbackend import SubprocessBackend
 
-__all__ = ["BACKENDS", "REAPER_KEY", "ServerState", "create_app", "make_backend"]
+__all__ = ["REAPER_KEY", "ServerState", "create_app"]
 
 logger = logging.getLogger(__name__)
-
-#: The two profiles of build-container contract §1.2, by the name the
-#: config carries and ``open-session`` answers. The table lives here
-#: rather than in :mod:`~mcuhome_buildserver.backend` because the two
-#: backends must not import each other — the subprocess backend stands
-#: on the container backend's base class, and a factory in that module
-#: would close the circle.
-BACKENDS: dict[str, type[SessionBackend]] = {
-    ContainerBackend.profile: ContainerBackend,
-    SubprocessBackend.profile: SubprocessBackend,
-}
-
-
-def make_backend(config: Config) -> SessionBackend:
-    """The backend an operator asked for.
-
-    The profile is validated in :func:`~mcuhome_buildserver.config.load_config`,
-    so an unknown one has already been refused with the list of the
-    known ones by the time this runs; the lookup here is deliberately
-    not lenient about it, because a server that fell back to a profile
-    nobody asked for would be making the promises of one profile while
-    behaving like the other.
-    """
-    return BACKENDS[config.backend_profile](config)
-
 
 #: The sweep task, so that shutdown can cancel the one it started.
 REAPER_KEY: web.AppKey[asyncio.Task[None]] = web.AppKey("reaper")
@@ -93,9 +67,8 @@ class ServerState:
     #: request the middleware sees.
     auth_throttle: AuthThrottle = field(default_factory=AuthThrottle)
     sessions: sessions.SessionManager = field(init=False)
-    #: The backend of the profile this server was configured for:
-    #: build-environment discovery, the session's runtime, invocations
-    #: and their streams. One per process, because the ``describe``
+    #: This server's half of a build: build-environment discovery, the
+    #: session's runtime, invocations and their streams. One per process, because the ``describe``
     #: cache and the runtime registry are properties of the host rather
     #: than of a session.
     backend: SessionBackend = field(init=False)
@@ -114,7 +87,7 @@ class ServerState:
                 max_seats=self.config.max_seats,
             ),
         )
-        self.backend = make_backend(self.config)
+        self.backend = SessionBackend(self.config)
 
 
 async def health(request: web.Request) -> web.Response:
@@ -203,12 +176,11 @@ async def _stop_reaper(app: web.Application) -> None:
     state = app[STATE_KEY]
     state.sessions.shutdown()
     # And the build environments those sessions were running in. A
-    # process that is killed outright still leaves the container-profile
-    # ones, which is what the ``org.mcuhome.build-server.session`` label
-    # on each is for — there is deliberately no startup sweep, for the
-    # reason ``SessionManager.shutdown`` gives about the context root.
-    # The subprocess profile has no such leftovers to find: its build
-    # environments are children of this process.
+    # process that is killed outright still leaves the containers
+    # behind, which is what the ``org.mcuhome.build-server.session``
+    # label on each is for — there is deliberately no startup sweep, for
+    # the reason ``SessionManager.shutdown`` gives about the context
+    # root.
     await state.backend.release_all()
 
 

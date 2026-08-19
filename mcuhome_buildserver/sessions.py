@@ -295,7 +295,7 @@ SEAT_ID_BYTES = 12
 #: ``attach-session`` worth having, and it stays true: a session is taken
 #: away only when a *third party* wants the slot, and only after this
 #: much quiet. What it stops being is unconditional. With
-#: ``--max-sessions 1`` — the subprocess profile's setting — a client
+#: ``--max-sessions 1`` a client
 #: that died without closing its session used to hold the whole server
 #: for the full idle timeout, measured at ten minutes of a build server
 #: doing nothing while a client polled its seat.
@@ -1379,17 +1379,15 @@ async def open_session(state: Any, connection: Any, command: Command) -> dict[st
     ``send-context`` precedes ``lock-context`` and therefore precedes
     every working command.
 
-    ``negotiated.backend_profile`` is ``container`` or ``subprocess``
-    (build-container contract §1.2), the field ADR 0019's amendment puts
-    in this response. It is **this server's configured profile**
-    (``--backend-profile``) and is the one thing a client learns about
-    which promises are being made to it: the ``subprocess`` row of §1.2
-    makes none of the isolation promises the ``container`` row makes —
-    no network isolation, no per-session resource limits, no container
-    trust boundary — and a client that cannot see which profile served
-    it would have to infer that from behaviour. Both profiles are
-    orchestrators and neither is itself the build environment; what
-    differs is how much of that environment the kernel keeps apart.
+    ``negotiated.backend_profile`` is the field ADR 0019's amendment puts
+    in this response: how this server executes the builds it accepts, and
+    the one thing a client learns about which promises are being made to
+    it. Today it is always ``container`` — one container per session, no
+    network, per-session limits, the session as the trust boundary — and
+    it stays on the wire because the answer is not going to stay the only
+    one: a machine that builds without a container runtime makes none of
+    those promises, and a client that could not see which it got would
+    have to infer it from behaviour.
 
     Patch *policy* is enforced against the files actually present, so it
     runs at ``send-context``/``extend-context`` time, not here.

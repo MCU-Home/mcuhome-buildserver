@@ -873,11 +873,9 @@ def test_the_idle_half_is_the_operators_and_reaches_the_manager(tmp_path) -> Non
 def test_admission_is_the_operators_and_reaches_the_manager(tmp_path) -> None:
     """The cap and the waiting room, wired rather than merely accepted.
 
-    The cap was a constant with no option in front of it, which made the
-    ``container`` profile's four concurrent sessions a number an operator
-    could not lower on a machine that cannot feed four builds, and made
-    the ``subprocess`` profile's "one build environment, therefore one
-    session" unsayable. The two seat times are the same kind of setting
+    The cap was a constant with no option in front of it, which made four
+    concurrent sessions a number an operator could not lower on a machine
+    that cannot feed four builds. The two seat times are the same kind of setting
     as the idle timeout: a private server sets the base high, a public
     one low.
     """
@@ -907,52 +905,6 @@ def test_admission_is_the_operators_and_reaches_the_manager(tmp_path) -> None:
     assert state.sessions.seats.retry_seconds == 30
     assert state.sessions.seats.retry_max_seconds == 300
     assert state.sessions.seats.max_seats == 8
-
-
-def test_the_subprocess_profile_serves_one_session_without_being_told(tmp_path) -> None:
-    """Naming the profile is naming the number.
-
-    That profile *is* the host it builds on, so concurrent sessions
-    compete for one machine's memory with nothing between them, and the
-    serialization is also what lets its build area have one fixed path.
-    An operator should not have to pass a second flag whose only legal
-    value is 1 for the server to start at all.
-    """
-    parsed = config_module.load_config(
-        ["--backend-profile", "subprocess", "--context-root", str(tmp_path)], env={}
-    )
-    assert parsed.max_sessions == 1
-
-    # Naming a different one is refused rather than clamped: a server
-    # running at 1 while its operator configured 4 would be answering a
-    # question nobody could see it had answered.
-    with pytest.raises(SystemExit) as excinfo:
-        config_module.load_config(
-            [
-                "--backend-profile",
-                "subprocess",
-                "--max-sessions",
-                "4",
-                "--context-root",
-                str(tmp_path),
-            ],
-            env={},
-        )
-    assert "one session at a time" in str(excinfo.value)
-
-    # And 1 stated explicitly is simply agreement.
-    agreed = config_module.load_config(
-        [
-            "--backend-profile",
-            "subprocess",
-            "--max-sessions",
-            "1",
-            "--context-root",
-            str(tmp_path),
-        ],
-        env={},
-    )
-    assert agreed.max_sessions == 1
 
 
 async def test_the_server_sweeps_without_anybody_asking(

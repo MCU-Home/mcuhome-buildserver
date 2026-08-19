@@ -1717,11 +1717,11 @@ async def test_attach_session_replays_before_it_joins_the_live_stream(
     because a race that reproduces sometimes is a test that passes
     sometimes.
     """
-    from mcuhome_buildserver.backend import ContainerBackend
+    from mcuhome_buildserver.backend import SessionBackend
     from mcuhome_buildserver.ws import Connection
 
     timeline: list[tuple[str, object]] = []
-    real_attach = ContainerBackend.attach
+    real_attach = SessionBackend.attach
     real_send = Connection.send
 
     def attach(self, session_id, connection, *, boundary=None):
@@ -1733,7 +1733,7 @@ async def test_attach_session_replays_before_it_joins_the_live_stream(
             timeline.append(("event", frame["payload"].get("seq")))
         return await real_send(self, frame)
 
-    monkeypatch.setattr(ContainerBackend, "attach", attach)
+    monkeypatch.setattr(SessionBackend, "attach", attach)
     monkeypatch.setattr(Connection, "send", send)
 
     async with client.ws_connect("/ws", headers=auth()) as ws:
@@ -1770,7 +1770,7 @@ def test_an_event_already_replayed_is_not_relayed_to_that_connection_again(
     connection, which never saw it.
     """
     from mcuhome_buildserver import protocol
-    from mcuhome_buildserver.backend import ContainerBackend, InvocationRecord
+    from mcuhome_buildserver.backend import InvocationRecord, SessionBackend
 
     class Fake:
         def __init__(self) -> None:
@@ -1779,7 +1779,7 @@ def test_an_event_already_replayed_is_not_relayed_to_that_connection_again(
         def offer(self, frame):
             self.frames.append(frame)
 
-    backend = ContainerBackend(config, docker=object())
+    backend = SessionBackend(config, docker=object())
     record = InvocationRecord(
         id="inv-1", session_id="s-1", action="build", directory=tmp_path, context_id="x"
     )
@@ -1842,8 +1842,8 @@ async def test_cancel_creates_the_sentinel_file_the_request_named(
 
     A cooperative sentinel rather than a signal, because killing a
     ``docker exec`` client does not kill the process inside the
-    container and because the same mechanism works unchanged in the
-    subprocess profile.
+    container — and because the same mechanism works unchanged wherever
+    a program is started without one.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
@@ -1940,10 +1940,13 @@ async def test_a_client_that_ignores_sigterm_is_killed(
     ``close-session`` — one session is one container, so there is always
     that hammer behind this one.
     """
-    from mcuhome_buildserver import backend
+    from mcuhome.workbench import orchestrator
+
     from mcuhome_buildserver.app import ServerState, create_app
 
-    monkeypatch.setattr(backend, "_KILL_AFTER_SECONDS", 0.0)
+    # The ladder is the orchestrator's since the server stopped driving
+    # invocations itself, so its last rung is the one to shorten.
+    monkeypatch.setattr(orchestrator, "_KILL_AFTER_SECONDS", 0.0)
     processes: list[FakeProcess] = []
 
     def program(action, request, on_line):
@@ -2582,74 +2585,3 @@ async def test_an_unreadable_static_description_falls_back_to_describe(
         if call[1:2] == ["run"] and "--rm" in call and call[-2:-1] != ["cat"]
     ]
     assert len(describe_runs) == 1, "the fallback probe ran"
-
-
-async def test_the_sdk_keeps_its_executable_bit_and_nothing_else(tmp_path) -> None:
-    """§6.1's `generate.program` is *executed*; 0600 across the board kills it.
-
-    The context extractor strips every mode bit an archive could smuggle
-    in, and that is right for contexts — nothing in model/, keys/ or
-    patches/ is run. The SDK is the one tree with a program in it, so
-    its unpack keeps exactly the owner's execute bit of regular files
-    (0700) and still strips setuid/setgid/sticky/group/world. Found as
-    a blocker by the B2 spec round: an SDK unpacked by this server
-    answered exit 127 where code generation should be.
-    """
-    import io
-    import tarfile
-
-    import zstandard
-
-    from mcuhome_buildserver import sdkstore
-
-    raw = io.BytesIO()
-    with tarfile.open(fileobj=raw, mode="w") as tar:
-        program = tarfile.TarInfo("bin/generate")
-        payload = b"#!/usr/bin/env python3\n"
-        program.size = len(payload)
-        program.mode = 0o4775  # setuid + group/world bits: all must go
-        tar.addfile(program, io.BytesIO(payload))
-        quiet = tarfile.TarInfo("mcuhome-sdk.json")
-        body = b'{"sdk": 1, "generate": {"program": "bin/generate", "runtime": "python3"}}'
-        quiet.size = len(body)
-        quiet.mode = 0o664
-        tar.addfile(quiet, io.BytesIO(body))
-    archive = zstandard.ZstdCompressor().compress(raw.getvalue())
-
-    import hashlib
-
-    source = tmp_path / "sources"
-    source.mkdir()
-    (source / "mcuhome-sdk-9.9.9.tar.zst").write_bytes(archive)
-    into = tmp_path / "sdk"
-    sdkstore.acquire_sdk(
-        version="9.9.9",
-        sha256=hashlib.sha256(archive).hexdigest(),
-        sources=(source,),
-        into=into,
-        caps=sdkstore.SDK_CAPS,
-        max_bytes=sdkstore.SDK_MAX_BYTES,
-    )
-    assert (into / "bin" / "generate").stat().st_mode & 0o7777 == 0o700
-    assert (into / "mcuhome-sdk.json").stat().st_mode & 0o7777 == 0o600
-
-
-async def test_the_sdk_is_not_held_to_the_clients_budget_shape(tmp_path) -> None:
-    """The operator's material gets its own bounds, not the session caps.
-
-    E44's numbers were argued for contexts (kilobytes to a few
-    megabytes); an SDK is a source tree. Holding the operator's package
-    to the client's budget shape would make the two knobs fight — an
-    operator tightening context caps against abusive clients would
-    break their own SDK. Pinned by the constant, not by a giant archive:
-    the caps handed to the unpack are SDK_CAPS, and SDK_CAPS is roomier
-    than any default context cap.
-    """
-    from mcuhome_buildserver import config as config_module
-    from mcuhome_buildserver import sdkstore
-    from mcuhome_buildserver.ingress import IngressCaps
-
-    session_caps = IngressCaps.from_config(config_module.Config(token="t"))
-    assert sdkstore.SDK_CAPS.compressed_bytes > session_caps.compressed_bytes
-    assert sdkstore.SDK_CAPS.decompressed_bytes > session_caps.decompressed_bytes
-    assert sdkstore.SDK_CAPS.entries > session_caps.entries

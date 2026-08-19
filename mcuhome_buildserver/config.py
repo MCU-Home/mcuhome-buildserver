@@ -62,8 +62,6 @@ from mcuhome_buildserver.sessions import (
 )
 
 __all__ = [
-    "BACKEND_PROFILES",
-    "DEFAULT_BACKEND_PROFILE",
     "DEFAULT_BUILD_DEADLINE_SECONDS",
     "DEFAULT_BUILD_JOBS",
     "DEFAULT_CANCEL_GRACE_SECONDS",
@@ -126,18 +124,6 @@ DEFAULT_SESSION_QUOTA_BYTES = 2 * 1024 * 1024 * 1024
 #: together with safe-load, no duplicate keys and no anchors; the number
 #: is this server's default and an operator's to change.
 DEFAULT_MAX_CONTEXT_YAML_BYTES = 64 * 1024
-
-#: The two backend profiles of build-container contract §1.2, and the
-#: default. ``container`` because it is the profile with the isolation
-#: guarantees and because ADR 0019's amendment names standalone,
-#: self-hosted deployment the **primary** target, with the Home
-#: Assistant App — the ``subprocess`` case — "an additional target, not
-#: the shape the design is drawn around". A profile with no network
-#: isolation, no per-session limits and no trust boundary is a
-#: deliberate choice an operator makes, never one they inherit from a
-#: default.
-BACKEND_PROFILES = ("container", "subprocess")
-DEFAULT_BACKEND_PROFILE = "container"
 
 #: The container runtime this server drives. A name rather than a path,
 #: looked up on the server's own ``PATH``: an operator who wants
@@ -306,22 +292,6 @@ class Config:
     #: document that nothing behind it enforces would be a promise to
     #: the program that no one keeps.
     docker: str = DEFAULT_DOCKER
-    #: Which of contract §1.2's two profiles this server serves. It is
-    #: the one setting a **client** can see — ``open-session`` answers it
-    #: as ``negotiated.backend_profile`` — because it decides which
-    #: promises are being made, and a client must not have to guess that
-    #: from behaviour.
-    backend_profile: str = DEFAULT_BACKEND_PROFILE
-    #: ``subprocess`` profile only: the executable implementing the
-    #: invocation ABI (§5.1), or ``None`` for the installed MCUHome
-    #: compiler through this server's own interpreter
-    #: (:data:`~mcuhome_buildserver.program.DEFAULT_PROGRAM`). §2.2:
-    #: "the backend invokes its own program by a path it configures …
-    #: only the path is the backend's business." It is a path and not a
-    #: command line because a third party may ship a compiled binary,
-    #: and an interpreter this server put in front of one would make
-    #: MCUHome's implementation language a requirement.
-    program: Path | None = None
     build_jobs: int = DEFAULT_BUILD_JOBS
     build_deadline_seconds: int = DEFAULT_BUILD_DEADLINE_SECONDS
     cancel_grace_seconds: int = DEFAULT_CANCEL_GRACE_SECONDS
@@ -502,11 +472,10 @@ _SESSION_OPTIONS: tuple[tuple[str, str, int, str], ...] = (
 #: Admission: how many turns there are, and how a client that finds none
 #: free is made to wait. Same table shape and same reason again.
 #:
-#: The cap was a constant with no option in front of it, which made the
-#: ``container`` profile's four concurrent sessions — four containers at
-#: ``--container-memory`` each — a number an operator could not lower on
-#: a machine that cannot feed them, and made the ``subprocess`` profile's
-#: "one build environment, therefore one session" unsayable. Sizing it
+#: The cap was a constant with no option in front of it, which made four
+#: concurrent sessions — four containers at ``--container-memory`` each —
+#: a number an operator could not lower on a machine that cannot feed
+#: them. Sizing it
 #: from real load is a later version's job; a static number is what an
 #: operator can reason about, and a dynamic one that guessed wrong would
 #: be a build killed for arithmetic.
@@ -522,7 +491,7 @@ _ADMISSION_OPTIONS: tuple[tuple[str, str, int, str], ...] = (
         "--max-sessions",
         "max_sessions",
         DEFAULT_MAX_OPEN_SESSIONS,
-        "how many sessions may be open at once (the subprocess profile serves one)",
+        "how many sessions may be open at once",
     ),
     (
         "--seat-retry-seconds",
@@ -706,29 +675,6 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "in-flight command tasks one /ws connection may run at once "
             f"(default {DEFAULT_MAX_INFLIGHT_COMMANDS})"
-        ),
-    )
-    parser.add_argument(
-        "--backend-profile",
-        metavar="PROFILE",
-        choices=list(BACKEND_PROFILES),
-        help=(
-            "which build-container-contract §1.2 profile this server serves: "
-            "container (one container per session; no network, per-session limits, "
-            "the session is the trust boundary) or subprocess (the build environment "
-            "is this filesystem and the program runs as a child process; NO network "
-            "isolation, NO per-session limits, NO trust boundary). "
-            f"Default {DEFAULT_BACKEND_PROFILE}"
-        ),
-    )
-    parser.add_argument(
-        "--program",
-        type=Path,
-        metavar="PATH",
-        help=(
-            "subprocess profile: the executable implementing the invocation ABI, called "
-            "as <path> <action> <request document>. Default: the installed mcuhome "
-            "compiler through this server's own interpreter"
         ),
     )
     parser.add_argument(
@@ -944,41 +890,6 @@ def load_config(
     )
     container_cpus = _text_option(args.container_cpus, env, "CONTAINER_CPUS", None)
 
-    backend_profile = (
-        args.backend_profile or env.get(ENV_PREFIX + "BACKEND_PROFILE") or DEFAULT_BACKEND_PROFILE
-    ).strip()
-    if backend_profile not in BACKEND_PROFILES:
-        # Checked here rather than by `choices=` alone, because the
-        # environment form bypasses argparse entirely and a profile
-        # nobody validated would fall through to a backend that does not
-        # exist — after the socket is bound.
-        raise SystemExit(
-            f"{backend_profile!r} is not a backend profile this server has "
-            f"({', '.join(BACKEND_PROFILES)})."
-        )
-
-    # The `subprocess` profile serves one session at a time, and that is
-    # not advice: this profile *is* the host, so concurrent sessions
-    # compete for one machine's memory with nothing between them
-    # (contract §1.2: "no per-session resource limits"), and the same
-    # serialization is what lets its build area have one fixed path.
-    #
-    # An operator who names the profile has said all that is needed —
-    # requiring a second flag to make the server start at all would be a
-    # ceremony for a number with one legal value. Naming a different one
-    # is refused rather than clamped, because a server that ran at 1
-    # while its operator configured 4 would be answering a question
-    # nobody could see it had answered.
-    if backend_profile == "subprocess":
-        stated = limits.get("max_sessions")
-        if stated is not None and stated > 1:
-            raise SystemExit(
-                f"--max-sessions {stated} does not go with --backend-profile subprocess: "
-                "that profile is the host it builds on, so it serves one session at a "
-                "time. Leave --max-sessions out and it is 1."
-            )
-        limits["max_sessions"] = 1
-
     config = Config(
         host=args.host or env.get(ENV_PREFIX + "HOST") or DEFAULT_HOST,
         port=args.port or _env_int(env, "PORT") or DEFAULT_PORT,
@@ -990,8 +901,6 @@ def load_config(
         auto_pull=auto_pull,
         context_root=context_root,
         docker=args.docker or env.get(ENV_PREFIX + "DOCKER") or DEFAULT_DOCKER,
-        backend_profile=backend_profile,
-        program=path_option(args.program, "PROGRAM"),
         # Order-preserving de-duplication: the search order is fixed
         # (ADR 0019's amendment) and a directory listed twice must not
         # move the one behind it.

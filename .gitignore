@@ -1,39 +1,184 @@
-# AI coding-agent files — these live in the workspace, never in a repository
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# this repository
+.deps/
+.cache/
+
+# ai coding agents, which live in the workspace and never in a repository
 AGENTS.md
 CLAUDE.md
+CLAUDE.local.md
 GEMINI.md
 .claude/
 .cursor/
 .aider*
 .github/copilot-instructions.md
 
-# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
-# SPDX-License-Identifier: Apache-2.0
-
-# Python
+# python
 __pycache__/
-*.py[cod]
-*.egg-info/
+*.py[codz]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
 dist/
-.venv/
-
-# Tool caches
-.ruff_cache/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py.cover
+*.lcov
+.hypothesis/
 .pytest_cache/
-.cache/
-
-# Environment / secrets
+cover/
+*.mo
+*.pot
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+instance/
+.webassets-cache
+.scrapy
+docs/_build/
+.pybuilder/
+target/
+.ipynb_checkpoints
+profile_default/
+ipython_config.py
+.pdm-python
+.pdm-build/
+.pixi/*
+!.pixi/config.toml
+__pypackages__/
+celerybeat-schedule*
+celerybeat.pid
+*.rdb
+*.aof
+*.pid
+mnesia/
+rabbitmq/
+rabbitmq-data/
+activemq-data/
+*.sage.py
 .env
-.env.*
+.envrc
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.spyderproject
+.spyproject
+.ropeproject
+/site
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+cython_debug/
+.abstra/
+tempCodeRunnerFile.py
+.ruff_cache/
+.pypirc
+marimo/_static/
+marimo/_lsp/
+__marimo__/
+.streamlit/secrets.toml
 
-# Editors / OS
+# editors
 .vscode/
 .idea/
 *.swp
+
+# operating system specific files
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
 .DS_Store
-
-# Claude Code local files
-CLAUDE.local.md
-
-# CI-only sibling checkout (see .github/workflows/ci.yml)
-.deps/
+.localized
+__MACOSX/
+.AppleDouble
+.LSOverride
+Icon[
+]
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.com.apple.timemachine.supported
+.PKInstallSandboxManager
+.PKInstallSandboxManager-SystemSoftware
+.hotfiles.btree
+.vol
+.file
+.disk_label*
+lost+found
+.HFS+ Private Directory Data[
+]
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+Desktop DB
+Desktop DF
+TheFindByContentFolder
+TheVolumeSettingsFolder
+.FBCIndex
+.FBCSemaphoreFile
+.FBCLockFolder
+.quota.group
+.quota.user
+.quota.ops.group
+.quota.ops.user
+Backups.backupdb
+.MobileBackups
+.MobileBackups.trash
+MobileBackups.trash
+tmbootpicker.efi
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+nohup.out

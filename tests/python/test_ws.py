@@ -21,7 +21,7 @@ from mcuhome.buildserver import ws as ws_module
 from mcuhome.buildserver.app import ServerState, create_app
 from mcuhome.buildserver.protocol import Command
 from mcuhome.buildserver.ws import OUTBOX_LIMIT, Connection
-from tests.conftest import auth, call
+from tests.python.conftest import auth, call
 
 
 def _log(seq: int) -> dict:

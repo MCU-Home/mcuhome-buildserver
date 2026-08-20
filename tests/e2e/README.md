@@ -62,7 +62,7 @@ workbench with its `remote` extra, the model and the compiler, and the
 
 ```sh
 python .deps/mcuhome-sdk/scripts/build_sdk_archive.py --output-dir dist/sdk
-python e2e/run.py --sdk-dir dist/sdk
+python tests/e2e/run.py --sdk-dir dist/sdk
 ```
 
 `--keep` leaves the working tree — server log, project, build directory —

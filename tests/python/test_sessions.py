@@ -10,7 +10,7 @@ import pytest
 
 from mcuhome.buildserver import errors, protocol, sessions
 from mcuhome.buildserver.errors import LAYERS, REGISTRY, SessionError, envelope
-from tests.conftest import auth, call
+from tests.python.conftest import auth, call
 
 # --------------------------------------------------------------------------
 # The error envelope and its registry

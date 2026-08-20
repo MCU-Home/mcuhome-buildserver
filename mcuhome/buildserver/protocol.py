@@ -28,7 +28,7 @@ the thin half, which is exactly the coupling ADR 0003 spent its length
 avoiding.
 
 What must not drift is the *envelope*, and that is guarded rather than
-assumed: ``tests/test_protocol.py`` compares this module's constants
+assumed: ``tests/python/test_protocol.py`` compares this module's constants
 against ``mcuhome.ui.protocol`` whenever both packages are
 importable. A rename on one side fails a test on the other instead of
 producing two servers that almost agree.

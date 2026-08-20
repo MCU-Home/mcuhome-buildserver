@@ -12,7 +12,7 @@
 #          — correctly, a build server is an orchestrator — and that is
 #          exactly why three lease-versus-time defects and one address
 #          parsed as a URL reached a real build before anything noticed.
-#          e2e/run.py is the harness and its head comment is the reason.
+#          tests/e2e/run.py is the harness and its head comment is the reason.
 #
 # The test gate checks out two siblings, `mcu-home/mcuhome-workbench` and
 # `mcu-home/mcuhome-sdk`: pyproject declares mcuhome-workbench, which
@@ -112,7 +112,7 @@ jobs:
   # revisited.
   #
   # The device is deliberately the cheapest one that still walks the
-  # whole chain (e2e/project/devices/e2e-node/main.yaml says why): no
+  # whole chain (tests/e2e/project/devices/e2e-node/main.yaml says why): no
   # transport, no Matter, therefore no OpenThread and no CHIP. Four
   # minutes rather than fifteen — and a remote build is ALWAYS a cold
   # one, because this server mounts a shared compiler cache read-only
@@ -212,4 +212,4 @@ jobs:
           docker pull --quiet "$reference"
 
       - name: One real remote build
-        run: python e2e/run.py --sdk-dir dist/sdk
+        run: python tests/e2e/run.py --sdk-dir dist/sdk

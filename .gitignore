@@ -1,3 +1,12 @@
+# AI coding-agent files — these live in the workspace, never in a repository
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.claude/
+.cursor/
+.aider*
+.github/copilot-instructions.md
+
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
 
@@ -24,7 +33,6 @@ dist/
 .DS_Store
 
 # Claude Code local files
-.claude/settings.local.json
 CLAUDE.local.md
 
 # CI-only sibling checkout (see .github/workflows/ci.yml)

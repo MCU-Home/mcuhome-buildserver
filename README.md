@@ -913,7 +913,7 @@ it will serve, what it makes of the result the orchestrator hands back,
 and what reaches the client while it happens.
 
 The frame envelope is kept from drifting apart from the dashboard's by
-`tests/test_protocol.py`, which compares this package's constants
+`tests/python/test_protocol.py`, which compares this package's constants
 against `mcuhome.ui.protocol` whenever both are importable —
 install the sibling checkout's backend (`pip install -e
 ../mcuhome-ui/backend`) to run that check; it skips otherwise.

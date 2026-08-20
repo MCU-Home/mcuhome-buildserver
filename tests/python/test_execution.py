@@ -25,7 +25,7 @@ from dataclasses import replace
 import pytest
 
 from mcuhome.buildserver.app import ServerState, create_app
-from tests.conftest import (
+from tests.python.conftest import (
     IMAGE_DIGEST,
     IMAGE_REFERENCE_FORMAT3,
     auth,
@@ -34,7 +34,7 @@ from tests.conftest import (
     make_archive,
     write_sdk_package,
 )
-from tests.test_backend import open_session, send_archive
+from tests.python.test_backend import open_session, send_archive
 
 #: Strings planted in a context, each somewhere a naive implementation
 #: might pass a value through to a command line.

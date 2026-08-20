@@ -22,7 +22,7 @@ import zstandard
 from mcuhome.buildserver import contextstore, protocol, sessions
 from mcuhome.buildserver.app import ServerState, create_app
 from mcuhome.buildserver.config import Config
-from tests.conftest import (
+from tests.python.conftest import (
     BUILD_CONTEXT_BYTES,
     CONTEXT_YAML,
     IMAGE,

@@ -25,7 +25,7 @@ from mcuhome.buildserver.security import (
     publish_pairing_token,
     read_token_file,
 )
-from tests.conftest import TOKEN
+from tests.python.conftest import TOKEN
 
 
 async def test_health_is_open_and_says_nothing_secret(client) -> None:

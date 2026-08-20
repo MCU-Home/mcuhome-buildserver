@@ -30,7 +30,7 @@ from mcuhome.buildserver import app as app_module
 from mcuhome.buildserver import config as config_module
 from mcuhome.buildserver import sessions
 from mcuhome.buildserver.errors import SessionError
-from tests.conftest import (
+from tests.python.conftest import (
     BUILD_CONTEXT_BYTES,
     CONTEXT_YAML,
     IMAGE,
@@ -46,7 +46,7 @@ from tests.conftest import (
     make_archive,
     send_archive,
 )
-from tests.test_context import MODEL, PATCH, open_session, serve
+from tests.python.test_context import MODEL, PATCH, open_session, serve
 
 SDK_SHA256 = "a" * 64
 BOARD = "nrf7002dk/nrf5340/cpuapp"
@@ -517,7 +517,7 @@ def test_this_server_calls_the_workbench_and_never_the_compiler() -> None:
     import ast
     from pathlib import Path
 
-    package = Path(__file__).resolve().parent.parent / "mcuhome.buildserver"
+    package = Path(__file__).resolve().parents[2] / "mcuhome" / "buildserver"
     offenders = []
     for source in sorted(package.rglob("*.py")):
         for node in ast.walk(ast.parse(source.read_text(encoding="utf-8"))):

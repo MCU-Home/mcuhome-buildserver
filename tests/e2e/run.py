@@ -19,9 +19,9 @@ this file exists to prevent.
 
 Run it by hand exactly as CI does::
 
-    python e2e/run.py --sdk-dir <dir with the SDK package and index.json>
+    python tests/e2e/run.py --sdk-dir <dir with the SDK package and index.json>
 
-The device it builds is ``e2e/project/devices/e2e-node`` — deliberately
+The device it builds is ``tests/e2e/project/devices/e2e-node`` — deliberately
 the cheapest configuration that still walks the whole chain; its own file
 says why.
 """

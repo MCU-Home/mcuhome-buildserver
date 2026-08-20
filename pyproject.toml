@@ -38,7 +38,7 @@ classifiers = [
 # and the container it drives would stop being the only thing that
 # compiles. The workbench reaches the compiler only through a dynamic
 # import for the build methods that need one, so nothing here loads it —
-# and `tests/test_freeze.py` pins both halves of that sentence, in the
+# and `tests/python/test_freeze.py` pins both halves of that sentence, in the
 # syntax tree and at run time.
 #
 # `mcuhome-model` comes along behind the workbench and is still what the
@@ -90,7 +90,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 known-first-party = ["mcuhome.buildserver", "tests"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests/python"]
 asyncio_mode = "auto"
 
 [tool.codespell]

@@ -30,7 +30,7 @@ from mcuhome.model.buildimage import CONTRACT_LABEL, ZEPHYR_LABEL
 from ruamel.yaml import YAML
 
 from mcuhome.buildserver import sessions
-from tests.conftest import (
+from tests.python.conftest import (
     BUILD_REPORT,
     IMAGE,
     IMAGE_DIGEST,

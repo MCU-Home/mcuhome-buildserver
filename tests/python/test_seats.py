@@ -20,7 +20,7 @@ import pytest
 from mcuhome.buildserver import errors, sessions
 from mcuhome.buildserver.app import ServerState, create_app
 from mcuhome.buildserver.errors import SessionError
-from tests.conftest import auth, call
+from tests.python.conftest import auth, call
 
 
 def _open(manager: sessions.SessionManager, seat: str | None = None) -> sessions.Session:

@@ -34,8 +34,8 @@ permissions:
   contents: read
 
 jobs:
-  lint:
-    name: Lint (ruff + REUSE)
+  lint-ruff:
+    name: Lint (ruff)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -47,7 +47,7 @@ jobs:
           python-version: "3.13"
 
       - name: Install lint tools
-        run: python -m pip install --disable-pip-version-check ruff==0.16.1 reuse==5.0.2
+        run: python -m pip install --disable-pip-version-check ruff==0.16.1
 
       - name: ruff check
         run: ruff check .
@@ -55,11 +55,9 @@ jobs:
       - name: ruff format --check
         run: ruff format --check .
 
-      - name: REUSE lint
-        run: reuse lint
 
-  test:
-    name: pytest
+  test-pytest:
+    name: Test (pytest)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -118,8 +116,8 @@ jobs:
   # one, because this server mounts a shared compiler cache read-only
   # and never a writable one (README, "the cache"), so the cheap device
   # is not a nicety here.
-  e2e:
-    name: End-to-end (one real remote build)
+  test-e2e:
+    name: Test (end to end)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -213,3 +211,117 @@ jobs:
 
       - name: One real remote build
         run: python tests/e2e/run.py --sdk-dir dist/sdk
+
+  license-reuse:
+    name: License (reuse)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install
+        run: python -m pip install --disable-pip-version-check reuse==5.0.2
+
+      - name: reuse lint
+        run: reuse lint
+
+  spell-codespell:
+    name: Spelling (codespell)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install
+        run: python -m pip install --disable-pip-version-check codespell==2.4.3
+
+      # The ignored words are deliberate spellings, not slips: Requestor and
+      # PASE are the Matter specification's own, OT is OpenThread, rsource is
+      # Kconfig's. Generated documents and patches are skipped because their
+      # wording is not ours to correct.
+      - name: codespell
+        run: codespell --ignore-words-list=requestor,pase,ot,rsource,re-declared,re-declare,re-used,unparseable,pre-empt --skip='./.git,./frontend/node_modules,*.matter,*.zap,pnpm-lock.yaml,*.patch'
+
+  hygiene-prehooks:
+    name: Hygiene (pre-commit-hooks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install
+        run: python -m pip install --disable-pip-version-check pre-commit-hooks==5.0.0
+
+      # The fixers rewrite and exit non-zero when they had to; in CI the tree
+      # is throwaway, so that is exactly a check. `patches/` is excluded on
+      # purpose: a context line in a unified diff is a single space, and
+      # stripping it produces a patch that no longer applies.
+      - name: Whitespace, final newline and line endings
+        run: |
+          text=$(git grep -Il '' -- . ':!patches/**' ':!*.patch' ':!*.matter' ':!*.zap')
+          trailing-whitespace-fixer $text
+          end-of-file-fixer $text
+          mixed-line-ending --fix=no $text
+
+      - name: No merge markers
+        run: check-merge-conflict $(git grep -Il '' -- .)
+
+      # --unsafe checks the syntax and not the tags: this project has its own
+      # (`!secret`, `!file`), and a loader that refuses them is not a finding.
+      - name: YAML parses
+        run: |
+          files=$(git ls-files '*.yml' '*.yaml')
+          if [ -n "$files" ]; then check-yaml --unsafe $files; fi
+
+  commits-conventional:
+    name: Commits (conventional)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install
+        run: python -m pip install --disable-pip-version-check conventional-pre-commit==4.0.0
+
+      # Merge commits carry GitHub's wording, not ours, so they are skipped.
+      - name: Every commit message states its kind
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ -n "$BASE" ]; then
+            range="$BASE..$HEAD_SHA"
+          elif [ -n "$BEFORE" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            range="$BEFORE..${{ github.sha }}"
+          else
+            range="HEAD~1..HEAD"
+          fi
+          status=0
+          for sha in $(git log --no-merges --format=%H "$range"); do
+            git log -1 --format=%B "$sha" > /tmp/commit-message
+            conventional-pre-commit /tmp/commit-message || { echo "  ^ $sha"; status=1; }
+          done
+          exit $status

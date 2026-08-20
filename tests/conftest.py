@@ -820,9 +820,22 @@ def make_archive_from(members: list[tuple[str, bytes]]) -> bytes:
     return zstandard.ZstdCompressor().compress(raw.getvalue())
 
 
+#: The generator declaration every context created by a workbench
+#: carries. Part of the base fixture rather than an extra, so what the
+#: tests push at the server has the shape a real client sends.
+BUILD_CONTEXT_JSON = '{\n  "generator": "mcuhome-workbench:0.1.0.dev0"\n}\n'
+BUILD_CONTEXT_BYTES = BUILD_CONTEXT_JSON.encode()
+
+
 def base_context(**files: bytes) -> bytes:
-    """The usual base context: a valid ``context.yaml`` plus *files*."""
-    return make_archive({"context.yaml": CONTEXT_YAML.encode(), **files})
+    """The usual base context: ``context.yaml``, the generator, plus *files*."""
+    return make_archive(
+        {
+            "build-context.json": BUILD_CONTEXT_JSON.encode(),
+            "context.yaml": CONTEXT_YAML.encode(),
+            **files,
+        }
+    )
 
 
 async def send_archive(

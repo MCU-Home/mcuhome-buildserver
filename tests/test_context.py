@@ -23,6 +23,7 @@ from mcuhome_buildserver import contextstore, protocol, sessions
 from mcuhome_buildserver.app import ServerState, create_app
 from mcuhome_buildserver.config import Config
 from tests.conftest import (
+    BUILD_CONTEXT_BYTES,
     CONTEXT_YAML,
     IMAGE,
     IMAGE_LABELS,
@@ -596,7 +597,7 @@ async def test_every_budget_counts_across_the_base_context_and_its_extensions(
     key = b"public key"
     base = base_context(**{"model/device-model.json": MODEL})
     extension = make_archive({"keys/signing.pub": key})
-    on_disk = len(CONTEXT_YAML.encode()) + len(MODEL)
+    on_disk = len(BUILD_CONTEXT_BYTES) + len(CONTEXT_YAML.encode()) + len(MODEL)
     override, measured = {
         "compressed size": (
             {"max_compressed_bytes": len(base) + len(extension) - 1},
@@ -606,7 +607,7 @@ async def test_every_budget_counts_across_the_base_context_and_its_extensions(
             {"max_decompressed_bytes": _decompressed(base) + _decompressed(extension) - 1},
             _decompressed(base) + _decompressed(extension),
         ),
-        "entry count": ({"max_entries": 2}, 3),
+        "entry count": ({"max_entries": 3}, 4),
         "disk quota": ({"session_quota_bytes": on_disk + len(key) - 1}, on_disk + len(key)),
     }[budget]
 
@@ -1089,7 +1090,7 @@ async def test_extend_context_adds_and_overwrites_by_path(client, state) -> None
         paths = state.sessions.require(session_id).paths
 
     assert frame["type"] == "result", frame
-    assert frame["payload"]["files"] == 2
+    assert frame["payload"]["files"] == 3, "the two written here plus the generator declaration"
     assert paths is not None
     assert (paths.context / "model/device-model.json").read_bytes() == b"{}"
     assert (paths.context / "keys/signing.pub").read_bytes() == b"key"
@@ -1120,7 +1121,7 @@ async def test_extend_context_removes_and_says_how_many_existed(client, state) -
         paths = state.sessions.require(session_id).paths
 
     assert frame["payload"]["removed"] == 1
-    assert frame["payload"]["files"] == 1
+    assert frame["payload"]["files"] == 2
     assert paths is not None
     assert not (paths.context / "keys").exists(), "an emptied directory goes with its last file"
 
@@ -1174,6 +1175,36 @@ async def test_an_extension_may_not_touch_context_yaml(client, how) -> None:
                 ws,
                 "extend-context",
                 {"session_id": session_id, "remove": ["context.yaml"]},
+                frame_id="r",
+            )
+    assert frame["error"]["code"] == "context.pins-immutable"
+
+
+@pytest.mark.parametrize("how", ["archive", "remove"])
+async def test_an_extension_may_not_touch_the_generator_declaration(client, how) -> None:
+    """Same code as ``context.yaml``, and for the same reason.
+
+    The generator declaration is what the build environment's constraint
+    was checked against when the environment for this session was
+    selected. An extension that replaced it would leave the session
+    running an environment nothing ever admitted it to — which is a new
+    session, not an extension.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        await send_archive(ws, "send-context", session_id, base_context())
+        if how == "archive":
+            frame = await send_archive(
+                ws,
+                "extend-context",
+                session_id,
+                make_archive({"build-context.json": b'{"generator": "evil-tool:1.0.0"}\n'}),
+            )
+        else:
+            frame = await call(
+                ws,
+                "extend-context",
+                {"session_id": session_id, "remove": ["build-context.json"]},
                 frame_id="r",
             )
     assert frame["error"]["code"] == "context.pins-immutable"
@@ -1276,7 +1307,7 @@ async def test_a_refused_extension_gives_the_disk_meter_back(client, state) -> N
 
     # context.yaml is on the disk like any other file, so it is on the
     # meter — the quota is about the host, not about the integrity list.
-    assert before == len(MODEL) + len(CONTEXT_YAML.encode())
+    assert before == len(MODEL) + len(CONTEXT_YAML.encode()) + len(BUILD_CONTEXT_BYTES)
     assert session.ledger.disk_bytes == before
 
 

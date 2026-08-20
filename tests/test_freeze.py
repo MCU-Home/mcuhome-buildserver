@@ -31,6 +31,7 @@ from mcuhome_buildserver import config as config_module
 from mcuhome_buildserver import sessions
 from mcuhome_buildserver.errors import SessionError
 from tests.conftest import (
+    BUILD_CONTEXT_BYTES,
     CONTEXT_YAML,
     IMAGE,
     IMAGE_DIGEST,
@@ -99,7 +100,11 @@ async def test_the_id_is_the_models_rule_over_the_bytes_received(client) -> None
     rule (ADR 0020 decision 4), so the only thing worth asserting is
     that the number it answers is the rule's.
     """
-    files = {"model/device-model.json": MODEL, "keys/signing.pub": b"public key"}
+    files = {
+        "build-context.json": BUILD_CONTEXT_BYTES,
+        "model/device-model.json": MODEL,
+        "keys/signing.pub": b"public key",
+    }
     expected = context_id(
         sdk_sha256=SDK_SHA256,
         environment_digest=IMAGE_DIGEST,
@@ -149,13 +154,21 @@ async def test_an_empty_context_has_an_identity_and_may_be_locked(client) -> Non
     the document still has the key — and the things a ``build`` needs
     beyond existence, ``keys/signing.pub`` above all, are checked by
     ``build``, which is where the contract scopes them.
+
+    The archive is assembled here rather than through ``base_context``
+    because that fixture carries the generator declaration, which is
+    content and would make this context exactly not empty. Nothing a real
+    client sends looks like this — and the rule under test is the
+    server's, which is why it is worth being able to state it at all.
     """
     expected = context_id(
         sdk_sha256=SDK_SHA256, environment_digest=IMAGE_DIGEST, board=BOARD, files=()
     )
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
-        frame = await send_and_lock(ws, session_id, base_context())
+        frame = await send_and_lock(
+            ws, session_id, make_archive({"context.yaml": CONTEXT_YAML.encode()})
+        )
 
     assert frame["payload"]["context_id"] == expected
 
@@ -322,6 +335,11 @@ async def test_neither_context_document_is_in_the_integrity_list(client, state) 
     byte-identical configurations created a second apart would get two
     identities, and one resolved pin reached under two constraints would
     get two more.
+
+    ``build-context.json`` is neither, and the list proves it: it names
+    the tool that generated the context, a build environment is admitted
+    against that name, and a file that decides who may build belongs
+    inside the identity the build is claimed under.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
@@ -334,7 +352,11 @@ async def test_neither_context_document_is_in_the_integrity_list(client, state) 
 
     assert paths is not None
     listed = [entry["path"] for entry in read_manifest(paths.context / "manifest.yaml")["files"]]
-    assert listed == ["keys/signing.pub", "model/device-model.json"], "sorted by path"
+    assert listed == [
+        "build-context.json",
+        "keys/signing.pub",
+        "model/device-model.json",
+    ], "sorted by path"
     assert "context.yaml" not in listed
     assert "manifest.yaml" not in listed
 
@@ -357,7 +379,11 @@ async def test_a_patch_is_an_ordinary_entry_of_the_list(aiohttp_client, config) 
     assert paths is not None
     manifest = read_manifest(paths.context / "manifest.yaml")
     assert manifest["files"] == [
-        {"path": "patches/zephyr/0001-fix.patch", "sha256": hashlib.sha256(PATCH).hexdigest()}
+        {
+            "path": "build-context.json",
+            "sha256": hashlib.sha256(BUILD_CONTEXT_BYTES).hexdigest(),
+        },
+        {"path": "patches/zephyr/0001-fix.patch", "sha256": hashlib.sha256(PATCH).hexdigest()},
     ]
 
 
@@ -662,7 +688,7 @@ async def test_a_lock_cannot_slip_between_an_extension_and_its_bytes(client, sta
     # freezing at a defined moment.
     assert paths is not None
     listed = [entry["path"] for entry in read_manifest(paths.context / "manifest.yaml")["files"]]
-    assert listed == ["keys/signing.pub", "model/device-model.json"]
+    assert listed == ["build-context.json", "keys/signing.pub", "model/device-model.json"]
 
 
 async def test_a_close_during_an_upload_is_answered_typed_and_leaves_nothing(client, state) -> None:

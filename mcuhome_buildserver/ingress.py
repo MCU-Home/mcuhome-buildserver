@@ -53,7 +53,14 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 import zstandard
-from mcuhome.model.context import CONTEXT_FILE, KEYS_DIR, MANIFEST_FILE, MODEL_FILE, PATCHES_DIR
+from mcuhome.model.context import (
+    BUILD_CONTEXT_FILE,
+    CONTEXT_FILE,
+    KEYS_DIR,
+    MANIFEST_FILE,
+    MODEL_FILE,
+    PATCHES_DIR,
+)
 
 from mcuhome_buildserver.errors import SessionError
 from mcuhome_buildserver.protocol import ProtocolError
@@ -488,11 +495,12 @@ def patch_layer_of(path: str) -> str | None:
 def check_file_target(path: str, *, allow_context_file: bool) -> None:
     """Refuse a file the context layout has no place for.
 
-    The whitelist is ADR 0019 decision 8's, verbatim: ``context.yaml`` at
-    the root plus ``model/``, ``keys/`` and ``patches/<layer>/``.
-    ``patches`` is the one subtree with a fixed depth, because a layer
-    folder holds patch files and nothing else — a nested path has no
-    meaning for the application order, which is the filename alone.
+    The whitelist is ADR 0019 decision 8's: ``context.yaml`` and
+    ``build-context.json`` at the root plus ``model/``, ``keys/`` and
+    ``patches/<layer>/``. ``patches`` is the one subtree with a fixed
+    depth, because a layer folder holds patch files and nothing else — a
+    nested path has no meaning for the application order, which is the
+    filename alone.
 
     Exported because ``extend-context``'s ``remove`` list names files in
     exactly this layout, and a second copy of the whitelist is how the
@@ -505,6 +513,24 @@ def check_file_target(path: str, *, allow_context_file: bool) -> None:
                 "context.pins-immutable",
                 "An extension may not carry context.yaml. It holds the pins this session "
                 "was admitted on, and changing them is a new session rather than an "
+                "extension.",
+                entry=path,
+            )
+        return
+    if path == BUILD_CONTEXT_FILE:
+        if not allow_context_file:
+            # Same code as context.yaml, and for the same reason rather
+            # than for convenience: both documents are what the session
+            # was admitted on. This one names the tool that generated the
+            # context, which is what the build environment's generator
+            # constraint was checked against when the environment was
+            # selected — replacing it afterwards would leave the session
+            # running an environment nothing ever admitted it to.
+            raise SessionError(
+                "context.pins-immutable",
+                "An extension may not carry build-context.json. It names the tool this "
+                "context was generated with, which is what the build environment was "
+                "selected against, and changing it is a new session rather than an "
                 "extension.",
                 entry=path,
             )
@@ -523,8 +549,8 @@ def check_file_target(path: str, *, allow_context_file: bool) -> None:
     raise SessionError(
         "context.unsafe-entry",
         f'"{path}" is outside the subtrees a context may carry. A context holds '
-        f"{CONTEXT_FILE} at its root and files under {MODEL_DIR}/, {KEYS_DIR}/ and "
-        f"{PATCHES_DIR}/<layer>/, and nothing else.",
+        f"{BUILD_CONTEXT_FILE} and {CONTEXT_FILE} at its root and files under "
+        f"{MODEL_DIR}/, {KEYS_DIR}/ and {PATCHES_DIR}/<layer>/, and nothing else.",
         entry=path,
     )
 

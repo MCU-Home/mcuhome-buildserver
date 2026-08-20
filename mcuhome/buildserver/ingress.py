@@ -12,7 +12,7 @@ announcement is not trusted and neither is the size: the receiver counts
 what actually arrives, hashes it, and decompresses it as it goes, so a
 cap can refuse **mid-stream**. That is the whole point of the ADR's word
 *streaming*, and the reason the 8 MiB ``max_msg_size`` in
-:mod:`mcuhome_buildserver.ws` is explicitly *not* the ingress cap: a
+:mod:`mcuhome.buildserver.ws` is explicitly *not* the ingress cap: a
 limit that only fires once the bytes are on the host is not a limit.
 
 The decompression bomb is the case that decides the shape. A few
@@ -62,8 +62,8 @@ from mcuhome.model.context import (
     PATCHES_DIR,
 )
 
-from mcuhome_buildserver.errors import SessionError
-from mcuhome_buildserver.protocol import ProtocolError
+from mcuhome.buildserver.errors import SessionError
+from mcuhome.buildserver.protocol import ProtocolError
 
 __all__ = [
     "MAX_NAME_BYTES",
@@ -191,7 +191,7 @@ def _unreadable(reason: str) -> ProtocolError:
     """A body that is not a tar.zst archive at all.
 
     Pre-registry on purpose. The typed registry of
-    :mod:`mcuhome_buildserver.errors` describes a *session's* refusals —
+    :mod:`mcuhome.buildserver.errors` describes a *session's* refusals —
     a cap, a forbidden path, a hash that disagrees — and none of its
     entries means "these bytes are not an archive". No ADR names a code
     for it either, and adding one is a protocol decision rather than an
@@ -456,7 +456,7 @@ def type_conflict(path: str, *, conflict: str, where: str) -> SessionError:
     describing does not exist. Widening the registry entry's summary was
     the alternative to a new code, and the pre-release window is what
     makes amending a summary legitimate where adding a code would be a
-    protocol decision (:mod:`mcuhome_buildserver.errors`).
+    protocol decision (:mod:`mcuhome.buildserver.errors`).
 
     Both paths are named, because the offending entry is rarely the
     interesting one: a client that sent ``model/a`` sees nothing wrong

@@ -53,8 +53,8 @@ from pathlib import Path
 
 import zstandard
 
-from mcuhome_buildserver.abi import Artifact
-from mcuhome_buildserver.errors import SessionError
+from mcuhome.buildserver.abi import Artifact
+from mcuhome.buildserver.errors import SessionError
 
 __all__ = [
     "Delivery",

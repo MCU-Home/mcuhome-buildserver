@@ -19,9 +19,9 @@ from pathlib import Path
 import pytest
 import zstandard
 
-from mcuhome_buildserver import contextstore, protocol, sessions
-from mcuhome_buildserver.app import ServerState, create_app
-from mcuhome_buildserver.config import Config
+from mcuhome.buildserver import contextstore, protocol, sessions
+from mcuhome.buildserver.app import ServerState, create_app
+from mcuhome.buildserver.config import Config
 from tests.conftest import (
     BUILD_CONTEXT_BYTES,
     CONTEXT_YAML,
@@ -859,7 +859,7 @@ async def test_an_empty_folder_for_a_denied_layer_is_refused_too(client) -> None
 
 def test_the_configuration_accepts_the_four_names_and_the_x_prefix() -> None:
     """Nameable is not the same as allowed, and the option knows both."""
-    from mcuhome_buildserver.config import load_config
+    from mcuhome.buildserver.config import load_config
 
     config = load_config(
         ["--allow-patch-layer", "mcuboot", "--allow-patch-layer", "x-acme"], env={}
@@ -879,7 +879,7 @@ def test_the_caps_and_the_context_root_are_configuration() -> None:
     the environment, which is what an App's ``run`` script and a
     ``docker run`` have.
     """
-    from mcuhome_buildserver.config import load_config
+    from mcuhome.buildserver.config import load_config
 
     config = load_config(["--max-entries", "7", "--context-root", "/srv/ctx"], env={})
     assert config.max_entries == 7
@@ -905,15 +905,13 @@ def test_the_context_root_falls_back_to_state_and_then_to_the_temporary_dir() ->
     the account database, which picks a directory nobody asked for. Here
     the fallback is somewhere obviously ephemeral instead.
     """
-    from mcuhome_buildserver.config import default_context_root
+    from mcuhome.buildserver.config import default_context_root
 
-    assert default_context_root({"XDG_STATE_HOME": "/x"}) == Path(
-        "/x/mcuhome-build-server/sessions"
-    )
+    assert default_context_root({"XDG_STATE_HOME": "/x"}) == Path("/x/mcuhome-buildserver/sessions")
     assert default_context_root({"HOME": "/home/s"}) == Path(
-        "/home/s/.local/state/mcuhome-build-server/sessions"
+        "/home/s/.local/state/mcuhome-buildserver/sessions"
     )
-    assert default_context_root({}).parts[-2:] == ("mcuhome-build-server", "sessions")
+    assert default_context_root({}).parts[-2:] == ("mcuhome-buildserver", "sessions")
 
 
 # --------------------------------------------------------------------------
@@ -1574,7 +1572,7 @@ def test_the_merge_never_re_parents_a_staged_file(tmp_path: Path) -> None:
     :func:`os.replace` raises. A guard whose backstop would misplace the
     bytes rather than refuse them is one bug away from doing it.
     """
-    from mcuhome_buildserver.sessions import Session, _merge_staging
+    from mcuhome.buildserver.sessions import Session, _merge_staging
 
     context, staging = tmp_path / "context", tmp_path / "staging"
     (context / "model/a").mkdir(parents=True)
@@ -1765,8 +1763,8 @@ def test_the_patch_policy_recheck_refuses_on_its_own(tmp_path: Path) -> None:
     refuses a denied patch before it is ever written. Testing this one as
     a unit is what keeps the safety net a net rather than a comment.
     """
-    from mcuhome_buildserver.contextstore import recheck_patch_policy
-    from mcuhome_buildserver.errors import SessionError
+    from mcuhome.buildserver.contextstore import recheck_patch_policy
+    from mcuhome.buildserver.errors import SessionError
 
     (tmp_path / "patches/zephyr").mkdir(parents=True)
     (tmp_path / "patches/zephyr/0001.patch").write_bytes(PATCH)
@@ -1787,7 +1785,7 @@ def test_the_file_count_walks_the_context_without_hashing_it(tmp_path: Path, mon
     number a walk produces. The two must still agree about *which* files
     are the context, which is why both go through one exclusion rule.
     """
-    from mcuhome_buildserver import contextstore
+    from mcuhome.buildserver import contextstore
 
     (tmp_path / "model").mkdir()
     (tmp_path / "context.yaml").write_bytes(CONTEXT_YAML.encode())
@@ -1823,9 +1821,9 @@ def test_the_context_root_is_created_private_and_level_by_level(tmp_path: Path) 
     """
     import os as os_module
 
-    from mcuhome_buildserver.contextstore import prepare_context_root
+    from mcuhome.buildserver.contextstore import prepare_context_root
 
-    root = tmp_path / "state" / "mcuhome-build-server" / "sessions"
+    root = tmp_path / "state" / "mcuhome-buildserver" / "sessions"
     previous = os_module.umask(0o000)
     try:
         assert prepare_context_root(root) == root
@@ -1852,8 +1850,8 @@ def test_a_relative_context_root_is_refused_at_startup(tmp_path: Path, monkeypat
     A startup refusal because it is an operator's mistake about a path,
     and every session would make it again.
     """
-    from mcuhome_buildserver.config import load_config
-    from mcuhome_buildserver.contextstore import UnsafeContextRoot, prepare_context_root
+    from mcuhome.buildserver.config import load_config
+    from mcuhome.buildserver.contextstore import UnsafeContextRoot, prepare_context_root
 
     # Chdir first: without the refusal the relative name resolves against
     # the working directory, and the point of the refusal is that nobody
@@ -1871,7 +1869,7 @@ def test_a_context_root_under_a_world_writable_directory_refuses_to_serve(tmp_pa
     """The systemd fallback lands in ``/tmp``, and that is the case.
 
     With neither ``XDG_STATE_HOME`` nor ``HOME`` set the default is
-    ``/tmp/mcuhome-build-server/sessions``, a fixed name in a directory
+    ``/tmp/mcuhome-buildserver/sessions``, a fixed name in a directory
     every local user can write to: whoever creates it first owns the
     parent of every per-session directory and can rename one away and
     substitute their own. Session ids are unguessable, so the attack is
@@ -1881,7 +1879,7 @@ def test_a_context_root_under_a_world_writable_directory_refuses_to_serve(tmp_pa
     sticky is exactly what stops a stranger from renaming somebody else's
     entry. A world-writable directory *without* the sticky bit is.
     """
-    from mcuhome_buildserver.contextstore import UnsafeContextRoot, prepare_context_root
+    from mcuhome.buildserver.contextstore import UnsafeContextRoot, prepare_context_root
 
     shared = tmp_path / "shared"
     shared.mkdir()
@@ -1902,7 +1900,7 @@ def test_an_unsafe_context_root_stops_the_server_before_it_binds(tmp_path: Path)
     and what is wrong with it, so the process exits non-zero with that
     one sentence and never binds the socket.
     """
-    from mcuhome_buildserver.server import run
+    from mcuhome.buildserver.server import run
 
     shared = tmp_path / "shared"
     shared.mkdir()
@@ -1929,7 +1927,7 @@ def test_a_context_root_owned_by_somebody_else_refuses_to_serve(
     """
     import os as os_module
 
-    from mcuhome_buildserver.contextstore import UnsafeContextRoot, prepare_context_root
+    from mcuhome.buildserver.contextstore import UnsafeContextRoot, prepare_context_root
 
     root = tmp_path / "sessions"
     root.mkdir()

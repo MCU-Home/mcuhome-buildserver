@@ -12,8 +12,8 @@ back.
 
 **Docker is stubbed at the seam and never runs**, which is a hard rule
 of this suite rather than a convenience. :class:`FakeDocker` replaces
-:func:`mcuhome_buildserver.container.run_docker` and
-:func:`~mcuhome_buildserver.container.spawn_docker`, the two impure
+:func:`mcuhome.buildserver.container.run_docker` and
+:func:`~mcuhome.buildserver.container.spawn_docker`, the two impure
 functions everything else in that module goes through, and it is
 installed by an **autouse** fixture: a test that forgot to ask for it
 would otherwise start a real container on the machine running the
@@ -47,9 +47,9 @@ from mcuhome.model.buildimage import CONTRACT_LABEL, TOOLCHAIN_LABEL, ZEPHYR_LAB
 from mcuhome.workbench import orchestrator
 from ruamel.yaml import YAML
 
-from mcuhome_buildserver import container
-from mcuhome_buildserver.app import ServerState, create_app
-from mcuhome_buildserver.config import Config
+from mcuhome.buildserver import container
+from mcuhome.buildserver.app import ServerState, create_app
+from mcuhome.buildserver.config import Config
 
 TOKEN = "test-token-000000000000000000000000"
 
@@ -177,7 +177,7 @@ class FakeProcess:
     async def stop(self) -> None:
         """Teardown's escalation, with the grace collapsed to nothing.
 
-        The real one (:meth:`mcuhome_buildserver.processes.ChildProcess.stop`)
+        The real one (:meth:`mcuhome.buildserver.processes.ChildProcess.stop`)
         asks the process group, waits a bounded moment and kills what is
         left. The shape a test needs from it is the *ladder* and not the
         clock: a child that goes away on SIGTERM is never killed, and one

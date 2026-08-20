@@ -38,11 +38,11 @@ from dataclasses import dataclass, field
 
 from aiohttp import web
 
-from mcuhome_buildserver import sessions, ws
-from mcuhome_buildserver.backend import SessionBackend
-from mcuhome_buildserver.config import Config
-from mcuhome_buildserver.contextstore import prepare_context_root
-from mcuhome_buildserver.security import STATE_KEY, AuthThrottle, auth_middleware
+from mcuhome.buildserver import sessions, ws
+from mcuhome.buildserver.backend import SessionBackend
+from mcuhome.buildserver.config import Config
+from mcuhome.buildserver.contextstore import prepare_context_root
+from mcuhome.buildserver.security import STATE_KEY, AuthThrottle, auth_middleware
 
 __all__ = ["REAPER_KEY", "ServerState", "create_app"]
 
@@ -110,7 +110,7 @@ async def _reap_loop(state: ServerState) -> None:
     The task exists because a lease that is only enforced when a client
     presents its session id is not a lease at all: the client that most
     needs reaping is the one that never comes back. Every
-    :data:`~mcuhome_buildserver.sessions.DEFAULT_REAP_INTERVAL` seconds
+    :data:`~mcuhome.buildserver.sessions.DEFAULT_REAP_INTERVAL` seconds
     this closes the sessions whose lease or idle timeout ran out and
     deletes their directories, which is what the README's "deleted at
     lease expiry" has always claimed and what the credentials in

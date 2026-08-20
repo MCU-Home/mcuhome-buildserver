@@ -19,20 +19,20 @@ answers ``session.not-implemented``.
 Module map:
 
 ==========================================  ===================================
-:mod:`mcuhome_buildserver.config`           runtime configuration (CLI + env)
-:mod:`mcuhome_buildserver.server`           process entry point
-:mod:`mcuhome_buildserver.app`              application factory, shared state,
+:mod:`mcuhome.buildserver.config`           runtime configuration (CLI + env)
+:mod:`mcuhome.buildserver.server`           process entry point
+:mod:`mcuhome.buildserver.app`              application factory, shared state,
                                             the backend, ``/health``
-:mod:`mcuhome_buildserver.security`         the bearer token and where it comes from
-:mod:`mcuhome_buildserver.protocol`         the frame envelope and its codec
-:mod:`mcuhome_buildserver.errors`           the session protocol's error envelope
+:mod:`mcuhome.buildserver.security`         the bearer token and where it comes from
+:mod:`mcuhome.buildserver.protocol`         the frame envelope and its codec
+:mod:`mcuhome.buildserver.errors`           the session protocol's error envelope
                                             and its append-only code registry
-:mod:`mcuhome_buildserver.sessions`         session protocol v2: sessions and verbs
-:mod:`mcuhome_buildserver.ws`               the ``/ws`` endpoint and the command loop
-:mod:`mcuhome_buildserver.backend`          this server's half of one session's
+:mod:`mcuhome.buildserver.sessions`         session protocol v2: sessions and verbs
+:mod:`mcuhome.buildserver.ws`               the ``/ws`` endpoint and the command loop
+:mod:`mcuhome.buildserver.backend`          this server's half of one session's
                                             build: discovery, invocations, egress
-:mod:`mcuhome_buildserver.container`        docker, and the one seam to it
-:mod:`mcuhome_buildserver.processes`        child processes
+:mod:`mcuhome.buildserver.container`        docker, and the one seam to it
+:mod:`mcuhome.buildserver.processes`        child processes
 ==========================================  ===================================
 """
 

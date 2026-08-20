@@ -14,8 +14,8 @@ import json
 
 import pytest
 
-from mcuhome_buildserver import protocol
-from mcuhome_buildserver.protocol import Command, ProtocolError
+from mcuhome.buildserver import protocol
+from mcuhome.buildserver.protocol import Command, ProtocolError
 
 
 def test_a_command_round_trips() -> None:

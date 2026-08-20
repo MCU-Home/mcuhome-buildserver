@@ -51,7 +51,7 @@ from collections.abc import Iterable
 
 from mcuhome.model.imageref import DOCKER_HUB, parse_reference
 
-from mcuhome_buildserver.errors import SessionError
+from mcuhome.buildserver.errors import SessionError
 
 __all__ = [
     "check_allowed",

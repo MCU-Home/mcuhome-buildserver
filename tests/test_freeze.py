@@ -26,10 +26,10 @@ from mcuhome.model.context import (
 )
 from ruamel.yaml import YAML
 
-from mcuhome_buildserver import app as app_module
-from mcuhome_buildserver import config as config_module
-from mcuhome_buildserver import sessions
-from mcuhome_buildserver.errors import SessionError
+from mcuhome.buildserver import app as app_module
+from mcuhome.buildserver import config as config_module
+from mcuhome.buildserver import sessions
+from mcuhome.buildserver.errors import SessionError
 from tests.conftest import (
     BUILD_CONTEXT_BYTES,
     CONTEXT_YAML,
@@ -478,7 +478,7 @@ def test_an_expired_lease_takes_the_context_with_it(tmp_path) -> None:
         protocol_version=sessions.SESSION_PROTOCOL_VERSION,
         context_format=sessions.CONTEXT_FORMAT_MAX,
     )
-    from mcuhome_buildserver.contextstore import SessionPaths
+    from mcuhome.buildserver.contextstore import SessionPaths
 
     session.paths = SessionPaths.create(tmp_path, session.id)
     session.context_state = sessions.CONTEXT_UNLOCKED
@@ -517,7 +517,7 @@ def test_this_server_calls_the_workbench_and_never_the_compiler() -> None:
     import ast
     from pathlib import Path
 
-    package = Path(__file__).resolve().parent.parent / "mcuhome_buildserver"
+    package = Path(__file__).resolve().parent.parent / "mcuhome.buildserver"
     offenders = []
     for source in sorted(package.rglob("*.py")):
         for node in ast.walk(ast.parse(source.read_text(encoding="utf-8"))):
@@ -544,7 +544,7 @@ def test_importing_this_server_does_not_load_the_compiler() -> None:
     import sys
 
     probe = (
-        "import sys, mcuhome_buildserver.app, mcuhome_buildserver.backend;"
+        "import sys, mcuhome.buildserver.app, mcuhome.buildserver.backend;"
         "print('mcuhome.compiler' in sys.modules)"
     )
     answer = subprocess.run(  # noqa: S603 - fixed argv, no shell
@@ -738,7 +738,7 @@ async def test_a_close_during_an_upload_is_answered_typed_and_leaves_nothing(cli
 
 def _abandoned(manager: sessions.SessionManager, tmp_path) -> sessions.Session:
     """One session with a real directory, and a client that never returns."""
-    from mcuhome_buildserver.contextstore import SessionPaths
+    from mcuhome.buildserver.contextstore import SessionPaths
 
     session = manager.open(
         profile="oneshot",

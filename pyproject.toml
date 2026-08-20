@@ -6,7 +6,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "mcuhome-build-server"
+name = "mcuhome-buildserver"
 version = "0.1.0.dev0"
 description = "Headless MCUHome build service: drives build environments over the session build protocol."
 readme = "README.md"
@@ -58,7 +58,7 @@ dependencies = [
   "zstandard>=0.22",
 ]
 #
-# There is deliberately **no dependency on `mcuhome-dashboard`**. The two
+# There is deliberately **no dependency on `mcuhome-ui`**. The two
 # are separate products with separate version numbers (ADR 0003 decision
 # 1), joined by one protocol; a build server that could not be deployed
 # without the dashboard package would make that untrue in the packaging
@@ -68,16 +68,16 @@ dependencies = [
 dev = ["pytest>=8", "pytest-aiohttp>=1.1", "ruff==0.16.1"]
 
 [project.scripts]
-mcuhome-build-server = "mcuhome_buildserver.server:main"
+mcuhome-buildserver = "mcuhome.buildserver.server:main"
 
 [project.urls]
-Homepage = "https://github.com/mcu-home/build-server"
-Issues = "https://github.com/mcu-home/build-server/issues"
+Homepage = "https://github.com/mcu-home/mcuhome-buildserver"
+Issues = "https://github.com/mcu-home/mcuhome-buildserver/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["mcuhome_buildserver"]
+only-include = ["mcuhome/buildserver"]
 
-# Byte-identical to the dashboard repository's ruff configuration, so
+# Byte-identical to the mcuhome-ui repository's ruff configuration, so
 # that `ruff` means the same thing in every MCUHome Python package.
 [tool.ruff]
 line-length = 100
@@ -87,7 +87,7 @@ target-version = "py313"
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["mcuhome_buildserver", "tests"]
+known-first-party = ["mcuhome.buildserver", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

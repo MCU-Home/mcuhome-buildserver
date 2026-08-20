@@ -24,7 +24,7 @@ from dataclasses import replace
 
 import pytest
 
-from mcuhome_buildserver.app import ServerState, create_app
+from mcuhome.buildserver.app import ServerState, create_app
 from tests.conftest import (
     IMAGE_DIGEST,
     IMAGE_REFERENCE_FORMAT3,

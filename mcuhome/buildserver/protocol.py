@@ -16,9 +16,9 @@ the one-shot job protocol of dashboard ADR 0006; that protocol was
 dismantled rather than migrated, and dashboard ADR 0012 decision 3
 keeps exactly this — the frame envelope, the transport under it and the
 bearer token in front of it — while the verbs inside became the session
-protocol of :mod:`mcuhome_buildserver.sessions`.
+protocol of :mod:`mcuhome.buildserver.sessions`.
 
-**Why this module is a sibling of** ``mcuhome_dashboard.protocol``
+**Why this module is a sibling of** ``mcuhome.ui.protocol``
 **rather than an import of it.** The dashboard and the build server are
 separate products with separate version numbers (ADR 0003 decision 1),
 and the build server is routinely installed where the dashboard is not —
@@ -29,13 +29,13 @@ avoiding.
 
 What must not drift is the *envelope*, and that is guarded rather than
 assumed: ``tests/test_protocol.py`` compares this module's constants
-against ``mcuhome_dashboard.protocol`` whenever both packages are
+against ``mcuhome.ui.protocol`` whenever both packages are
 importable. A rename on one side fails a test on the other instead of
 producing two servers that almost agree.
 
 **Errors come in two vocabularies, and the difference is which layer
 failed.** A frame that parsed and named a verb is answered from the
-typed registry in :mod:`mcuhome_buildserver.errors` — dotted code,
+typed registry in :mod:`mcuhome.buildserver.errors` — dotted code,
 authoritative ``retryable``, structured details. The two constants
 below are for the frames that never got that far, and they are the
 whole reason this module still defines any error code at all.
@@ -75,15 +75,15 @@ TYPE_EVENT = "event"
 #: before it has been buffered. The session protocol's context upload is
 #: bounded separately and by a different mechanism — a streaming ingress
 #: cap answering ``policy.ingress-limit-exceeded``
-#: (:mod:`mcuhome_buildserver.errors`) — because a limit that only fires
+#: (:mod:`mcuhome.buildserver.errors`) — because a limit that only fires
 #: after the bytes arrived is not a limit.
 #:
 #: **It lives with the envelope rather than with the endpoint** because
 #: it is announced (E57): ``capabilities`` carries it in its ``ingress``
 #: block, so that a client can size its chunks instead of discovering
 #: this bound as a dropped connection — the overrun of a frame cap is
-#: not a typed refusal and can never be one. :mod:`mcuhome_buildserver.ws`
-#: applies it to the socket; :mod:`mcuhome_buildserver.sessions`
+#: not a typed refusal and can never be one. :mod:`mcuhome.buildserver.ws`
+#: applies it to the socket; :mod:`mcuhome.buildserver.sessions`
 #: announces it, and importing the endpoint from the verbs would close
 #: an import cycle.
 MAX_FRAME_BYTES = 8 * 1024 * 1024
@@ -101,7 +101,7 @@ TYPE_LOG = "log"
 #: The frame was not understood: malformed JSON, missing fields, wrong
 #: types, a binary message on a text endpoint. Always the client's
 #: fault, and necessarily *pre*-registry: the typed codes of
-#: :mod:`mcuhome_buildserver.errors` describe a session's refusals, and
+#: :mod:`mcuhome.buildserver.errors` describe a session's refusals, and
 #: a frame that did not parse has no session and no verb to attribute
 #: the refusal to. Adding a registry code for it is a protocol decision
 #: — the layer set is fixed by the concept — so this constant stays

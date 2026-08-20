@@ -66,7 +66,7 @@ STATUS_UNSUPPORTED = "unsupported"
 STATUS_CANCELLED = "cancelled"
 
 #: The three actions contract §7 defines. Named here as well as in
-#: :mod:`mcuhome_buildserver.backend` because §5.4's mandatory-field
+#: :mod:`mcuhome.buildserver.backend` because §5.4's mandatory-field
 #: table is stated per action, and reading it needs the names beside it.
 ACTION_DESCRIBE = "describe"
 ACTION_VERIFY = "verify"
@@ -102,7 +102,7 @@ ARTIFACT_ROLES = (
 
 #: The ``reason`` values contract v1 defines (twelve, plus
 #: ``error.internal`` from the 2026-08-11 erratum). Listed so that the
-#: envelope mapping in :mod:`mcuhome_buildserver.errors` can be checked
+#: envelope mapping in :mod:`mcuhome.buildserver.errors` can be checked
 #: against the contract by a test rather than by reading; unknown values
 #: are handled as their status class and passed through verbatim, so
 #: this list is never a filter.
@@ -268,7 +268,7 @@ class InvocationOutcome:
     violation: str | None = None
     #: Declared artifacts that survived §9.3's egress check, with the
     #: hashes **re-read from disk**. Filled by
-    #: :mod:`mcuhome_buildserver.artifacts`, not here.
+    #: :mod:`mcuhome.buildserver.artifacts`, not here.
     artifacts: tuple[Artifact, ...] = field(default_factory=tuple)
 
     @property
@@ -376,7 +376,7 @@ def read_result(
 
     Condition 6 is deliberately **not** here: it is egress (§9.3), it
     needs the filesystem, and it lives in
-    :mod:`mcuhome_buildserver.artifacts`. What this function answers is
+    :mod:`mcuhome.buildserver.artifacts`. What this function answers is
     everything the document alone can settle, and the caller adds the
     sixth before calling the invocation successful.
 

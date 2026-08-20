@@ -1,10 +1,10 @@
-# mcuhome-build-server
+# mcuhome-buildserver
 
 The build service of the [MCUHome](https://github.com/mcu-home) project:
 a headless service that serves the **session build protocol**
-([mcuhome ADR 0019](https://github.com/mcu-home/mcuhome/blob/main/docs/adr/0019-session-build-protocol-and-container-contract.md)).
+([mcuhome ADR 0019](https://github.com/mcu-home/mcuhome-workbench/blob/main/docs/adr/0019-session-build-protocol-and-container-contract.md)).
 One session is one ephemeral build environment and one effective build
-context. It is the fat half of [dashboard ADR 0003](https://github.com/mcu-home/dashboard/blob/main/docs/adr/0003-two-home-assistant-apps-dashboard-never-compiles.md)'s
+context. It is the fat half of [dashboard ADR 0003](https://github.com/mcu-home/mcuhome-ui/blob/main/docs/adr/0003-two-home-assistant-apps-dashboard-never-compiles.md)'s
 two-App topology, extracted into its own repository per the remote-build
 architecture: the dashboard and the build server are separate products
 with separate release cycles, joined by one protocol.
@@ -24,7 +24,7 @@ nothing else.
 > **Operate a build server as a trusted machine.** A Matter device's
 > commissioning credentials are compile-time Kconfig, so this server
 > necessarily learns each device's passcode, discriminator and SPAKE2+
-> verifier ([dashboard ADR 0007](https://github.com/mcu-home/dashboard/blob/main/docs/adr/0007-wire-content-and-credential-exposure.md)
+> verifier ([dashboard ADR 0007](https://github.com/mcu-home/mcuhome-ui/blob/main/docs/adr/0007-wire-content-and-credential-exposure.md)
 > decision 2). It is inside the trust boundary of every device it
 > builds — exactly like the machine that holds the signing key.
 >
@@ -79,7 +79,7 @@ are what the session protocol runs on.
 ```sh
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-mcuhome-build-server
+mcuhome-buildserver
 ```
 
 Every option also has an environment variable prefixed
@@ -715,7 +715,7 @@ Session-protocol errors use a **fixed envelope** in the error frame:
 ```
 
 Codes come from the append-only registry in
-`mcuhome_buildserver/errors.py` (`policy.*`, `session.*`, `context.*`,
+`mcuhome/buildserver/errors.py` (`policy.*`, `session.*`, `context.*`,
 `version.*`, `builder.*`, `invocation.*`, `sdk.*`, `artifact.*`; `x-*`
 is reserved for third parties). A code,
 once released, is never renamed, removed or re-classified; clients treat
@@ -822,9 +822,9 @@ Any Linux machine with Docker and systemd works — bare metal, a VM, or
 a WSL instance. Install from a checkout (once):
 
 ```sh
-cd build-server &&
-python3 -m venv /opt/mcuhome-build-server &&
-/opt/mcuhome-build-server/bin/pip install \
+cd mcuhome-buildserver &&
+python3 -m venv /opt/mcuhome-buildserver &&
+/opt/mcuhome-buildserver/bin/pip install \
   "mcuhome-model @ git+https://github.com/mcu-home/mcuhome-sdk#subdirectory=packaging/model" .
 ```
 
@@ -832,7 +832,7 @@ python3 -m venv /opt/mcuhome-build-server &&
 dependency from git while nothing is published on PyPI yet; once it is,
 `pip install .` alone will do.)
 
-A systemd unit — `/etc/systemd/system/mcuhome-build-server.service`:
+A systemd unit — `/etc/systemd/system/mcuhome-buildserver.service`:
 
 ```ini
 [Unit]
@@ -843,7 +843,7 @@ Wants=network-online.target
 [Service]
 Type=exec
 Environment=MCUHOME_BUILDSERVER_TOKEN_FILE=/etc/mcuhome/build-server.token
-ExecStart=/opt/mcuhome-build-server/bin/mcuhome-build-server --no-pair-file
+ExecStart=/opt/mcuhome-buildserver/bin/mcuhome-buildserver --no-pair-file
 Restart=on-failure
 RestartSec=5
 
@@ -858,7 +858,7 @@ show` would print it:
 install -d -m 700 /etc/mcuhome
 python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > /etc/mcuhome/build-server.token
 chmod 600 /etc/mcuhome/build-server.token
-systemctl enable --now mcuhome-build-server
+systemctl enable --now mcuhome-buildserver
 ```
 
 A WSL instance's address changes with WSL's NAT; reach it from other
@@ -897,7 +897,7 @@ ruff check --fix . && ruff format .
 
 **The suite never starts a container and never compiles anything.**
 Docker is stubbed at the two impure functions of
-`mcuhome_buildserver/container.py`, by an **autouse** fixture: a test
+`mcuhome/buildserver/container.py`, by an **autouse** fixture: a test
 that forgot to ask for the stub would otherwise start a real container
 on the machine running the suite, which is the exact failure mode the
 reference implementation warns about. The fake is a *conforming
@@ -914,9 +914,9 @@ and what reaches the client while it happens.
 
 The frame envelope is kept from drifting apart from the dashboard's by
 `tests/test_protocol.py`, which compares this package's constants
-against `mcuhome_dashboard.protocol` whenever both are importable —
+against `mcuhome.ui.protocol` whenever both are importable —
 install the sibling checkout's backend (`pip install -e
-../dashboard/backend`) to run that check; it skips otherwise.
+../mcuhome-ui/backend`) to run that check; it skips otherwise.
 
 ## Layout
 

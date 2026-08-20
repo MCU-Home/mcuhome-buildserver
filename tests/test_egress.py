@@ -21,9 +21,9 @@ from pathlib import Path
 import pytest
 import zstandard
 
-from mcuhome_buildserver import artifacts
-from mcuhome_buildserver.abi import Artifact
-from mcuhome_buildserver.errors import SessionError
+from mcuhome.buildserver import artifacts
+from mcuhome.buildserver.abi import Artifact
+from mcuhome.buildserver.errors import SessionError
 
 
 def _declare(path: str, payload: bytes, role: str = "firmware") -> Artifact:

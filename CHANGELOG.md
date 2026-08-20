@@ -583,7 +583,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (ADR 0020 §4), together with a syntax check that no module in this
   package imports `mcuhome.workbench` or `mcuhome.compiler`.
 - The build server, extracted from the
-  [dashboard repository](https://github.com/mcu-home/dashboard) into its
+  [dashboard repository](https://github.com/mcu-home/mcuhome-ui) into its
   own repository per the remote-build architecture: the WebSocket
   transport with bearer-token authentication, the frame envelope, and
   same-host App pairing. Its pre-extraction history lives in the

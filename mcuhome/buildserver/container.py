@@ -7,7 +7,7 @@ composes argv, it runs it, and it says what came back; it knows nothing
 about sessions, contexts or the invocation ABI. That split is what makes
 the rest of the backend testable without a container runtime, and it is
 the same shape the workbench's own orchestrator uses
-(``mcuhome/workbench/orchestrator.py`` in mcu-home/mcuhome) — which this
+(``mcuhome/workbench/orchestrator.py`` in mcu-home/mcuhome-workbench) — which this
 server may read and, today, does not import: that module drives the same
 contract from a host, and the two are the same lifecycle written for two
 worlds (a session state machine over a socket here, one blocking drive
@@ -24,7 +24,7 @@ reference states about its own seam: a default bound at definition time
 cannot be replaced by monkeypatching the module, and a test that thinks
 it stubbed docker out but did not is a test that starts a real build.
 
-Both are one line each over :mod:`mcuhome_buildserver.processes`, which
+Both are one line each over :mod:`mcuhome.buildserver.processes`, which
 owns the child-process plumbing every profile needs — the log pump, the
 line cap, the signal-an-exited-process rule. They stay *here* as their
 own names anyway, because they are this profile's seam: a suite that
@@ -40,11 +40,11 @@ apart. The first two are one wire code here —
 down comes back — and the third is ``version.builder-unavailable``,
 which is not retryable once this server has decided it will not have
 that image: the pin is resolved against the **local** inventory, and
-when :attr:`~mcuhome_buildserver.config.Config.auto_pull` allows it
+when :attr:`~mcuhome.buildserver.config.Config.auto_pull` allows it
 (the default) a miss becomes a :meth:`Docker.pull` rather than a
 refusal. What never depends on that switch is *which* images may run at
 all — that is the allowlist
-(:mod:`mcuhome_buildserver.environments`), checked before any command
+(:mod:`mcuhome.buildserver.environments`), checked before any command
 here names the image.
 
 **Starting a container is not here any more.** The session's build
@@ -72,15 +72,15 @@ from typing import Any
 # data**: they let this server recognize a build environment before
 # paying for a container start. They are not authoritative about what the
 # program can do — ``describe`` is — which is why
-# :mod:`mcuhome_buildserver.backend` cross-checks them against it before
+# :mod:`mcuhome.buildserver.backend` cross-checks them against it before
 # relying on them. Imported rather than spelled: the names belong to the
 # contract, and the repository that publishes an environment writes
 # exactly these strings onto it, so a second copy here is how one side
 # starts looking for a label the other stopped writing.
 from mcuhome.model.buildimage import CONTRACT_LABEL, TOOLCHAIN_LABEL, ZEPHYR_LABEL
 
-from mcuhome_buildserver.errors import SessionError
-from mcuhome_buildserver.processes import (
+from mcuhome.buildserver.errors import SessionError
+from mcuhome.buildserver.processes import (
     Completed,
     LineSink,
     Process,
@@ -117,7 +117,7 @@ PROGRAM = "/mcuhome/run"
 #: is backend policy, which §11 leaves free. It exists so that an
 #: operator can find the containers of a build server that was killed
 #: outright — there is deliberately no startup sweep, for the reason
-#: :meth:`~mcuhome_buildserver.sessions.SessionManager.shutdown` gives
+#: :meth:`~mcuhome.buildserver.sessions.SessionManager.shutdown` gives
 #: about the context root: two servers sharing one host is a
 #: configuration, and a sweep would answer it by reaping the other's live
 #: sessions.
@@ -315,7 +315,7 @@ class Docker:
         decision: exactly one set of bytes answers to it, and either
         they arrive or they do not. Whether this server may run them at
         all was settled before the pull
-        (:mod:`mcuhome_buildserver.environments`).
+        (:mod:`mcuhome.buildserver.environments`).
 
         ``False`` for every failure — no runtime, no network, a registry
         that wants a login, a digest nothing answers to — because the

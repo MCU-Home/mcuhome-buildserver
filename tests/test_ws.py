@@ -16,11 +16,11 @@ from dataclasses import replace
 
 from aiohttp import WSCloseCode
 
-from mcuhome_buildserver import protocol
-from mcuhome_buildserver import ws as ws_module
-from mcuhome_buildserver.app import ServerState, create_app
-from mcuhome_buildserver.protocol import Command
-from mcuhome_buildserver.ws import OUTBOX_LIMIT, Connection
+from mcuhome.buildserver import protocol
+from mcuhome.buildserver import ws as ws_module
+from mcuhome.buildserver.app import ServerState, create_app
+from mcuhome.buildserver.protocol import Command
+from mcuhome.buildserver.ws import OUTBOX_LIMIT, Connection
 from tests.conftest import auth, call
 
 
@@ -111,7 +111,7 @@ async def test_the_verdict_frame_is_not_evicted_to_make_room_for_a_log_line() ->
 async def test_a_binary_frame_is_refused_and_the_connection_survives(client) -> None:
     """This endpoint speaks JSON text frames only.
 
-    The refusal is what keeps :data:`~mcuhome_buildserver.protocol.ERROR_BAD_REQUEST`
+    The refusal is what keeps :data:`~mcuhome.buildserver.protocol.ERROR_BAD_REQUEST`
     load-bearing: the session protocol's error registry has no code for a
     frame that never parsed, so a malformed *frame* is answered in the
     envelope's own vocabulary rather than the session layer's.

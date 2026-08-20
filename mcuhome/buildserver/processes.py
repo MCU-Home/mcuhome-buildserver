@@ -4,8 +4,8 @@
 
 Every backend of build-container contract §1.2 ends up starting a child
 process. In the ``container`` profile that child is a ``docker`` client
-(:mod:`mcuhome_buildserver.container`); in the ``subprocess`` profile it
-is the program itself (:mod:`mcuhome_buildserver.program`). What the two
+(:mod:`mcuhome.buildserver.container`); in the ``subprocess`` profile it
+is the program itself (:mod:`mcuhome.buildserver.program`). What the two
 share is *how* a child is run, and it is exactly two shapes:
 
 * :func:`run_command` runs a short command to completion and answers its
@@ -48,7 +48,7 @@ environment", which is what a ``docker`` client wants — it is this
 server's own tool and reads this server's own ``DOCKER_HOST``. The
 ``subprocess`` profile never passes ``None``: what the *program* is
 started with is composed on purpose
-(:func:`mcuhome_buildserver.program.stated_environment`), because there
+(:func:`mcuhome.buildserver.program.stated_environment`), because there
 the child is not this server's tool but a build. What neither function
 does is let a caller be vague about which of the two it meant.
 """
@@ -134,10 +134,10 @@ class Process(Protocol):
     """A command that is still running.
 
     Four operations and no more: three are what liveness policy needs
-    (:mod:`mcuhome_buildserver.backend`) — wait for the exit status, ask
+    (:mod:`mcuhome.buildserver.backend`) — wait for the exit status, ask
     politely, insist — and the fourth is what *teardown* needs, which is
     the two of them in order with a bounded wait in between. The ladder
-    in :meth:`~mcuhome_buildserver.backend.SessionBackend._supervise` is
+    in :meth:`~mcuhome.buildserver.backend.SessionBackend._supervise` is
     driven by a clock it already owns and so spells its own escalation
     out; ``release`` has no clock of its own and must not grow one, since
     what it is escalating over is a process group only this object knows

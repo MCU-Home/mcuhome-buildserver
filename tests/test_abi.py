@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from mcuhome_buildserver import abi, errors, events
+from mcuhome.buildserver import abi, errors, events
 
 # --------------------------------------------------------------------------
 # Writing a request document

@@ -72,9 +72,9 @@ from mcuhome.model.modelfile import read_model
 from ruamel.yaml import YAML, YAMLError
 from ruamel.yaml.events import AliasEvent
 
-from mcuhome_buildserver.errors import SessionError
-from mcuhome_buildserver.ingress import check_patch_layer, patch_layer_of
-from mcuhome_buildserver.protocol import ProtocolError
+from mcuhome.buildserver.errors import SessionError
+from mcuhome.buildserver.ingress import check_patch_layer, patch_layer_of
+from mcuhome.buildserver.protocol import ProtocolError
 
 __all__ = [
     "ContextPins",
@@ -92,13 +92,13 @@ __all__ = [
 
 _SESSION_ID = re.compile(r"s-[A-Za-z0-9_-]{1,64}\Z")
 
-#: The shape :mod:`mcuhome_buildserver.sessions` issues invocation ids
+#: The shape :mod:`mcuhome.buildserver.sessions` issues invocation ids
 #: in — ``inv-`` and a per-session counter. Pinned here as well as
 #: there because this is where one becomes a path segment.
 _INVOCATION_ID = re.compile(r"inv-[1-9][0-9]{0,9}\Z")
 
 #: The shape an SDK version may have — checked at the pins, because
-#: :func:`mcuhome_buildserver.sdkstore.package_filename` turns the value
+#: :func:`mcuhome.buildserver.sdkstore.package_filename` turns the value
 #: into a filename component and searches the operator's source
 #: directories for it. PEP 440 needs letters, digits, dots, plus (local
 #: versions), bang (epochs) and dashes; nothing a version can legally
@@ -128,8 +128,8 @@ def prepare_context_root(root: Path) -> Path:
 
     That is not hypothetical, because of where the default lands. With
     neither ``XDG_STATE_HOME`` nor ``HOME`` set — the systemd case
-    :func:`~mcuhome_buildserver.config.default_context_root` is written
-    for — the fallback is ``/tmp/mcuhome-build-server/sessions``, a fixed
+    :func:`~mcuhome.buildserver.config.default_context_root` is written
+    for — the fallback is ``/tmp/mcuhome-buildserver/sessions``, a fixed
     name in a directory every local user can write to. A user who creates
     it before the server starts owns it, and ``mkdir(parents=True,
     exist_ok=True)`` would have reused it without a word.
@@ -140,7 +140,7 @@ def prepare_context_root(root: Path) -> Path:
     directories they trust. Owned by this process or by root, and not
     world-writable unless it carries the sticky bit, which is exactly
     what makes ``/tmp`` itself (root-owned, ``0o1777``, sticky)
-    legitimate while ``/tmp/mcuhome-build-server`` created by a stranger
+    legitimate while ``/tmp/mcuhome-buildserver`` created by a stranger
     is not. Checking one level would miss the interesting case: a root
     this server owns is still a root a stranger can rename away if they
     own its parent.
@@ -322,7 +322,7 @@ class SessionPaths:
     def create(context_root: Path, session_id: str) -> SessionPaths:
         """Make the session's directory, named by session id.
 
-        The id is checked against the shape :class:`~mcuhome_buildserver.
+        The id is checked against the shape :class:`~mcuhome.buildserver.
         sessions.SessionManager` generates even though this server is the
         only thing that ever produces one: a path element assembled from
         an identifier is exactly the place where "it can only ever be
@@ -461,7 +461,7 @@ def parse_context_yaml(path: Path, *, expected_version: int, max_bytes: int) -> 
     The bound is a **parameter and not a constant of this module**, which
     is the same rule the other six limits follow: "the config is the
     policy", and a limit an operator cannot move is a limit they will
-    work around by other means (:mod:`mcuhome_buildserver.config`). It
+    work around by other means (:mod:`mcuhome.buildserver.config`). It
     used to be a constant here while the README advertised its value to
     operators who had no way to change it.
 
@@ -474,7 +474,7 @@ def parse_context_yaml(path: Path, *, expected_version: int, max_bytes: int) -> 
     Only ``context.yaml``'s **shape** is judged here. Whether the pins
     are true is the cross-check of build-container contract §9.1, and
     two thirds of that check cannot be made on this server yet; see
-    :func:`~mcuhome_buildserver.sessions.send_context`.
+    :func:`~mcuhome.buildserver.sessions.send_context`.
     """
     try:
         size = path.stat().st_size
@@ -664,7 +664,7 @@ def recheck_patch_policy(root: Path, allowed_layers: frozenset[str]) -> tuple[st
     The ADR's rule stated where the ADR states it — *after* the change,
     over the files actually present. It cannot fail today, because every
     path that reached the context passed the same check on its way in
-    (:func:`~mcuhome_buildserver.ingress.check_patch_layer`), and that
+    (:func:`~mcuhome.buildserver.ingress.check_patch_layer`), and that
     ingress-time check is what makes a denial leave the context
     untouched instead of half-written. Keeping this one as well is
     cheap, and it is the check that stays correct if a future way into

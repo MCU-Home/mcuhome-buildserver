@@ -8,8 +8,8 @@ import time
 
 import pytest
 
-from mcuhome_buildserver import errors, protocol, sessions
-from mcuhome_buildserver.errors import LAYERS, REGISTRY, SessionError, envelope
+from mcuhome.buildserver import errors, protocol, sessions
+from mcuhome.buildserver.errors import LAYERS, REGISTRY, SessionError, envelope
 from tests.conftest import auth, call
 
 # --------------------------------------------------------------------------
@@ -166,7 +166,7 @@ async def test_capabilities_reports_version_and_uptime_behind_the_token(client) 
     wrong place to disclose a version an attacker could match to a known
     weakness. A client that has presented the token may read them.
     """
-    from mcuhome_buildserver import __version__
+    from mcuhome.buildserver import __version__
 
     async with client.ws_connect("/ws", headers=auth()) as ws:
         frame = await call(ws, "capabilities")
@@ -190,7 +190,7 @@ async def test_the_announced_ingress_caps_come_from_the_configuration(
     """
     from dataclasses import replace
 
-    from mcuhome_buildserver.app import ServerState, create_app
+    from mcuhome.buildserver.app import ServerState, create_app
 
     lowered = replace(
         config,
@@ -220,12 +220,12 @@ async def test_the_announced_ingress_caps_come_from_the_configuration(
 def test_the_frame_bound_is_announced_from_the_one_the_endpoint_applies() -> None:
     """The announced number and the socket's ``max_msg_size`` are one value.
 
-    It moved to :mod:`~mcuhome_buildserver.protocol` for E57 — the verbs
+    It moved to :mod:`~mcuhome.buildserver.protocol` for E57 — the verbs
     announce it and the endpoint applies it, and the endpoint imports
     the verbs, so a constant living in ``ws`` could only have been
     announced by copying it.
     """
-    from mcuhome_buildserver import ws as ws_module
+    from mcuhome.buildserver import ws as ws_module
 
     assert ws_module.MAX_FRAME_BYTES is protocol.MAX_FRAME_BYTES
     assert protocol.MAX_FRAME_BYTES == 8 * 1024 * 1024
@@ -234,7 +234,7 @@ def test_the_frame_bound_is_announced_from_the_one_the_endpoint_applies() -> Non
 async def test_the_patch_policy_comes_from_the_configuration(aiohttp_client, config) -> None:
     from dataclasses import replace
 
-    from mcuhome_buildserver.app import ServerState, create_app
+    from mcuhome.buildserver.app import ServerState, create_app
 
     state = ServerState(replace(config, allowed_patch_layers=("sdk",)))
     client = await aiohttp_client(create_app(state))
@@ -246,7 +246,7 @@ async def test_the_patch_policy_comes_from_the_configuration(aiohttp_client, con
 
 
 def test_the_allow_patch_layer_option_and_its_environment_form() -> None:
-    from mcuhome_buildserver.config import load_config
+    from mcuhome.buildserver.config import load_config
 
     config = load_config(["--allow-patch-layer", "sdk"], env={})
     assert config.allowed_patch_layers == ("sdk",)
@@ -284,7 +284,7 @@ def test_the_verb_set_is_the_whole_vocabulary() -> None:
     can never reach ``build``, and without ``cancel`` a closed socket
     would be the only stop signal — which is no stop signal at all.
     """
-    from mcuhome_buildserver import ws as ws_module
+    from mcuhome.buildserver import ws as ws_module
 
     assert set(ws_module.COMMANDS) == {
         "capabilities",
@@ -529,7 +529,7 @@ def test_a_session_past_its_lease_does_not_hold_an_admission_slot() -> None:
     expired one — so four abandoned sessions blocked admission until
     somebody restarted the process, and pinned up to four times the
     per-session disk quota while they did it. The sweep runs every
-    :data:`~mcuhome_buildserver.sessions.DEFAULT_REAP_INTERVAL` seconds
+    :data:`~mcuhome.buildserver.sessions.DEFAULT_REAP_INTERVAL` seconds
     and the answer must not depend on where in that interval the
     question lands, so the count asks about the lease itself.
     """

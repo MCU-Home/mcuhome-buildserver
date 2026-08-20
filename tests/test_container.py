@@ -3,7 +3,7 @@
 """The docker plumbing: composed argv, mount order, and the pre-start refusals.
 
 Nothing here runs a container either. What it exercises is the module
-that would — :mod:`mcuhome_buildserver.container` — through the two seam
+that would — :mod:`mcuhome.buildserver.container` — through the two seam
 functions everything in it goes through, which is what makes the whole
 backend testable on a machine with no container runtime at all.
 """
@@ -15,9 +15,9 @@ from pathlib import Path
 import pytest
 from mcuhome.model.buildimage import CONTRACT_LABEL, TOOLCHAIN_LABEL, ZEPHYR_LABEL
 
-from mcuhome_buildserver import container
-from mcuhome_buildserver.container import Completed, Docker, Mount
-from mcuhome_buildserver.errors import SessionError
+from mcuhome.buildserver import container
+from mcuhome.buildserver.container import Completed, Docker, Mount
+from mcuhome.buildserver.errors import SessionError
 
 
 def _runner(answers):

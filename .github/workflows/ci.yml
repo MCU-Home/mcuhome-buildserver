@@ -14,7 +14,7 @@
 #          parsed as a URL reached a real build before anything noticed.
 #          e2e/run.py is the harness and its head comment is the reason.
 #
-# The test gate checks out two siblings, `mcu-home/mcuhome` and
+# The test gate checks out two siblings, `mcu-home/mcuhome-workbench` and
 # `mcu-home/mcuhome-sdk`: pyproject declares mcuhome-workbench, which
 # brings mcuhome-model with it, and neither is published yet — so the
 # sibling checkouts satisfy the declaration. Plain checkouts, no deploy
@@ -76,11 +76,11 @@ jobs:
           repository: mcu-home/mcuhome-sdk
           path: .deps/mcuhome-sdk
 
-      - name: Checkout mcuhome
+      - name: Checkout mcuhome-workbench
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: mcu-home/mcuhome
-          path: .deps/mcuhome
+          repository: mcu-home/mcuhome-workbench
+          path: .deps/mcuhome-workbench
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -90,7 +90,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --disable-pip-version-check ./.deps/mcuhome-sdk/packaging/model
-          python -m pip install --disable-pip-version-check ./.deps/mcuhome
+          python -m pip install --disable-pip-version-check ./.deps/mcuhome-workbench
           python -m pip install --disable-pip-version-check -e '.[dev]'
 
       - name: pytest
@@ -100,8 +100,8 @@ jobs:
   # The whole chain, once, for real.
   #
   # Four repositories meet here because a remote build needs all four:
-  # the command (mcu-home/cli), the client half of the session protocol
-  # and the signing step (mcu-home/mcuhome), the SDK package and the
+  # the command (mcu-home/mcuhome-cli), the client half of the session protocol
+  # and the signing step (mcu-home/mcuhome-workbench), the SDK package and the
   # build container (mcu-home/mcuhome-sdk), and this server. They are
   # checked out at `main` and this repository at the commit under test —
   # which is the arrangement the product owner chose over a shared
@@ -139,17 +139,17 @@ jobs:
           repository: mcu-home/mcuhome-sdk
           path: .deps/mcuhome-sdk
 
-      - name: Checkout mcuhome
+      - name: Checkout mcuhome-workbench
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: mcu-home/mcuhome
-          path: .deps/mcuhome
+          repository: mcu-home/mcuhome-workbench
+          path: .deps/mcuhome-workbench
 
-      - name: Checkout cli
+      - name: Checkout mcuhome-cli
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: mcu-home/cli
-          path: .deps/cli
+          repository: mcu-home/mcuhome-cli
+          path: .deps/mcuhome-cli
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -165,8 +165,8 @@ jobs:
           python -m pip install --disable-pip-version-check \
             -e ./.deps/mcuhome-sdk/packaging/model \
             -e ./.deps/mcuhome-sdk/packaging/compiler \
-            -e './.deps/mcuhome[remote]' \
-            -e ./.deps/cli \
+            -e './.deps/mcuhome-workbench[remote]' \
+            -e ./.deps/mcuhome-cli \
             -e .
 
       # The build container image is several gigabytes and the build

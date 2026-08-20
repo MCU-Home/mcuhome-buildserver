@@ -32,7 +32,7 @@ constants in the module that enforces them — a limit an operator cannot
 move is a limit they will work around by other means. The bound on
 ``context.yaml`` is a sixth cap that no ADR asks for, and it is here
 rather than beside its enforcement for exactly that reason: it was a
-constant in :mod:`mcuhome_buildserver.contextstore` while the README
+constant in :mod:`mcuhome.buildserver.contextstore` while the README
 advertised its value to operators who had no way to move it.
 """
 
@@ -48,9 +48,9 @@ from pathlib import Path
 
 from mcuhome.model.buildimage import IMAGE_REPOSITORY
 
-from mcuhome_buildserver.environments import repository_of
-from mcuhome_buildserver.security import DEFAULT_PAIR_FILE, read_token_file
-from mcuhome_buildserver.sessions import (
+from mcuhome.buildserver.environments import repository_of
+from mcuhome.buildserver.security import DEFAULT_PAIR_FILE, read_token_file
+from mcuhome.buildserver.sessions import (
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_MAX_OPEN_SESSIONS,
     DEFAULT_MAX_SEATS,
@@ -145,7 +145,7 @@ DEFAULT_BUILD_JOBS = 2
 #: against a cold Matter build, mean against one that is not going to
 #: end. A program that honours the advisory value stops itself and says
 #: ``error.deadline.exceeded``; one that does not gets the liveness
-#: ladder of :mod:`mcuhome_buildserver.backend`.
+#: ladder of :mod:`mcuhome.buildserver.backend`.
 DEFAULT_BUILD_DEADLINE_SECONDS = 5400
 
 #: ``limits.cancel_grace_seconds`` — how long a cooperative program has
@@ -218,7 +218,7 @@ def default_context_root(env: Mapping[str, str]) -> Path:
         base = Path(env["HOME"].strip()) / ".local" / "state"
     else:
         base = Path(tempfile.gettempdir())
-    return base / "mcuhome-build-server" / "sessions"
+    return base / "mcuhome-buildserver" / "sessions"
 
 
 @dataclass(frozen=True)
@@ -449,7 +449,7 @@ _BACKEND_OPTIONS: tuple[tuple[str, str, int, str], ...] = (
 
 #: The session lease's own numbers, same table shape and same reason.
 #: Only the idle timeout is here: the hard lease follows the build
-#: deadline (:func:`mcuhome_buildserver.sessions.ttl_for`), so it is
+#: deadline (:func:`mcuhome.buildserver.sessions.ttl_for`), so it is
 #: derived rather than configured, and a knob that could contradict the
 #: deadline is a knob that can end a build that is still running.
 #:
@@ -571,7 +571,7 @@ def _env_flag(env: Mapping[str, str], name: str) -> bool | None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="mcuhome-build-server",
+        prog="mcuhome-buildserver",
         description=(
             "Headless MCUHome build service. Drives build environments over the "
             "session protocol and is never one itself; never stores a configuration "

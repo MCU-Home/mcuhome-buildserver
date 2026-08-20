@@ -16,15 +16,15 @@ relays what the program says and reads what came back.
 
 The layering, from the outside in:
 
-* :mod:`mcuhome_buildserver.sessions` owns the verbs and the state
+* :mod:`mcuhome.buildserver.sessions` owns the verbs and the state
   machine and calls into this module through ``state.backend``;
 * this module owns the *lifecycle* — build-environment discovery, the
   session's runtime, the invocation record, the event and log relay, and
   what an invocation is worth at the end of it;
-* :mod:`mcuhome_buildserver.container` owns docker discovery,
-  :mod:`mcuhome_buildserver.abi` owns the result document's vocabulary,
-  :mod:`mcuhome_buildserver.events` owns the NDJSON stream and
-  :mod:`mcuhome_buildserver.artifacts` owns egress.
+* :mod:`mcuhome.buildserver.container` owns docker discovery,
+  :mod:`mcuhome.buildserver.abi` owns the result document's vocabulary,
+  :mod:`mcuhome.buildserver.events` owns the NDJSON stream and
+  :mod:`mcuhome.buildserver.artifacts` owns egress.
 
 **Three things the container backend deliberately does not do**, each
 because a decision took the premise away.
@@ -68,7 +68,7 @@ from mcuhome.model.context import EnvironmentPin
 from mcuhome.model.sdkindex import SDK_PACKAGE_NAME
 from mcuhome.workbench import api as workbench
 
-from mcuhome_buildserver import (
+from mcuhome.buildserver import (
     abi,
     artifacts,
     container,
@@ -77,11 +77,11 @@ from mcuhome_buildserver import (
     events,
     protocol,
 )
-from mcuhome_buildserver.abi import Artifact, TreeEntry
-from mcuhome_buildserver.config import Config
-from mcuhome_buildserver.contextstore import ContextPins, SessionPaths
-from mcuhome_buildserver.errors import SessionError
-from mcuhome_buildserver.processes import LineSink
+from mcuhome.buildserver.abi import Artifact, TreeEntry
+from mcuhome.buildserver.config import Config
+from mcuhome.buildserver.contextstore import ContextPins, SessionPaths
+from mcuhome.buildserver.errors import SessionError
+from mcuhome.buildserver.processes import LineSink
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -340,10 +340,10 @@ class InvocationRecord:
 class SessionBackend:
     """Everything one build-server process knows about running builds.
 
-    One instance per :class:`~mcuhome_buildserver.app.ServerState`. It
+    One instance per :class:`~mcuhome.buildserver.app.ServerState`. It
     holds no session state of its own beyond what a build environment
     needs — the session record stays in
-    :class:`~mcuhome_buildserver.sessions.Session` — because the two have
+    :class:`~mcuhome.buildserver.sessions.Session` — because the two have
     different lifetimes: a session exists from ``open-session``, and its
     build environment exists from the first command that needs one.
 
@@ -462,7 +462,7 @@ class SessionBackend:
         # First, and before any `docker` command names this image: every
         # gate below costs a container, so a conformance check cannot be
         # what decides whether a stranger's image may run
-        # (:mod:`mcuhome_buildserver.environments`).
+        # (:mod:`mcuhome.buildserver.environments`).
         environments.check_allowed(
             pins.build_environment.reference,
             allowed=self.config.allowed_environments,
@@ -1015,7 +1015,7 @@ class SessionBackend:
         uses that one, never ``result.context`` — and, on a failure, the
         session protocol's own error envelope, mapped from the
         program's ``reason`` through
-        :data:`~mcuhome_buildserver.errors.REASON_CODES`.
+        :data:`~mcuhome.buildserver.errors.REASON_CODES`.
 
         ``status`` is the pessimistic reading. A document that says
         ``success`` while one of §5.3's seven conditions does not hold
@@ -1339,7 +1339,7 @@ _POISONING = frozenset(
     reason for reason, code in errors.REASON_CODES.items() if code == "session.poisoned"
 )
 
-#: Mirrors of :mod:`mcuhome_buildserver.sessions`' invocation states.
+#: Mirrors of :mod:`mcuhome.buildserver.sessions`' invocation states.
 #: Spelled here rather than imported to keep the import edge one-way:
 #: the verbs call the backend, the backend never calls the verbs.
 _RUNNING = "running"
@@ -1502,7 +1502,7 @@ def _pinned(facts: container.ImageFacts) -> str:
     rather than silently building in the new bytes.
 
     The digest is the one docker paired with *this* reference's own
-    repository (:func:`~mcuhome_buildserver.container._facts_from`), so
+    repository (:func:`~mcuhome.buildserver.container._facts_from`), so
     the two halves joined here always name the same image. A digest
     borrowed from another repository the image also lives under would
     compose a reference this host cannot resolve — and on a server that

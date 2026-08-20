@@ -45,13 +45,13 @@ that a refusal leaves the accepted context untouched.
 ``lock-context`` hashes the bytes received, computes the context ID
 through ``mcuhome-model`` and writes ``manifest.yaml``. The transport
 under all three — the JSON announcement, the BINARY frames, the caps,
-the whitelist — lives in :mod:`mcuhome_buildserver.ingress`, and the
+the whitelist — lives in :mod:`mcuhome.buildserver.ingress`, and the
 directory, the pin document and the freeze in
-:mod:`mcuhome_buildserver.contextstore`.
+:mod:`mcuhome.buildserver.contextstore`.
 
 **The working path is real too, and it lives one module over.**
 ``verify`` and ``build`` re-measure the locked context, hand it to
-:mod:`mcuhome_buildserver.backend` and answer an invocation id
+:mod:`mcuhome.buildserver.backend` and answer an invocation id
 immediately; the completion arrives as an ``invocation.verdict`` event
 with the status and the artifact list (E58 gave it that name of its own,
 so that it is never confused with the program's contract §8
@@ -92,8 +92,8 @@ from typing import Any
 from mcuhome.model.context import CONTEXT_FILE
 from mcuhome.model.hashes import sha256_file
 
-from mcuhome_buildserver import __version__, artifacts, events, protocol
-from mcuhome_buildserver.contextstore import (
+from mcuhome.buildserver import __version__, artifacts, events, protocol
+from mcuhome.buildserver.contextstore import (
     ContextPins,
     SessionPaths,
     count_context_files,
@@ -102,8 +102,8 @@ from mcuhome_buildserver.contextstore import (
     recheck_locked_context,
     recheck_patch_policy,
 )
-from mcuhome_buildserver.errors import SessionError
-from mcuhome_buildserver.ingress import (
+from mcuhome.buildserver.errors import SessionError
+from mcuhome.buildserver.ingress import (
     IngressCaps,
     IngressLedger,
     Upload,
@@ -113,7 +113,7 @@ from mcuhome_buildserver.ingress import (
     type_conflict,
     unpack,
 )
-from mcuhome_buildserver.protocol import Command, ProtocolError
+from mcuhome.buildserver.protocol import Command, ProtocolError
 
 __all__ = [
     "CONTEXT_FORMAT_MAX",
@@ -198,7 +198,7 @@ def is_patch_layer_name(name: str) -> bool:
     """Whether *name* is a layer name a config may allow at all.
 
     Nameable is not the same as allowed: this says the string could be a
-    layer, while :data:`~mcuhome_buildserver.config.Config.allowed_patch_layers`
+    layer, while :data:`~mcuhome.buildserver.config.Config.allowed_patch_layers`
     says whether contexts may patch it. Keeping them apart is what lets
     a third-party ``x-`` layer be configured without this server having
     to know what it is.
@@ -1300,7 +1300,7 @@ def capabilities_payload(state: Any, containers: list[dict[str, Any]]) -> dict[s
 
     The sixth number is not one of the five. ``frame_bytes`` is the
     largest WebSocket message the endpoint accepts
-    (:data:`~mcuhome_buildserver.protocol.MAX_FRAME_BYTES`) — a bound
+    (:data:`~mcuhome.buildserver.protocol.MAX_FRAME_BYTES`) — a bound
     that lives *below* the verbs, whose overrun is a dropped connection
     rather than a typed refusal, and which therefore has to be knowable
     in advance or not at all.
@@ -1562,7 +1562,7 @@ def _signal_cancellation(session: Session, invocation_id: str) -> None:
     ``status: "cancelled"`` — which carries ``reason: null`` and
     ``error: null``, because nothing was diagnosed. SIGTERM and then
     SIGKILL stay the backend's hard path behind the cooperative one, and
-    :mod:`mcuhome_buildserver.backend` starts that ladder when it sees
+    :mod:`mcuhome.buildserver.backend` starts that ladder when it sees
     this file appear.
 
     A sentinel file rather than a signal, for the same reason the verb
@@ -1575,7 +1575,7 @@ def _signal_cancellation(session: Session, invocation_id: str) -> None:
     **It is here rather than on the backend** because both callers are
     here — the ``cancel`` verb and ``close-session``'s implicit cancel —
     and because the path is the session's own: the per-invocation
-    directory is named by :class:`~mcuhome_buildserver.contextstore.SessionPaths`,
+    directory is named by :class:`~mcuhome.buildserver.contextstore.SessionPaths`,
     which the session record already holds. Nothing about creating the
     file needs a container, and the one thing it must not do is fail:
     every caller is answering something else, and a cancel that raised
@@ -1650,7 +1650,7 @@ async def send_context(state: Any, connection: Any, command: Command) -> dict[st
     fetch against is the one the *lock* wrote. ``target.board`` and
     ``zephyr`` are compared against the pins the session was admitted on
     by the pre-invocation re-check
-    (:func:`~mcuhome_buildserver.contextstore.recheck_locked_context`):
+    (:func:`~mcuhome.buildserver.contextstore.recheck_locked_context`):
     admission carries no pins since ADR 0019's amendment took the
     manifest header away from ``open-session``, so the pins this
     ``send-context`` accepted *are* what the session was admitted on,
@@ -2701,7 +2701,7 @@ async def close_session(state: Any, connection: Any, command: Command) -> dict[s
 #: announced it (E41). The transport needs this and cannot derive it: a
 #: binary frame carries no id, so the reader has to know **before** it
 #: reads on that the command it just spawned is about to claim the next
-#: frames — see :meth:`~mcuhome_buildserver.ws.Connection.await_announcement`.
+#: frames — see :meth:`~mcuhome.buildserver.ws.Connection.await_announcement`.
 #: The set is here rather than in the transport because whether a verb
 #: takes an archive is a property of the verb.
 UPLOAD_VERBS = frozenset({"send-context", "extend-context"})

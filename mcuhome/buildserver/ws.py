@@ -6,7 +6,7 @@ This is the transport that dashboard ADR 0012 decision 3 carries
 forward from ADR 0006 while replacing the vocabulary that used to run
 over it: WebSocket plus a bearer token, this frame envelope, this
 connection handling. The verbs themselves live in
-:mod:`mcuhome_buildserver.sessions`.
+:mod:`mcuhome.buildserver.sessions`.
 
 The connection has the same shape as the dashboard's — one reader, one
 writer task, one task per in-flight command — for the same reason:
@@ -51,11 +51,11 @@ from typing import Any
 
 from aiohttp import WSCloseCode, WSMsgType, web
 
-from mcuhome_buildserver import errors, protocol, sessions
-from mcuhome_buildserver.config import DEFAULT_MAX_INFLIGHT_COMMANDS
-from mcuhome_buildserver.ingress import Upload
-from mcuhome_buildserver.protocol import MAX_FRAME_BYTES, Command, ProtocolError
-from mcuhome_buildserver.security import STATE_KEY, check_origin
+from mcuhome.buildserver import errors, protocol, sessions
+from mcuhome.buildserver.config import DEFAULT_MAX_INFLIGHT_COMMANDS
+from mcuhome.buildserver.ingress import Upload
+from mcuhome.buildserver.protocol import MAX_FRAME_BYTES, Command, ProtocolError
+from mcuhome.buildserver.security import STATE_KEY, check_origin
 
 __all__ = ["COMMANDS", "VERDICT_EVENT", "Connection", "websocket_handler"]
 
@@ -66,7 +66,7 @@ logger = logging.getLogger(__name__)
 OUTBOX_LIMIT = 1024
 
 #: How much of a download archive goes into one outbound BINARY frame.
-#: Well under :data:`~mcuhome_buildserver.protocol.MAX_FRAME_BYTES`,
+#: Well under :data:`~mcuhome.buildserver.protocol.MAX_FRAME_BYTES`,
 #: deliberately: that cap is this endpoint's own ``max_msg_size``, which
 #: this server announces and a third-party client need not match — a
 #: client with a smaller one would drop the connection rather than

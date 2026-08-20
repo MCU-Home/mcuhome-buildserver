@@ -18,8 +18,8 @@ from pathlib import Path
 import aiohttp
 import pytest
 
-from mcuhome_buildserver.config import load_config, resolve_token
-from mcuhome_buildserver.security import (
+from mcuhome.buildserver.config import load_config, resolve_token
+from mcuhome.buildserver.security import (
     DEFAULT_AUTH_FREE_ATTEMPTS,
     AuthThrottle,
     publish_pairing_token,

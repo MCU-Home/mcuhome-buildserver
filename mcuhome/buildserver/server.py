@@ -23,11 +23,11 @@ from collections.abc import Sequence
 
 from aiohttp import web
 
-from mcuhome_buildserver import __version__
-from mcuhome_buildserver.app import ServerState, create_app
-from mcuhome_buildserver.config import Config, load_config
-from mcuhome_buildserver.contextstore import UnsafeContextRoot
-from mcuhome_buildserver.security import publish_pairing_token
+from mcuhome.buildserver import __version__
+from mcuhome.buildserver.app import ServerState, create_app
+from mcuhome.buildserver.config import Config, load_config
+from mcuhome.buildserver.contextstore import UnsafeContextRoot
+from mcuhome.buildserver.security import publish_pairing_token
 
 __all__ = ["main", "run", "serve"]
 

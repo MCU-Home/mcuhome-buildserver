@@ -73,7 +73,7 @@ TOKEN_HEADER = "Authorization"
 DEFAULT_PAIR_FILE = Path("/share/mcuhome/build-server.token")
 
 #: Application key holding the server state.
-STATE_KEY: web.AppKey[Any] = web.AppKey("mcuhome_buildserver_state")
+STATE_KEY: web.AppKey[Any] = web.AppKey("mcuhome.buildserver_state")
 
 #: Paths served without a token. ``/health`` says what is running and
 #: nothing about what it holds, which is what an orchestrator's liveness

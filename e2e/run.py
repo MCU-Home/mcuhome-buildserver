@@ -107,7 +107,7 @@ def server(*, sdk_dir: Path, state: Path, log: Path, token: str):
     argv = [
         sys.executable,
         "-m",
-        "mcuhome_buildserver",
+        "mcuhome.buildserver",
         "--host",
         "127.0.0.1",
         "--port",

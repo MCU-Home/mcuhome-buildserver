@@ -19,10 +19,10 @@ from dataclasses import replace
 
 import pytest
 
-from mcuhome_buildserver import environments
-from mcuhome_buildserver.app import ServerState, create_app
-from mcuhome_buildserver.config import Config, load_config
-from mcuhome_buildserver.errors import SessionError
+from mcuhome.buildserver import environments
+from mcuhome.buildserver.app import ServerState, create_app
+from mcuhome.buildserver.config import Config, load_config
+from mcuhome.buildserver.errors import SessionError
 from tests.conftest import (
     IMAGE,
     IMAGE_DIGEST,

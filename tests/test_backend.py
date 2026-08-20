@@ -29,7 +29,7 @@ from mcuhome.model import containerpaths
 from mcuhome.model.buildimage import CONTRACT_LABEL, ZEPHYR_LABEL
 from ruamel.yaml import YAML
 
-from mcuhome_buildserver import sessions
+from mcuhome.buildserver import sessions
 from tests.conftest import (
     BUILD_REPORT,
     IMAGE,
@@ -1196,7 +1196,7 @@ async def test_the_shared_cache_is_offered_read_only_and_keyed_by_program_id(
     ``ccache_dir``, so a silently inverted ``read_only`` would have been
     a cross-tenant write nobody noticed.
     """
-    from mcuhome_buildserver.app import ServerState, create_app
+    from mcuhome.buildserver.app import ServerState, create_app
 
     # The store's per-program subdirectory is the operator's to create,
     # and it has to be there before the session starts. Nothing creates
@@ -1235,7 +1235,7 @@ async def test_a_program_id_that_is_not_a_path_segment_gets_no_cache_at_all(
     identity the program never claimed — and pointing two of them at one
     store.
     """
-    from mcuhome_buildserver.app import ServerState, create_app
+    from mcuhome.buildserver.app import ServerState, create_app
 
     docker.program["id"] = "../escape"
     state = ServerState(cached)
@@ -1448,7 +1448,7 @@ async def test_the_verdict_frame_is_sent_and_never_offered(client, config, docke
     among them, since it is a line in the events file ``attach-session``
     replays from.
     """
-    from mcuhome_buildserver.ws import Connection
+    from mcuhome.buildserver.ws import Connection
 
     offered: list[dict] = []
     sent: list[dict] = []
@@ -1552,7 +1552,7 @@ async def test_nothing_filesystem_heavy_runs_on_the_event_loop(
     stays here is the second one, at download time — the session tree is
     writable between the end of an invocation and ``get-artifact``.
     """
-    from mcuhome_buildserver import artifacts
+    from mcuhome.buildserver import artifacts
 
     threads: dict[str, threading.Thread] = {}
 
@@ -1608,8 +1608,8 @@ async def test_one_download_at_a_time_per_connection_and_never_one_spool(
     it. The announced size and hash and the delivered bytes then came
     from different archives.
     """
-    from mcuhome_buildserver import artifacts
-    from mcuhome_buildserver import sessions as session_module
+    from mcuhome.buildserver import artifacts
+    from mcuhome.buildserver import sessions as session_module
 
     spools: list[str] = []
     live = 0
@@ -1717,8 +1717,8 @@ async def test_attach_session_replays_before_it_joins_the_live_stream(
     because a race that reproduces sometimes is a test that passes
     sometimes.
     """
-    from mcuhome_buildserver.backend import SessionBackend
-    from mcuhome_buildserver.ws import Connection
+    from mcuhome.buildserver.backend import SessionBackend
+    from mcuhome.buildserver.ws import Connection
 
     timeline: list[tuple[str, object]] = []
     real_attach = SessionBackend.attach
@@ -1769,8 +1769,8 @@ def test_an_event_already_replayed_is_not_relayed_to_that_connection_again(
     delivered to it a second time — while it still reaches every other
     connection, which never saw it.
     """
-    from mcuhome_buildserver import protocol
-    from mcuhome_buildserver.backend import InvocationRecord, SessionBackend
+    from mcuhome.buildserver import protocol
+    from mcuhome.buildserver.backend import InvocationRecord, SessionBackend
 
     class Fake:
         def __init__(self) -> None:
@@ -1874,7 +1874,7 @@ async def test_the_liveness_ladder_starts_with_the_sentinel_and_then_signals(
     killing a ``docker exec`` client never has, which is exactly why the
     contract has a cooperative sentinel at all.
     """
-    from mcuhome_buildserver.app import ServerState, create_app
+    from mcuhome.buildserver.app import ServerState, create_app
 
     processes: list[FakeProcess] = []
 
@@ -1908,7 +1908,7 @@ async def test_the_deadline_is_enforced_by_this_server(aiohttp_client, config, d
     ``error.deadline.exceeded``; one that does not gets the same ladder
     a cancel gets, starting with the sentinel it agreed to poll.
     """
-    from mcuhome_buildserver.app import ServerState, create_app
+    from mcuhome.buildserver.app import ServerState, create_app
 
     processes: list[FakeProcess] = []
     docker.run_program = lambda action, request, on_line: (
@@ -1942,7 +1942,7 @@ async def test_a_client_that_ignores_sigterm_is_killed(
     """
     from mcuhome.workbench import orchestrator
 
-    from mcuhome_buildserver.app import ServerState, create_app
+    from mcuhome.buildserver.app import ServerState, create_app
 
     # The ladder is the orchestrator's since the server stopped driving
     # invocations itself, so its last rung is the one to shorten.

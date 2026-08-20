@@ -7,7 +7,7 @@
 #     pip install -r requirements-dev.txt
 #
 # This repository no longer needs a sibling checkout to run. It used to
-# install `-e ../mcuhome` and `-e ../cli`, because the build server
+# install `-e ../mcuhome-workbench` and `-e ../mcuhome-cli`, because the build server
 # spawned the `mcuhome` command as its builder and imported the library
 # for the version it was about to spawn; both went with the job
 # protocol. The build server is an orchestrator and is never itself the
@@ -27,7 +27,7 @@
 # having one. The workbench reaches it through a dynamic import for the
 # build methods that need one; nothing on this side does.
 #
-# There is deliberately no `mcuhome-dashboard` here, and no sibling
+# There is deliberately no `mcuhome-ui` here, and no sibling
 # checkout of it either: the build server depends on the build-container
 # contract and on nothing else (ADR 0017 decision 3, dashboard ADR 0012).
 # The frame envelope the two products share is pinned by the contract,
@@ -39,8 +39,8 @@
 #
 #     pip install \
 #       "mcuhome-model @ git+https://github.com/mcu-home/mcuhome-sdk#subdirectory=packaging/model" \
-#       "mcuhome-workbench @ git+https://github.com/mcu-home/mcuhome" \
+#       "mcuhome-workbench @ git+https://github.com/mcu-home/mcuhome-workbench" \
 #       -e .[dev]
 -e ../mcuhome-sdk/packaging/model
--e ../mcuhome
+-e ../mcuhome-workbench
 -e .[dev]

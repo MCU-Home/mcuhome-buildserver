@@ -17,9 +17,9 @@ from dataclasses import replace
 
 import pytest
 
-from mcuhome_buildserver import errors, sessions
-from mcuhome_buildserver.app import ServerState, create_app
-from mcuhome_buildserver.errors import SessionError
+from mcuhome.buildserver import errors, sessions
+from mcuhome.buildserver.app import ServerState, create_app
+from mcuhome.buildserver.errors import SessionError
 from tests.conftest import auth, call
 
 

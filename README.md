@@ -48,20 +48,36 @@ digest in the context it uploads. The clients that open sessions are
 session client on the caller's side of the protocol, and neither a dependency
 of this package.
 
-## Working on this repository
+## Development — how to work on this repository
 
-Python 3.13 and a container runtime are the environment. `requirements-dev.txt`
-satisfies the two MCUHome dependencies from sibling checkouts of `mcuhome-sdk`
-and `mcuhome-workbench`, and names the git URLs to install them from when this
-is the only checkout; the unit suite lives in `tests/python`. `tests/e2e/run.py`
-drives this server as a real process, against a real build environment and a real
-client, through one remote build. Continuous integration runs ruff, both
-suites, REUSE, codespell, and the file-hygiene and commit-message checks.
+This repository has its own virtual environment in `.venv/`; nothing is
+installed into the system Python or into another repository's environment.
+`bin/` holds the user-facing entry points, `scripts/` the development
+tooling: `scripts/test` and `scripts/lint` dispatch the checks — `all` runs
+every one, `list` names them, `<name>` runs one — and each check is its own
+wrapper in `scripts/test.d/` or `scripts/lint.d/`. The wrappers select
+`.venv` themselves (never activate one by hand) and are exactly what CI
+runs, one job per check.
+
+Needs Python 3.13; `requirements-dev.txt` installs it together with sibling
+checkouts of `mcuhome-sdk` (`packaging/model`) and `mcuhome-workbench`, the
+build environment this server orchestrates — see the file for the git-URL
+form when this is the only checkout. `scripts/test e2e` additionally needs a
+container runtime and the pinned build-container image.
 
 ```sh
-pip install -r requirements-dev.txt
-pytest
+python3.13 -m venv .venv && .venv/bin/pip install \
+  -r requirements-dev.txt --group dev
 ```
+
+```sh
+scripts/test all
+scripts/lint all
+```
+
+The rules that hold across every MCUHome repository — coding standards,
+commits, licensing — are in the organization's
+[contributing guide](https://github.com/mcu-home/.github/blob/main/CONTRIBUTING.md).
 
 ## Configuration
 

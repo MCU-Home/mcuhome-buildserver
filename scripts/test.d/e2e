@@ -51,4 +51,6 @@ fi
 [ $# -gt 0 ] && shift
 
 cd "$root"
+# the e2e runner shells out to the `mcuhome` CLI installed in this venv
+export PATH="$venv/bin:$PATH"
 exec "$venv/bin/python" tests/e2e/run.py --sdk-dir "$sdk_dir" "$@"

@@ -1,32 +1,31 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
 #
-# CI for the MCUHome build server. Three gates:
+# Test gate for the build server: one job per wrapper in
+# scripts/test.d/ (pytest, e2e), plus a pre-check that every wrapper has
+# a job here.
 #
-#   lint — scripts/lint (ruff check + format) and REUSE, pinned to the
-#          same versions the other MCUHome repositories use; bump them
-#          together. scripts/lint selects this job's own .venv, created
-#          first, the same as a developer does locally.
-#   test — scripts/test (pytest over the transport, the token and the
-#          session protocol), same .venv convention.
-#   e2e  — one real remote build: this server as a process, a real build
-#          container, `mcuhome device build --build-mode remote` against
-#          it, and a signed image at the end. The unit suite fakes docker
-#          — correctly, a build server is an orchestrator — and that is
-#          exactly why three lease-versus-time defects and one address
-#          parsed as a URL reached a real build before anything noticed.
-#          tests/e2e/run.py is the harness and its head comment is the reason.
-#
-# The test gate checks out two siblings, `mcu-home/mcuhome-workbench` and
-# `mcu-home/mcuhome-sdk`: pyproject declares mcuhome-workbench, which
+# test-pytest checks out two siblings, mcu-home/mcuhome-workbench and
+# mcu-home/mcuhome-sdk: pyproject declares mcuhome-workbench, which
 # brings mcuhome-model with it, and neither is published yet — so the
 # sibling checkouts satisfy the declaration. Plain checkouts, no deploy
 # key needed since the repositories went public (ADR 0024).
 #
-# All actions are pinned to commit SHAs, not tags (see dependabot.yml,
-# which keeps the pins current via its github-actions ecosystem entry).
+# test-e2e is one real remote build: this server as a process, a real
+# build container, `mcuhome device build --build-mode remote` against
+# it, and a signed image at the end. The unit suite fakes docker —
+# correctly, a build server is an orchestrator — and that is exactly why
+# three lease-versus-time defects and one address parsed as a URL
+# reached a real build before anything noticed. It needs four
+# repositories checked out (the command, the workbench, the SDK and this
+# server), a built SDK source archive, and the build-container image
+# pulled — all preparation steps that belong to CI, done here before
+# scripts/test e2e is called with the archive directory. See
+# scripts/test.d/e2e's head comment for what the wrapper itself checks.
+#
+# All actions are pinned to commit SHAs, not tags.
 
-name: CI
+name: Test
 
 on:
   push:
@@ -37,29 +36,19 @@ permissions:
   contents: read
 
 jobs:
-  lint-ruff:
-    name: Lint (ruff)
+  check-gates:
+    name: Check gates
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.13"
-
-      - name: Create .venv and install lint tools
-        run: |
-          python -m venv .venv
-          .venv/bin/pip install --disable-pip-version-check ruff==0.16.1
-
-      - name: scripts/lint
-        run: scripts/lint
-
+      - name: scripts/test check-ci
+        run: scripts/test check-ci
 
   test-pytest:
     name: Test (pytest)
+    needs: check-gates
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -90,12 +79,13 @@ jobs:
       - name: Create .venv and install
         run: |
           python -m venv .venv
+          .venv/bin/pip install --disable-pip-version-check -U pip
           .venv/bin/pip install --disable-pip-version-check ./.deps/mcuhome-sdk/packaging/model
           .venv/bin/pip install --disable-pip-version-check ./.deps/mcuhome-workbench
-          .venv/bin/pip install --disable-pip-version-check -e '.[dev]'
+          .venv/bin/pip install --disable-pip-version-check -e . --group dev
 
-      - name: scripts/test
-        run: scripts/test
+      - name: scripts/test pytest
+        run: scripts/test pytest
 
   # ------------------------------------------------------------------
   # The whole chain, once, for real.
@@ -120,7 +110,8 @@ jobs:
   # and never a writable one (README, "the cache"), so the cheap device
   # is not a nicety here.
   test-e2e:
-    name: Test (end to end)
+    name: Test (e2e)
+    needs: check-gates
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -160,10 +151,13 @@ jobs:
       # In dependency order, which pip does not need and a reader does.
       # `remote` is the extra the session-protocol client lives in
       # (aiohttp + zstandard); zstandard also builds the SDK archive
-      # below.
+      # below. This is a plain venv, not the dev-tools group: scripts/test
+      # e2e needs the four distributions installed, not the lint/test
+      # tool pins.
       - name: Install the four distributions
         run: |
-          python -m pip install --disable-pip-version-check \
+          python -m venv .venv
+          .venv/bin/pip install --disable-pip-version-check \
             -e ./.deps/mcuhome-sdk/packaging/model \
             -e ./.deps/mcuhome-sdk/packaging/compiler \
             -e './.deps/mcuhome-workbench[remote]' \
@@ -186,8 +180,8 @@ jobs:
       # two, which is the case the pin exists for.
       - name: Build the SDK source archive
         run: |
-          python -m pip install --disable-pip-version-check zstandard
-          python .deps/mcuhome-sdk/scripts/build_sdk_archive.py --output-dir dist/sdk
+          .venv/bin/pip install --disable-pip-version-check zstandard
+          .venv/bin/python .deps/mcuhome-sdk/scripts/build_sdk_archive.py --output-dir dist/sdk
 
       - name: Log in to ghcr.io
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -206,125 +200,14 @@ jobs:
       # it writes match what this pull put here.
       - name: Pull the build container
         run: |
-          reference="$(python -c '
+          reference="$(.venv/bin/python -c '
           from mcuhome.model.buildimage import IMAGE
           print(IMAGE)')"
           echo "::notice::pulling $reference"
           docker pull --quiet "$reference"
 
-      - name: One real remote build
-        run: python tests/e2e/run.py --sdk-dir dist/sdk
-
-  license-reuse:
-    name: License (reuse)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.13"
-
-      - name: Install
-        run: python -m pip install --disable-pip-version-check reuse==5.0.2
-
-      - name: reuse lint
-        run: reuse lint
-
-  spell-codespell:
-    name: Spelling (codespell)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.13"
-
-      - name: Install
-        run: python -m pip install --disable-pip-version-check codespell==2.4.3
-
-      # The ignored words are deliberate spellings, not slips: Requestor and
-      # PASE are the Matter specification's own, OT is OpenThread, rsource is
-      # Kconfig's. Generated documents and patches are skipped because their
-      # wording is not ours to correct.
-      - name: codespell
-        run: codespell --ignore-words-list=requestor,pase,ot,rsource,re-declared,re-declare,re-used,unparseable,pre-empt --skip='./.git,./frontend/node_modules,*.matter,*.zap,pnpm-lock.yaml,*.patch'
-
-  hygiene-prehooks:
-    name: Hygiene (pre-commit-hooks)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.13"
-
-      - name: Install
-        run: python -m pip install --disable-pip-version-check pre-commit-hooks==5.0.0
-
-      # The fixers rewrite and exit non-zero when they had to; in CI the tree
-      # is throwaway, so that is exactly a check. `patches/` is excluded on
-      # purpose: a context line in a unified diff is a single space, and
-      # stripping it produces a patch that no longer applies.
-      - name: Whitespace, final newline and line endings
-        run: |
-          text=$(git grep -Il '' -- . ':!patches/**' ':!*.patch' ':!*.matter' ':!*.zap')
-          trailing-whitespace-fixer $text
-          end-of-file-fixer $text
-          mixed-line-ending --fix=no $text
-
-      - name: No merge markers
-        run: check-merge-conflict $(git grep -Il '' -- .)
-
-      # --unsafe checks the syntax and not the tags: this project has its own
-      # (`!secret`, `!file`), and a loader that refuses them is not a finding.
-      - name: YAML parses
-        run: |
-          files=$(git ls-files '*.yml' '*.yaml')
-          if [ -n "$files" ]; then check-yaml --unsafe $files; fi
-
-  commits-conventional:
-    name: Commits (conventional)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.13"
-
-      - name: Install
-        run: python -m pip install --disable-pip-version-check conventional-pre-commit==4.0.0
-
-      # Merge commits carry GitHub's wording, not ours, so they are skipped.
-      - name: Every commit message states its kind
-        env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          BEFORE: ${{ github.event.before }}
-        run: |
-          if [ -n "$BASE" ]; then
-            range="$BASE..$HEAD_SHA"
-          elif [ -n "$BEFORE" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
-            range="$BEFORE..${{ github.sha }}"
-          else
-            range="HEAD~1..HEAD"
-          fi
-          status=0
-          for sha in $(git log --no-merges --format=%H "$range"); do
-            git log -1 --format=%B "$sha" > /tmp/commit-message
-            conventional-pre-commit /tmp/commit-message || { echo "  ^ $sha"; status=1; }
-          done
-          exit $status
+      # Preparation is done: scripts/test e2e itself re-checks the
+      # runtime, the image and the archive directory, and then drives
+      # tests/e2e/run.py against them.
+      - name: scripts/test e2e
+        run: scripts/test e2e "$PWD/dist/sdk"

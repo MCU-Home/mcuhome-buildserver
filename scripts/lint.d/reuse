@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# reuse lint, from this repository's own .venv. Extra arguments are
+# passed through.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+venv="$root/.venv"
+
+if [ ! -x "$venv/bin/reuse" ]; then
+  echo "lint.d/reuse: no .venv found. Create it first: python3.13 -m venv .venv && .venv/bin/pip install --group dev (see README)." >&2
+  exit 1
+fi
+
+cd "$root"
+exec "$venv/bin/reuse" lint "$@"

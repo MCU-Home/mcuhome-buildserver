@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# One real remote build against this server (tests/e2e/run.py). Unlike
+# the other wrappers this one has prerequisites the wrapper cannot
+# create for itself, so each is checked up front and reported as a
+# failure with a one-line notice — never a silent skip:
+#
+#   - a container runtime reachable as `docker`
+#   - the exact build-container image this server's own code pins
+#     (never pulled here: CI pulls it in a step before calling this
+#     wrapper; locally, pull it yourself)
+#   - an SDK archive directory (holding index.json and the SDK package),
+#     passed as this wrapper's first argument or in the
+#     MCUHOME_E2E_SDK_DIR environment variable; CI builds this directory
+#     in a step before calling this wrapper (build_sdk_archive.py)
+#
+# Everything else (siblings, the four-distribution install) is a CI
+# preparation step, not this wrapper's job — see ci-test.yml.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+venv="$root/.venv"
+
+if [ ! -x "$venv/bin/python" ]; then
+  echo "test.d/e2e: no .venv found. Create it first: python3.13 -m venv .venv && .venv/bin/pip install -e . --group dev (see README)." >&2
+  exit 1
+fi
+
+if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+  echo "test.d/e2e: no reachable container runtime. Install/start docker first." >&2
+  exit 1
+fi
+
+if ! image="$("$venv/bin/python" -c 'from mcuhome.model.buildimage import IMAGE; print(IMAGE)' 2>/dev/null)"; then
+  echo "test.d/e2e: mcuhome-model is not importable from this .venv. Install the sibling checkouts this e2e run needs (mcuhome-sdk's model and compiler, mcuhome-workbench with the remote extra, mcuhome-cli), as ci-test.yml's test-e2e job does." >&2
+  exit 1
+fi
+
+if ! docker image inspect "$image" >/dev/null 2>&1; then
+  echo "test.d/e2e: build-container image '$image' is not present locally. Pull it first (docker pull $image) — this wrapper never pulls it." >&2
+  exit 1
+fi
+
+sdk_dir="${1:-${MCUHOME_E2E_SDK_DIR:-}}"
+if [ -z "$sdk_dir" ]; then
+  echo "test.d/e2e: no SDK archive directory given. Pass it as the first argument or set MCUHOME_E2E_SDK_DIR (a directory holding index.json and the SDK package, e.g. built with mcuhome-sdk/scripts/build_sdk_archive.py)." >&2
+  exit 1
+fi
+[ $# -gt 0 ] && shift
+
+cd "$root"
+exec "$venv/bin/python" tests/e2e/run.py --sdk-dir "$sdk_dir" "$@"

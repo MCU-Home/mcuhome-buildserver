@@ -4,7 +4,14 @@
 # Development install:
 #
 #     python3 -m venv .venv && . .venv/bin/activate
-#     pip install -r requirements-dev.txt
+#     pip install -r requirements-dev.txt --group dev
+#
+# The dev tools (pytest, ruff, codespell, reuse, pre-commit-hooks) are a
+# PEP 735 dependency group ([dependency-groups] dev in pyproject.toml),
+# not something this file can express — a requirements file has no
+# --group line — so they are installed with --group dev on the command
+# line above, alongside what this file lists: the project itself and the
+# sibling checkouts a dependency group cannot express either.
 #
 # This repository no longer needs a sibling checkout to run. It used to
 # install `-e ../mcuhome-workbench` and `-e ../mcuhome-cli`, because the build server
@@ -40,7 +47,7 @@
 #     pip install \
 #       "mcuhome-model @ git+https://github.com/mcu-home/mcuhome-sdk#subdirectory=packaging/model" \
 #       "mcuhome-workbench @ git+https://github.com/mcu-home/mcuhome-workbench" \
-#       -e .[dev]
+#       -e . --group dev
 -e ../mcuhome-sdk/packaging/model
 -e ../mcuhome-workbench
--e .[dev]
+-e .

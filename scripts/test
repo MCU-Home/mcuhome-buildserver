@@ -2,18 +2,150 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
 #
-# The test gate: pytest, run from this repository's own .venv. Extra
-# arguments are passed through to pytest. See CONTRIBUTING.md
-# ("Repository layout") for the .venv/bin/scripts convention.
+# Dispatcher for one gate ("test" or "lint"). Byte-identical in every
+# MCUHome repository and between scripts/test and scripts/lint: the gate
+# name comes from this file's own name, never from an argument. Runs the
+# wrappers in scripts/<gate>.d/, one per test or linter. See
+# CONTRIBUTING.md ("Repository layout") for the .venv/bin/scripts
+# convention this depends on.
+#
+# Usage:
+#   scripts/<gate> all          run every wrapper, one line each, continue
+#                                after a failure, exit non-zero if any failed
+#   scripts/<gate> list         print the wrapper names, one per line
+#   scripts/<gate> check-ci     check that .github/workflows/ci-<gate>.yml
+#                                runs, or explicitly skips with a reason,
+#                                every wrapper
+#   scripts/<gate> <name> ...   run one wrapper, remaining args passed through
+#
+# check-ci reads the workflow file with a line-based parse (grep/sed), not
+# a YAML library: these workflows are hand-written by us in a fixed shape
+# (job ids at a known indent under "jobs:", skip declarations as a fixed
+# comment form), so a full parser would be a dependency the dispatcher
+# does not otherwise need, for a shape simple enough that grep/sed already
+# parse it unambiguously.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-venv="$root/.venv"
+gate="$(basename "${BASH_SOURCE[0]}")"
+wrapper_dir="$root/scripts/$gate.d"
+workflow="$root/.github/workflows/ci-$gate.yml"
 
-if [ ! -x "$venv/bin/python" ]; then
-  echo "scripts/test: no .venv found. Create it first: python3.13 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt (see README, \"Working on this repository\")." >&2
-  exit 1
-fi
+usage() {
+  echo "usage: scripts/$gate {all|list|check-ci|<name> [args...]}" >&2
+}
 
-cd "$root"
-exec "$venv/bin/python" -m pytest "$@"
+list_wrappers() {
+  if [ -d "$wrapper_dir" ]; then
+    find "$wrapper_dir" -maxdepth 1 -type f -perm -u+x -printf '%f\n' | LC_ALL=C sort
+  fi
+}
+
+cmd_all() {
+  local names name failed=0 count=0
+  names="$(list_wrappers)"
+  if [ -z "$names" ]; then
+    echo "scripts/$gate: no wrappers in scripts/$gate.d/."
+    return 0
+  fi
+  while IFS= read -r name; do
+    count=$((count + 1))
+    if "$wrapper_dir/$name"; then
+      echo "PASS  $gate/$name"
+    else
+      echo "FAIL  $gate/$name"
+      failed=$((failed + 1))
+    fi
+  done <<<"$names"
+  if [ "$failed" -eq 0 ]; then
+    echo "scripts/$gate all: $count wrapper(s), all passed."
+    return 0
+  fi
+  echo "scripts/$gate all: $failed of $count wrapper(s) failed." >&2
+  return 1
+}
+
+cmd_list() {
+  list_wrappers
+}
+
+cmd_check_ci() {
+  local names name job_ids job_id line key val status=0
+  names="$(list_wrappers)"
+
+  if [ ! -f "$workflow" ]; then
+    echo "scripts/$gate check-ci: $workflow does not exist." >&2
+    return 1
+  fi
+
+  # Job ids: lines at exactly two-space indent under the top-level
+  # "jobs:" key, e.g. "  lint-ruff:" -> "lint-ruff". Our workflows put
+  # "jobs:" last, so everything from there to the end of the file belongs
+  # to it.
+  job_ids="$(sed -n '/^jobs:/,$p' "$workflow" | grep -E '^  [A-Za-z0-9_-]+:' | sed -E 's/^  ([A-Za-z0-9_-]+):.*/\1/')"
+
+  # Skip declarations: a comment of the fixed form
+  #   # skip-gate: <wrapper>: <reason>
+  # anywhere in the file, one per skipped wrapper.
+  declare -A skip_reason_of=()
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    key="${line%%: *}"
+    val="${line#*: }"
+    skip_reason_of["$key"]="$val"
+  done < <(grep -E '^[[:space:]]*# skip-gate: [A-Za-z0-9_-]+: .+$' "$workflow" | sed -E 's/^[[:space:]]*# skip-gate: ([A-Za-z0-9_-]+): (.+)$/\1: \2/')
+
+  if [ -z "$names" ]; then
+    echo "scripts/$gate check-ci: no wrappers in scripts/$gate.d/."
+  fi
+
+  while IFS= read -r name; do
+    [ -z "$name" ] && continue
+    job_id="$gate-$name"
+    if printf '%s\n' "$job_ids" | grep -qxF "$job_id"; then
+      echo "ok    $name -> job $job_id"
+    elif [ -n "${skip_reason_of[$name]+x}" ]; then
+      echo "skip  $name: ${skip_reason_of[$name]}"
+    else
+      echo "FAIL  $name: no job $job_id and no skip declaration" >&2
+      status=1
+    fi
+    unset "skip_reason_of[$name]" 2>/dev/null || true
+  done <<<"$names"
+
+  for key in "${!skip_reason_of[@]}"; do
+    echo "FAIL  skip declared for '$key', which is not a wrapper in scripts/$gate.d/" >&2
+    status=1
+  done
+
+  return "$status"
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    "")
+      usage
+      exit 2
+      ;;
+    all)
+      cmd_all
+      ;;
+    list)
+      cmd_list
+      ;;
+    check-ci)
+      cmd_check_ci
+      ;;
+    *)
+      if [ -x "$wrapper_dir/$cmd" ]; then
+        shift
+        exec "$wrapper_dir/$cmd" "$@"
+      fi
+      usage
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

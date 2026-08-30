@@ -1,0 +1,126 @@
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Lint gate for the build server: one job per wrapper in
+# scripts/lint.d/, plus a pre-check that every wrapper has a job here.
+#
+# The lint tools are a PEP 735 dependency group ([dependency-groups] dev
+# in pyproject.toml), not a [project.optional-dependencies] extra: a
+# group installs standalone, without the project or its dependencies, so
+# none of these jobs need the package itself or its unpublished siblings
+# (mcu-home/mcuhome-workbench, mcu-home/mcuhome-sdk) — only the test gate
+# does.
+#
+# --group needs pip >= 25.1; each job upgrades pip in its fresh .venv
+# before using it.
+#
+# All actions are pinned to commit SHAs, not tags.
+
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check-gates:
+    name: Check gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: scripts/lint check-ci
+        run: scripts/lint check-ci
+
+  lint-ruff:
+    name: Lint (ruff)
+    needs: check-gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Create .venv and install the dev tools
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --disable-pip-version-check -U pip
+          .venv/bin/pip install --disable-pip-version-check --group dev
+
+      - name: scripts/lint ruff
+        run: scripts/lint ruff
+
+  lint-codespell:
+    name: Lint (codespell)
+    needs: check-gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Create .venv and install the dev tools
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --disable-pip-version-check -U pip
+          .venv/bin/pip install --disable-pip-version-check --group dev
+
+      - name: scripts/lint codespell
+        run: scripts/lint codespell
+
+  lint-reuse:
+    name: Lint (reuse)
+    needs: check-gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Create .venv and install the dev tools
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --disable-pip-version-check -U pip
+          .venv/bin/pip install --disable-pip-version-check --group dev
+
+      - name: scripts/lint reuse
+        run: scripts/lint reuse
+
+  lint-hygiene:
+    name: Lint (hygiene)
+    needs: check-gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Create .venv and install the dev tools
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --disable-pip-version-check -U pip
+          .venv/bin/pip install --disable-pip-version-check --group dev
+
+      - name: scripts/lint hygiene
+        run: scripts/lint hygiene

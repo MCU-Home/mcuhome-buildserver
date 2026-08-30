@@ -3,9 +3,12 @@
 #
 # CI for the MCUHome build server. Three gates:
 #
-#   lint — ruff (check + format) and REUSE, pinned to the same versions
-#          the other MCUHome repositories use; bump them together.
-#   test — pytest over the transport, the token and the session protocol.
+#   lint — scripts/lint (ruff check + format) and REUSE, pinned to the
+#          same versions the other MCUHome repositories use; bump them
+#          together. scripts/lint selects this job's own .venv, created
+#          first, the same as a developer does locally.
+#   test — scripts/test (pytest over the transport, the token and the
+#          session protocol), same .venv convention.
 #   e2e  — one real remote build: this server as a process, a real build
 #          container, `mcuhome device build --build-mode remote` against
 #          it, and a signed image at the end. The unit suite fakes docker
@@ -46,14 +49,13 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install lint tools
-        run: python -m pip install --disable-pip-version-check ruff==0.16.1
+      - name: Create .venv and install lint tools
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --disable-pip-version-check ruff==0.16.1
 
-      - name: ruff check
-        run: ruff check .
-
-      - name: ruff format --check
-        run: ruff format --check .
+      - name: scripts/lint
+        run: scripts/lint
 
 
   test-pytest:
@@ -85,14 +87,15 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install
+      - name: Create .venv and install
         run: |
-          python -m pip install --disable-pip-version-check ./.deps/mcuhome-sdk/packaging/model
-          python -m pip install --disable-pip-version-check ./.deps/mcuhome-workbench
-          python -m pip install --disable-pip-version-check -e '.[dev]'
+          python -m venv .venv
+          .venv/bin/pip install --disable-pip-version-check ./.deps/mcuhome-sdk/packaging/model
+          .venv/bin/pip install --disable-pip-version-check ./.deps/mcuhome-workbench
+          .venv/bin/pip install --disable-pip-version-check -e '.[dev]'
 
-      - name: pytest
-        run: pytest
+      - name: scripts/test
+        run: scripts/test
 
   # ------------------------------------------------------------------
   # The whole chain, once, for real.

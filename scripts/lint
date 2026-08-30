@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# The lint gate: ruff check and ruff format --check, run from this
+# repository's own .venv. Extra arguments are passed through to both.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+venv="$root/.venv"
+
+if [ ! -x "$venv/bin/python" ]; then
+  echo "scripts/lint: no .venv found. Create it first: python3.13 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt (see README, \"Working on this repository\")." >&2
+  exit 1
+fi
+
+cd "$root"
+status=0
+"$venv/bin/python" -m ruff check . "$@" || status=$?
+"$venv/bin/python" -m ruff format --check . "$@" || status=$?
+exit "$status"

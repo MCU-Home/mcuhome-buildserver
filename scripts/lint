@@ -15,7 +15,8 @@
 #   scripts/<gate> list         print the wrapper names, one per line
 #   scripts/<gate> check-ci     check that .github/workflows/ci-<gate>.yml
 #                                runs, or explicitly skips with a reason,
-#                                every wrapper
+#                                every wrapper; passes trivially if there
+#                                are no wrappers
 #   scripts/<gate> <name> ...   run one wrapper, remaining args passed through
 #
 # check-ci reads the workflow file with a line-based parse (grep/sed), not
@@ -72,6 +73,11 @@ cmd_list() {
 cmd_check_ci() {
   local names name job_ids job_id line key val status=0
   names="$(list_wrappers)"
+
+  if [ -z "$names" ] && [ ! -f "$workflow" ]; then
+    echo "scripts/$gate check-ci: no wrappers in scripts/$gate.d/, nothing to check."
+    return 0
+  fi
 
   if [ ! -f "$workflow" ]; then
     echo "scripts/$gate check-ci: $workflow does not exist." >&2

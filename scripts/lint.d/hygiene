@@ -3,10 +3,15 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Hygiene checks from the pre-commit-hooks project, from this
-# repository's own .venv: trailing whitespace, final newline and line
-# endings in check mode, merge markers, and YAML syntax. File selection
-# mirrors what the CI job checked before this wrapper existed: patches
-# and vendored/generated formats are excluded from the whitespace/newline
+# repository's own .venv: trailing whitespace, final newline, line
+# endings, merge markers, and YAML syntax. The whitespace and
+# final-newline tools have no check-only mode — they rewrite what they
+# object to in place and exit non-zero, exactly the way the pre-commit
+# hooks and the CI job before this wrapper ran them, so a failing run
+# leaves the fixes in the working tree; the wrapper names them below.
+# Line endings are only reported (--fix=no). File selection mirrors what
+# the CI job checked before this wrapper existed: patches and
+# vendored/generated formats are excluded from the whitespace/newline
 # checks because a single changed byte breaks them.
 set -euo pipefail
 
@@ -15,19 +20,28 @@ venv="$root/.venv"
 
 for tool in trailing-whitespace-fixer end-of-file-fixer mixed-line-ending check-merge-conflict check-yaml; do
   if [ ! -x "$venv/bin/$tool" ]; then
-    echo "lint.d/hygiene: no .venv found. Create it first: python3.13 -m venv .venv && .venv/bin/pip install --group dev (see README)." >&2
+    echo "lint.d/hygiene: no .venv found. Create it first — see README, \"Development — how to work on this repository\"." >&2
     exit 1
   fi
 done
 
 cd "$root"
 status=0
+dirty_before="$(git status --porcelain)"
 
 mapfile -d '' -t text_files < <(git grep -Ilz '' -- . ':!patches/**' ':!*.patch' ':!*.matter' ':!*.zap')
 if [ "${#text_files[@]}" -gt 0 ]; then
   "$venv/bin/trailing-whitespace-fixer" "${text_files[@]}" || status=$?
   "$venv/bin/end-of-file-fixer" "${text_files[@]}" || status=$?
   "$venv/bin/mixed-line-ending" --fix=no "${text_files[@]}" || status=$?
+fi
+
+# What the two fixers rewrote: everything git reports as changed now and
+# did not report before this run. The fixers already exited non-zero for
+# it, so the notice does not touch the status.
+mapfile -t rewritten < <(comm -13 <(printf '%s\n' "$dirty_before" | sort) <(git status --porcelain | sort) | cut -c4-)
+if [ "${#rewritten[@]}" -gt 0 ]; then
+  echo "lint.d/hygiene: rewrote ${rewritten[*]} — review the changes and commit them." >&2
 fi
 
 mapfile -d '' -t all_files < <(git grep -Ilz '' -- .)

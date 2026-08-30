@@ -11,7 +11,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 venv="$root/.venv"
 
 if [ ! -x "$venv/bin/codespell" ]; then
-  echo "lint.d/codespell: no .venv found. Create it first: python3.13 -m venv .venv && .venv/bin/pip install --group dev (see README)." >&2
+  echo "lint.d/codespell: no .venv found. Create it first — see README, \"Development — how to work on this repository\"." >&2
   exit 1
 fi
 

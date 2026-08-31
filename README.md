@@ -59,14 +59,14 @@ wrapper in `scripts/test.d/` or `scripts/lint.d/`. The wrappers select
 `.venv` themselves (never activate one by hand) and are exactly what CI
 runs, one job per check.
 
-Needs Python 3.13; `requirements-dev.txt` installs it together with sibling
+Needs Python ≥3.13; `requirements-dev.txt` installs it together with sibling
 checkouts of `mcuhome-sdk` (`packaging/model`) and `mcuhome-workbench`, the
 build environment this server orchestrates — see the file for the git-URL
 form when this is the only checkout. `scripts/test e2e` additionally needs a
 container runtime and the pinned build-container image.
 
 ```sh
-python3.13 -m venv .venv && .venv/bin/pip install \
+python3 -m venv .venv && .venv/bin/pip install \
   -r requirements-dev.txt --group dev
 ```
 

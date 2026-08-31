@@ -103,7 +103,6 @@ through the organization's
 - [Build environment specification](https://github.com/mcu-home/mcuhome-sdk/blob/main/docs/spec/build-environment-specification.md) — what a session runs
 - [Build context format](https://github.com/mcu-home/mcuhome-sdk/blob/main/docs/spec/build-context-format.md) — the document a client uploads
 - [Build actions](https://github.com/mcu-home/mcuhome-sdk/blob/main/docs/spec/build-actions.md) — what an invocation asks for
-- [Decision records](https://github.com/mcu-home/mcuhome-workbench/tree/main/docs/adr) — the project's architecture decisions
 - [MCUHome project overview](https://github.com/mcu-home) — the repositories and how they relate
 
 ## Contributing and support

@@ -107,9 +107,9 @@ asyncio_mode = "auto"
 
 # The ignored words are deliberate spellings, not slips: Requestor and PASE
 # are the Matter specification's own, OT is OpenThread, rsource is
-# Kconfig's. Generated documents and patches are skipped because their
-# wording is not ours to correct. Moved here from the CI command line so
-# scripts/lint.d/codespell can run the plain tool.
+# Kconfig's. Only .git is skipped: this repository holds no vendored or
+# generated formats whose wording is not ours to correct. Moved here from
+# the CI command line so scripts/lint.d/codespell can run the plain tool.
 [tool.codespell]
 ignore-words-list = "requestor,pase,ot,rsource,re-declared,re-declare,re-used,unparseable,pre-empt"
-skip = "./.git,./frontend/node_modules,*.matter,*.zap,pnpm-lock.yaml,*.patch"
+skip = "./.git"

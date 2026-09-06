@@ -183,9 +183,15 @@ async def _stop_reaper(app: web.Application) -> None:
     # The build environments first, and the directories after them. A
     # container is what a session's directory is mounted into and a
     # supervisor is what reads it, so deleting the trees first protected
-    # nothing and only delayed the exit it was standing in front of. The
-    # whole loop is bounded by ``sessions.SHUTDOWN_RELEASE_SECONDS``: a
-    # process that was told to stop is expected to be gone.
+    # nothing and only delayed the exit it was standing in front of.
+    #
+    # ``sessions.SHUTDOWN_RELEASE_SECONDS`` bounds the *waiting*: the
+    # budget is spent on joining supervisors and is shared by every
+    # session, because a process that was told to stop is expected to be
+    # gone. It does not bound the removals themselves — each session's
+    # `docker rm --force` is awaited with no timeout of its own, so a
+    # container runtime that has stopped answering delays this exit for
+    # as long as it stays unresponsive.
     #
     # A process that is killed outright still leaves the containers
     # behind, which is what the ``org.mcuhome.build-server.session``

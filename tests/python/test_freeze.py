@@ -886,7 +886,7 @@ def test_the_hard_ttl_takes_a_working_session_anyway(tmp_path) -> None:
     session.invocations["inv-1"] = sessions.INVOCATION_RUNNING
 
     assert manager.reap() == (session.id,)
-    assert manager.reaped_reason(session.id) == "lease"
+    assert session.reaped == "lease"
 
 
 def test_finishing_an_invocation_restarts_the_idle_clock(tmp_path) -> None:

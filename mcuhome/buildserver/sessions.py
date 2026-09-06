@@ -969,18 +969,6 @@ class SessionManager:
             reaped.append(session.id)
         return tuple(reaped)
 
-    def reaped_reason(self, session_id: str) -> str | None:
-        """Which half of the lease took *session_id* away, if one did.
-
-        The sweep records it on the session and the backend needs it a
-        moment later, to tell an audience why its build stopped. Kept as
-        a lookup rather than folded into :meth:`reap`'s answer so that
-        the sweep's return value stays what every caller reads it as: the
-        ids, for the log.
-        """
-        session = self._sessions.get(session_id)
-        return None if session is None else session.reaped
-
     def shutdown(self) -> None:
         """Discard every live session's directory. For process exit.
 
@@ -1751,11 +1739,11 @@ async def release_session(state: Any, session_id: str, *, wait: float | None = N
 async def release_pending(state: Any) -> tuple[str, ...]:
     """Try again for every session whose release has not finished.
 
-    The sweep's second half and the whole of the retry: sessions land on
-    this list from the reap in the same tick, from a handover admission
-    could not finish, from a lease that ran out inside a verb, and from
-    a release that ran out of ladder. Answers the ids that are still
-    pending afterwards, for the log.
+    The sweep's second half and the whole of the retry. Four things put
+    a session on this list: the reap in the same tick, a handover whose
+    drain in ``open-session`` did not finish, a lease that ran out
+    inside a verb, and a release that ran out of ladder. Answers the ids
+    that are still pending afterwards, for the log.
     """
     for session_id in state.sessions.pending_releases():
         await release_session(state, session_id)
@@ -1772,10 +1760,12 @@ async def release_every_session(state: Any) -> None:
     what has not noticed inside the budget is logged rather than waited
     for.
 
-    The directories are **not** deleted here.
-    :meth:`SessionManager.shutdown` does that, after this, for every
-    session — including one this could not release, because a stopping
-    process is the last thing that could ever name its directory.
+    A session that releases has its directory deleted with it, by
+    :func:`release_session` and in the order that holds. What is left
+    afterwards is the directory of a session that did **not** release,
+    and that one is :meth:`SessionManager.shutdown`'s: it runs after
+    this and deletes unconditionally, because a stopping process is the
+    last thing that could ever name a session directory.
     """
     deadline = time.monotonic() + SHUTDOWN_RELEASE_SECONDS
     for session_id in tuple(state.sessions.ids()):
@@ -2926,14 +2916,16 @@ async def close_session(state: Any, connection: Any, command: Command) -> dict[s
     refusal.
 
     **The retry is this server's own** and the message says so. The
-    session stays on the manager's release list and the sweep finishes
-    what this verb could not, within :data:`DEFAULT_REAP_INTERVAL`
-    seconds. That is what makes the refusal survivable, and it has to
-    be: a client cannot be relied on to ask twice — the workbench's own
-    session client forgets its session id in a ``finally`` as it closes
-    and would have nothing left to name — and a container left running
-    on a server nobody asks again is not something a client's manners
-    should decide.
+    session stays on the manager's release list and every sweep tries it
+    again until it succeeds; no promise is made about *when*, because
+    there is none to make — a sweep runs every
+    :data:`DEFAULT_REAP_INTERVAL` seconds and each attempt may spend the
+    ladder again. What is promised is that it keeps trying, and it has
+    to be this server's job: a client cannot be relied on to ask twice —
+    the workbench's own session client forgets its session id in a
+    ``finally`` as it closes and would have nothing left to name — and a
+    container left running on a server nobody asks again is not
+    something a client's manners should decide.
 
     **The client gets no result for an implicitly cancelled invocation**
     (E39), and this verb no longer promises one survives. The guarantee
@@ -2949,7 +2941,7 @@ async def close_session(state: Any, connection: Any, command: Command) -> dict[s
         raise ProtocolError(
             f'This server could not stop the build of session "{session_id}" yet and kept '
             "its files instead of deleting them underneath it. Nothing is left for you to "
-            "do: this server finishes the cleanup by itself within the minute.",
+            "do: this server keeps retrying the cleanup by itself until it succeeds.",
             code=protocol.ERROR_INTERNAL,
             frame_id=command.id,
             session_id=session_id,

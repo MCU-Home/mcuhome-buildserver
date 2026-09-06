@@ -1244,19 +1244,23 @@ class SessionBackend:
         did not come back inside the ladder — and it means the session's
         directory must stay where it is.
 
-        *reaped* is the half of the lease that ran out, and it is set by
-        the sweep alone: a session this server took away owes its
-        audience an explanation, while ``close-session`` is the client's
-        own act and process shutdown reaches nobody anyway.
+        *reaped* is why the session was taken away, and it is set for a
+        session this server took rather than one a client closed: such a
+        session owes its audience an explanation, while ``close-session``
+        is the client's own act and process shutdown reaches nobody
+        anyway.
 
-        Called from ``close-session``, from the reaper's sweep and from
-        process shutdown — the same three exits the per-session
-        directory has, because the environment and the directory are one
-        thing: in the ``container`` profile the directory *is* the
-        container's mounts, and in the ``subprocess`` profile it is the
-        working area of a child of this process. Either way, something
-        still running against a deleted tree is the one state neither
-        half can recover from.
+        **Every caller comes through**
+        :func:`~mcuhome.buildserver.sessions.release_session`, which is
+        the session layer's half of the same teardown: it raises the
+        cancel sentinel before this runs and deletes the session's
+        directory after it. The two halves are one thing done in one
+        order, because the environment and the directory are one thing:
+        in the ``container`` profile the directory *is* the container's
+        mounts, and in the ``subprocess`` profile it is the working area
+        of a child of this process. Either way, something still running
+        against a deleted tree is the one state neither half can recover
+        from.
 
         **The order is the guarantee**, and the wait is the rung that was
         missing from it. The container is removed first, because that —
@@ -1270,9 +1274,9 @@ class SessionBackend:
 
         A session that did not release keeps its runtime and its records:
         nothing here has been forgotten, so the same call can be made
-        again — by the next ``close-session``, by the sweep, or by
-        process shutdown — and it walks the same three steps against the
-        same state.
+        again — by the sweep, which retries every session on its release
+        list, or by process shutdown — and it walks the same three steps
+        against the same state.
 
         *wait* overrides the ladder for a caller that has a deadline of
         its own. Process shutdown is the one that does: it releases every
@@ -1371,24 +1375,27 @@ class SessionBackend:
                 ),
             )
 
-    async def release_all(self, *, deadline: float | None = None) -> None:
-        """Every build environment this server still holds, for shutdown.
+    async def release_all(self, *, deadline: float) -> None:
+        """Every build environment still held, after shutdown released them.
 
-        The backstop behind
-        :func:`~mcuhome.buildserver.sessions.release_every_session`: what
-        it releases is a *session*, and this is what is left if a runtime
-        outlived the session record that named it.
+        The last pass of
+        :func:`~mcuhome.buildserver.sessions.release_every_session`,
+        which releases every session this process has and therefore
+        every runtime one of them named. What is still here afterwards
+        is one of two things: the runtime of a session whose release
+        just ran out of the shutdown budget, or — if the two halves ever
+        disagree about what exists — a runtime nothing else would have
+        reached. Both get one more attempt and, failing that, a log
+        line: a container that outlives this process is one an operator
+        has to find by its label, and the id in the log is where that
+        search starts.
 
-        *deadline* is a :func:`time.monotonic` value and bounds the whole
-        loop rather than each session, because it is one budget for
-        stopping the process. A session that does not release is logged
-        and left: the process is going away, and there is nothing
-        further this side can do about a supervisor that outlived its
-        own ladder.
+        *deadline* is a :func:`time.monotonic` value: the caller's
+        remaining budget, shared by whatever is left here, and usually
+        already spent by the time this runs.
         """
         for session_id in list(self._runtimes):
-            wait = None if deadline is None else max(0.0, deadline - time.monotonic())
-            if not await self.release(session_id, wait=wait):
+            if not await self.release(session_id, wait=max(0.0, deadline - time.monotonic())):
                 logger.error("session %s was not released before shutdown", session_id)
 
 

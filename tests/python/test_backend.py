@@ -2380,10 +2380,11 @@ async def test_close_session_refuses_when_the_supervisor_outlives_the_ladder(
     minting one is a protocol decision rather than an implementation
     choice.
 
-    And the refusal leaves the session in a state a retry can finish,
-    which is the second half of the test: nothing was forgotten, so the
-    same verb sent again walks the same steps and this time gets to the
-    end of them.
+    And the refusal leaves the session in a state the **sweep** can
+    finish, which is the second half of the test: nothing was
+    forgotten, so the next tick walks the same steps and this time gets
+    to the end of them. The sweep and not a second ``close-session``,
+    because the retry cannot depend on a client sending one.
     """
     from mcuhome.buildserver import backend
     from mcuhome.buildserver.app import ServerState, create_app
@@ -2408,10 +2409,9 @@ async def test_close_session_refuses_when_the_supervisor_outlives_the_ladder(
         assert paths.root.exists(), "the tree stayed, which is the whole point of refusing"
 
         # The container is gone, so the supervisor ends on its next poll
-        # and the sweep's retry finds nothing left to wait for. It is the
-        # sweep and not a second close-session on purpose: the client
-        # that would have to send it has already thrown its session id
-        # away by the time it reads this error.
+        # and the sweep's retry finds nothing left to wait for. This is
+        # what a reaper tick does with the list, called here directly so
+        # that the test does not have to wait one out.
         waited[0] = 30.0
         assert state.sessions.pending_releases() == (session_id,)
         assert await sessions.release_pending(state) == ()

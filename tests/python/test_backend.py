@@ -33,6 +33,7 @@ from ruamel.yaml import YAML
 from mcuhome.buildserver import sessions
 from tests.python.conftest import (
     BUILD_REPORT,
+    ENVIRONMENT,
     IMAGE,
     IMAGE_DIGEST,
     IMAGE_LABELS,
@@ -2702,7 +2703,7 @@ async def test_an_image_pulled_after_the_lock_does_not_take_over_the_session(
     )
     assert newer not in started and f"{IMAGE}@sha256:{'e' * 64}" not in started
     recorded = YAML(typ="safe", pure=True).load((context / "manifest.yaml").read_text())
-    assert recorded["build_environment"] == IMAGE_REFERENCE_FORMAT3
+    assert recorded["build_environment"] == ENVIRONMENT.to_dict(url=False)
     after = len([argv for argv in docker.calls if argv[1:3] == ["image", "ls"]])
     assert after == listings, "no second selection: the choice was made at send-context"
 
@@ -2845,8 +2846,8 @@ async def test_a_rewritten_context_format_version_is_caught_too(client, config, 
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         manifest = state.sessions.require(session_id).paths.context / "manifest.yaml"
-        assert "context: 3" in manifest.read_text()
-        manifest.write_text(manifest.read_text().replace("context: 3", "context: 2"))
+        assert "context: 4" in manifest.read_text()
+        manifest.write_text(manifest.read_text().replace("context: 4", "context: 2"))
         frame = await call(ws, "verify", {"session_id": session_id}, frame_id="v")
 
     assert frame["error"]["code"] == "context.integrity-mismatch"

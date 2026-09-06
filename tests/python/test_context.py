@@ -25,15 +25,24 @@ from mcuhome.buildserver.config import Config
 from tests.python.conftest import (
     BUILD_CONTEXT_BYTES,
     CONTEXT_YAML,
+    ENVIRONMENT,
+    ENVIRONMENT_VERSION,
     IMAGE,
     IMAGE_LABELS,
     IMAGE_REFERENCE,
     IMAGE_REFERENCE_FORMAT3,
+    REMOTE_BUILDS_UNAVAILABLE,
+    TOOLS_PACKAGE,
+    TOOLS_SHA256,
+    WORKSPACE_PACKAGE,
+    WORKSPACE_SHA256,
     auth,
     base_context,
     call,
+    context_yaml,
     make_archive,
     make_archive_from,
+    refuses_to_select_an_environment,
     send_archive,
 )
 
@@ -83,10 +92,9 @@ async def test_send_context_accepts_a_base_context_and_answers_its_pins(client) 
         "format": sessions.CONTEXT_FORMAT_MAX,
     }
     assert body["pins"]["mcuhome"]["package"]["sha256"] == "a" * 64
-    # Format 3: the client pins the build environment with full reference + digest
-    assert body["pins"]["build_environment"].startswith(
-        "ghcr.io/mcu-home/build-container:zephyr-4.4.0-r10@sha256:"
-    )
+    # The client pins the build environment as two packages, echoed back
+    # verbatim.
+    assert body["pins"]["build_environment"] == ENVIRONMENT.to_dict(url=False)
     assert body["pins"]["target"] == {"board": "nrf7002dk/nrf5340/cpuapp"}
 
 
@@ -111,7 +119,7 @@ async def test_send_context_answers_the_serving_container(client) -> None:
 
     assert set(frame["payload"]) == {"session_id", "context", "pins", "container"}
     serving = frame["payload"]["container"]
-    # Format 3: the serving container is named by build_environment (reference with digest)
+    # the serving container is this server's answer, not the context's (reference with digest)
     # The server normalizes to just repository@digest, the digest is what identifies the image
     assert serving["build_environment"] == f"ghcr.io/mcu-home/build-container@sha256:{'b' * 64}"
     assert serving["contract"] == 1
@@ -923,17 +931,14 @@ def test_the_context_root_falls_back_to_state_and_then_to_the_temporary_dir() ->
     ("what", "document"),
     [
         ("duplicate keys", CONTEXT_YAML + "target:\n  board: other\n"),
-        ("an anchor", CONTEXT_YAML.replace("context: 3", "context: &c 3\nalias: *c")),
-        ("no pins at all", "context: 3\n"),
-        ("a second document", CONTEXT_YAML + "---\ncontext: 3\n"),
+        ("an anchor", CONTEXT_YAML.replace("context: 4", "context: &c 4\nalias: *c")),
+        ("no pins at all", "context: 4\n"),
+        ("a second document", CONTEXT_YAML + "---\ncontext: 4\n"),
         ("a python tag", CONTEXT_YAML + "extra: !!python/object/apply:os.system ['id']\n"),
-        ("a wrong format version", CONTEXT_YAML.replace("context: 3", "context: 9")),
+        ("a wrong format version", CONTEXT_YAML.replace("context: 4", "context: 9")),
         (
             "a build_environment that is not one",
-            CONTEXT_YAML.replace(
-                f"build_environment: {IMAGE_REFERENCE_FORMAT3}",
-                "build_environment: not-a-reference",
-            ),
+            context_yaml(build_environment="not-a-reference").decode(),
         ),
         (
             "a prefixed package hash",
@@ -1408,8 +1413,12 @@ async def test_two_uploads_cannot_run_on_one_connection_at_once(client) -> None:
         while (accepted := await ws.receive_json(timeout=15)).get("id") != "a":
             pass
 
+    # The rule itself — one upload at a time on one connection — holds
+    # either way, and it is what this test is named after.
     assert refused["type"] == "error"
     assert "already in progress on this connection" in refused["error"]["message"]
+    if refuses_to_select_an_environment(accepted):
+        pytest.skip(REMOTE_BUILDS_UNAVAILABLE)
     assert accepted["type"] == "result", accepted
 
 
@@ -1446,7 +1455,11 @@ async def test_two_context_commands_on_one_session_do_not_race(client) -> None:
         while (accepted := await ws.receive_json(timeout=15)).get("id") != "a":
             pass
 
+    # The rule itself — one context command at a time — holds either way,
+    # and it is what this test is named after.
     assert "already running in session" in refused["error"]["message"]
+    if refuses_to_select_an_environment(accepted):
+        pytest.skip(REMOTE_BUILDS_UNAVAILABLE)
     assert accepted["type"] == "result", accepted
 
 
@@ -1947,16 +1960,21 @@ def test_the_two_informational_pin_fields_may_be_empty(tmp_path) -> None:
     """
     document = tmp_path / "context.yaml"
     document.write_text(
-        "context: 3\n"
+        "context: 4\n"
         "mcuhome:\n"
         "  constraint: ''\n"
         "  version: 2.4.0\n"
         "  package: {url: '', sha256: '" + "a" * 64 + "'}\n"
-        f"build_environment: ghcr.io/mcu-home/build-container:zephyr-4.4.0-r10@sha256:{'b' * 64}\n"
+        "build_environment: {"
+        f"workspace: {{name: {WORKSPACE_PACKAGE}, version: {ENVIRONMENT_VERSION}, "
+        f"sha256: {WORKSPACE_SHA256}}}, "
+        f"tools: {{name: {TOOLS_PACKAGE}, version: {ENVIRONMENT_VERSION}, "
+        f"sha256: {TOOLS_SHA256}}}"
+        "}\n"
         "target: {board: nrf7002dk/nrf5340/cpuapp}\n",
         encoding="utf-8",
     )
-    pins = contextstore.parse_context_yaml(document, expected_version=3, max_bytes=65536)
+    pins = contextstore.parse_context_yaml(document, expected_version=4, max_bytes=65536)
     assert pins.sdk.constraint == ""
     assert pins.sdk.url == ""
     assert pins.sdk.version == "2.4.0"
@@ -1970,14 +1988,19 @@ def test_a_version_that_is_not_a_version_is_refused_at_the_pins(tmp_path) -> Non
     for hostile in ("../../../etc/x", "a/b", ".hidden", "", "x" * 80):
         document = tmp_path / "context.yaml"
         document.write_text(
-            "context: 3\n"
+            "context: 4\n"
             "mcuhome:\n"
             "  constraint: ''\n"
             f"  version: '{hostile}'\n"
             "  package: {url: '', sha256: '" + "a" * 64 + "'}\n"
-            f"build_environment: {IMAGE_REFERENCE_FORMAT3}\n"
+            "build_environment: {"
+            f"workspace: {{name: {WORKSPACE_PACKAGE}, version: {ENVIRONMENT_VERSION}, "
+            f"sha256: {WORKSPACE_SHA256}}}, "
+            f"tools: {{name: {TOOLS_PACKAGE}, version: {ENVIRONMENT_VERSION}, "
+            f"sha256: {TOOLS_SHA256}}}"
+            "}\n"
             "target: {board: nrf7002dk/nrf5340/cpuapp}\n",
             encoding="utf-8",
         )
         with pytest.raises(protocol.ProtocolError):
-            contextstore.parse_context_yaml(document, expected_version=3, max_bytes=65536)
+            contextstore.parse_context_yaml(document, expected_version=4, max_bytes=65536)

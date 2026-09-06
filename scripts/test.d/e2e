@@ -2,7 +2,17 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
 #
-# One real remote build against this server (tests/e2e/run.py). Unlike
+# One real remote session against this server (tests/e2e/run.py).
+#
+# What it asserts today is the server's REFUSAL, not a firmware: remote
+# builds are unavailable while this server does not run package-built
+# build environments (see the README's status section). The mechanics and
+# the prerequisites below are unchanged on purpose — the process, the
+# socket, the SDK archive, the container runtime are all still exercised
+# for real — so that the switchover flips one expectation back and this
+# wrapper does not have to be rebuilt from memory.
+#
+# Unlike
 # the other wrappers this one has prerequisites the wrapper cannot
 # create for itself, so each is checked up front and reported as a
 # failure with a one-line notice — never a silent skip:

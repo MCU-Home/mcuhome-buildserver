@@ -64,7 +64,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from mcuhome.model.context import EnvironmentPin
 from mcuhome.model.sdkindex import SDK_PACKAGE_NAME
 from mcuhome.workbench import api as workbench
 
@@ -466,80 +465,52 @@ class SessionBackend:
     async def resolve_image(
         self, pins: ContextPins, context: Path, *, on_progress: LineSink | None = None
     ) -> ImageProfile:
-        """The image the context pins, found or fetched, described and gated.
+        """Which image serves this session — **unanswerable on this server today.**
 
-        Called from ``send-context``, which is where ADR 0019's
-        amendment puts container discovery: "``send-context`` answers
-        what the context determines — the serving build container's
-        contract version and its command set", because only with the
-        pins in hand does the backend know *which* container serves the
-        session.
+        Called from ``send-context``, which is where container discovery
+        belongs: only with the pins in hand does the backend know which
+        container serves the session.
 
-        **The client chose; this server finds, fetches or refuses.** The
-        context names one image, pinned to a digest, and it is hashed
-        into the context's identity — so an image "of the same line" is
-        not a substitute for it, and there is nothing here to select.
-        What there is, is the question of whether this host already has
-        those bytes: with fetching allowed (the default) a miss is a
-        pull, because a digest names exactly one set of bytes and
-        fetching them decides nothing. What *is* a decision — may this
-        server run images from that repository at all — was settled
-        before the first ``docker`` command, and independently of the
-        switch.
+        Under context format 3 there was nothing to select — the context
+        named one image, pinned to a digest, and this server found those
+        bytes or refused. Format 4 removed that: a context pins the build
+        environment's **packages**, and an image that declares them is one
+        delivery of the set. Finding that image is
+        :func:`mcuhome.workbench.resolve_image.image_for_packages`, and
+        two things this server does not have stand between it and a build:
 
-        Four gates, in the order that makes each one's refusal legible:
-        the repository is allowed; the runtime is there; this host has
-        the pinned image, or can get it; ``describe`` answers, answers
-        conformingly, and says something this server can actually drive.
+        * **It cannot resolve the set.** The tools entry of a context is
+          ordinarily the *family* — that is what lets one context build on
+          hosts of two architectures — and an image declares the concrete
+          package of the platform it was assembled for. Turning one into
+          the other needs a verified package index, and this server has no
+          registry client: it never needed one, because a digest answered
+          itself.
+        * **It could not run what it found.** This server invokes
+          ``/mcuhome/run`` (:data:`~mcuhome.buildserver.container.PROGRAM`)
+          and gates the image on what ``describe`` answers. The image that
+          carries the ``packages.`` labels carries no such program — it
+          carries the entry point the build environment specification
+          fixes, which is a different invocation entirely.
 
-        *on_progress* receives the pull's own output line by line. A
-        fetch is minutes long and a client that asked for a session is
-        entitled to see why it is waiting.
+        Both are the switchover's work, and both are outside what a
+        context-format change can settle. So this is a typed refusal that
+        names the gap rather than a selection made on a guess: a server
+        that quietly ran *some* image would attribute firmware to a
+        context that does not describe it, which is the one thing the pin
+        exists to prevent.
         """
-        del context  # a digest answers itself; nothing is read off the bytes
-        # First, and before any `docker` command names this image: every
-        # gate below costs a container, so a conformance check cannot be
-        # what decides whether a stranger's image may run
-        # (:mod:`mcuhome.buildserver.environments`).
-        environments.check_allowed(
-            pins.build_environment.reference,
-            allowed=self.config.allowed_environments,
-            what="the context",
-        )
-        await self.docker.require_runtime()
-        facts = await self._present(pins.build_environment, on_progress=on_progress)
-        # And again on what the digest actually found. An image is
-        # matched by digest alone, so a context may name a listed
-        # repository while its pin belongs to an image from somewhere
-        # else entirely — checking only the client's spelling would be
-        # checking a string the client chose.
-        environments.check_allowed(
-            facts.reference,
-            allowed=self.config.allowed_environments,
-            what="the image its digest found",
-        )
-        # Memoized per image, because `describe` costs a container start
-        # and its answer is a property of the image — so the key has to
-        # name bytes, or the memo starts answering for an image that no
-        # longer exists. The repo digest does; the local image ID does
-        # too, and is what an image that was never pushed has instead
-        # (docker's `Id`, content-addressed and new on every rebuild).
-        # The reference is last and is a tag, which names bytes only
-        # until somebody rebuilds it — kept solely so that an inspect
-        # answer without either id is memoized under *something* rather
-        # than crashing, which is a defensive branch and not a case.
-        key = facts.digest or facts.image_id or facts.reference
-        cached = self._images.get(key)
-        if cached is not None:
-            return cached
-        profile = await self._describe(facts)
-        self._images[key] = profile
-        return profile
+        del context, on_progress  # nothing is read off either until the gap closes
+        raise _no_image_for_a_package_set(pins)
 
     async def _present(
-        self, pin: EnvironmentPin, *, on_progress: LineSink | None
+        self, reference: str, *, on_progress: LineSink | None
     ) -> container.ImageFacts:
-        """The pinned image, on this host — fetched first if it is not.
+        """One image, on this host — fetched first if it is not.
+
+        *reference* names exact bytes: ``repository@sha256:…`` or a
+        reference carrying that digest. Whoever decided which image this
+        is passes it in; this only gets it here.
 
         The inventory is asked twice on the fetching path, and the
         second answer is the one that counts: a pull that reports
@@ -548,19 +519,22 @@ class SessionBackend:
         out and which would otherwise become a confusing failure two
         gates later.
         """
+        digest = environments.digest_of(reference)
         inventory = await self.docker.inventory()
-        found = _pinned_image_in(inventory, pin=pin)
+        found = _pinned_image_in(inventory, digest=digest)
         if found is not None:
             return found
         if not self.config.auto_pull:
-            raise _no_such_environment(inventory, pin=pin, fetched=False)
-        logger.info("fetching build environment %s", pin.reference)
+            raise _no_such_environment(inventory, reference=reference, fetched=False)
+        logger.info("fetching build environment %s", reference)
         pulled = await self.docker.pull(
-            pin.reference, on_line=on_progress if on_progress is not None else lambda _line: None
+            reference, on_line=on_progress if on_progress is not None else lambda _line: None
         )
-        found = _pinned_image_in(await self.docker.inventory(), pin=pin) if pulled else None
+        found = _pinned_image_in(await self.docker.inventory(), digest=digest) if pulled else None
         if found is None:
-            raise _no_such_environment(await self.docker.inventory(), pin=pin, fetched=True)
+            raise _no_such_environment(
+                await self.docker.inventory(), reference=reference, fetched=True
+            )
         return found
 
     async def _describe(self, facts: container.ImageFacts) -> ImageProfile:
@@ -686,7 +660,12 @@ class SessionBackend:
         profile = session.image
         assert isinstance(profile, ImageProfile)  # noqa: S101 - resolve_image's own type
         await self.docker.require_runtime()
-        pin = session.pins.build_environment
+        # Off the **profile** and not off the pins: a context pins a
+        # package set, and which delivery of it this session was answered
+        # with is what `resolve_image` decided and what has to still be
+        # here.
+        reference = profile.facts.reference
+        digest = profile.facts.digest or profile.facts.image_id or ""
         # Asked about **this** image and not about the inventory: the
         # choice was made at `send-context` and re-listing what this host
         # has would be the shape of making it again. A targeted inspect
@@ -697,16 +676,16 @@ class SessionBackend:
         # it reports back are the names it *has* — repo tags and repo
         # digests — and a pin carrying both is neither of them, so an
         # inspect by it comes back matching nothing.
-        if await self.docker.image(environments.digest_reference(pin.reference)) is not None:
+        if await self.docker.image(environments.digest_reference(reference)) is not None:
             return profile
         raise SessionError(
             "version.builder-unavailable",
-            f"The build environment {pin.reference} is no longer on this host. This "
-            "session was opened against it and its manifest names it, so another image "
-            "of the same line is not a substitute: the firmware would be attributed to "
-            "a context that does not describe it.",
-            environment=pin.reference,
-            digest=pin.digest,
+            f"The build environment {reference} is no longer on this host. This "
+            "session was opened against it, so another image of the same line is not a "
+            "substitute: the firmware would be attributed to a context that does not "
+            "describe it.",
+            environment=reference,
+            digest=digest,
         )
 
     async def ensure_runtime(
@@ -1546,8 +1525,27 @@ def _wire_status(outcome: abi.InvocationOutcome) -> str:
     return abi.STATUS_FAILURE
 
 
+def _no_image_for_a_package_set(pins: ContextPins) -> SessionError:
+    """This server cannot yet say which image delivers a pinned package set.
+
+    An operator reading this has done nothing wrong and can change
+    nothing: it is a stage of the build environment's switchover, and the
+    message says so rather than offering a setting to turn.
+    """
+    return SessionError(
+        "version.builder-unsatisfiable",
+        "Remote builds are unavailable on this server: it does not run "
+        "package-built build environments yet, and this build context asks for one "
+        f"({pins.build_environment.described()}). Build locally in the meantime — "
+        "`mcuhome device build` without a build server does the same work on your "
+        "own machine.",
+        required=pins.build_environment.described(),
+        available=[],
+    )
+
+
 def _pinned_image_in(
-    inventory: tuple[container.ImageFacts, ...], *, pin: EnvironmentPin
+    inventory: tuple[container.ImageFacts, ...], *, digest: str
 ) -> container.ImageFacts | None:
     """The image this context is pinned to, out of what this host has.
 
@@ -1570,13 +1568,13 @@ def _pinned_image_in(
     answer and a server that acts on it are looking at one list.
     """
     for facts in inventory:
-        if pin.digest in (facts.digest, facts.image_id):
+        if digest and digest in (facts.digest, facts.image_id):
             return facts
     return None
 
 
 def _no_such_environment(
-    inventory: tuple[container.ImageFacts, ...], *, pin: EnvironmentPin, fetched: bool
+    inventory: tuple[container.ImageFacts, ...], *, reference: str, fetched: bool
 ) -> SessionError:
     """This server will not be building that context, and why.
 
@@ -1598,18 +1596,18 @@ def _no_such_environment(
     if not fetched:
         return SessionError(
             "version.builder-unsatisfiable",
-            f"This server does not have the build environment {pin.reference}, and it "
+            f"This server does not have the build environment {reference}, and it "
             "does not fetch. Its build environments are placed by its operator, so a "
             "context naming one it does not have cannot build here.",
-            required=pin.reference,
+            required=reference,
             available=offered,
         )
     return SessionError(
         "version.builder-unfetchable",
-        f"This server could not fetch the build environment {pin.reference}. The pull "
+        f"This server could not fetch the build environment {reference}. The pull "
         "output above says why; the usual reasons are no network, a registry that wants "
         "a login, and a digest nothing answers to.",
-        required=pin.reference,
+        required=reference,
         available=offered,
     )
 

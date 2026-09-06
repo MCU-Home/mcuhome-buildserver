@@ -165,15 +165,20 @@ SESSION_PROTOCOL_VERSION = 2
 #: reason as the model version range: accepting an older format later is
 #: a change here, not a protocol change.
 #:
-#: Both moved to 2 with E61, and the minimum moved with the maximum
-#: rather than staying behind: format 1 pinned a container digest and
-#: hashed it, nothing is published, and a server that still accepted a
-#: format-1 context would have to carry that hashing rule — and the
-#: pin-shaped `container` block it needs — for documents no client
-#: writes. `mcuhome-model` dropped the format outright, so accepting it
-#: here is not even possible any more.
-CONTEXT_FORMAT_MIN = 3
-CONTEXT_FORMAT_MAX = 3
+#: The minimum has always moved with the maximum rather than staying
+#: behind, and for the same reason each time: nothing is published, no
+#: client writes an older format, and a server that still accepted one
+#: would have to carry that format's hashing rule — and the block it
+#: hashes — for documents nobody sends. `mcuhome-model` drops the older
+#: format outright, so accepting it here is not even possible.
+#:
+#: Both are 4 since the build environment became a package set: a format-3
+#: context pinned one container image by digest, a format-4 context pins
+#: the environment's packages, and the context ID is computed over
+#: different inputs. A reader of one would get the other wrong, which is
+#: precisely when the number moves.
+CONTEXT_FORMAT_MIN = 4
+CONTEXT_FORMAT_MAX = 4
 
 #: The session profiles. The profile drives admission, TTL, idle
 #: timeout and the per-profile resource budget; commands outside the

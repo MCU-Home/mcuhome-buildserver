@@ -28,6 +28,7 @@ from mcuhome.buildserver.app import ServerState, create_app
 from tests.python.conftest import (
     IMAGE_DIGEST,
     IMAGE_REFERENCE_FORMAT3,
+    REMOTE_BUILDS_UNAVAILABLE,
     auth,
     collect,
     context_yaml,
@@ -168,6 +169,7 @@ async def test_nothing_from_a_context_is_ever_run_directly(hostile, config, dock
     assert verbs <= {"version", "image", "run", "exec", "rm", "pull"}
 
 
+@pytest.mark.skip(reason=REMOTE_BUILDS_UNAVAILABLE)
 async def test_the_image_a_context_names_still_has_to_pass_the_allowlist(
     client, config, docker
 ) -> None:

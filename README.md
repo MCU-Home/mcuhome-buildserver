@@ -5,6 +5,26 @@ on a machine other than the one asking for it. It is the remote half of the
 build path: it serves the session protocol and drives build environments
 without ever being one.
 
+## Status: remote builds are unavailable
+
+This server selects the container it builds in by the image a build context
+names. A build context now names its build environment as **packages**
+instead — the workspace and the tools package, each pinned by name, version
+and content hash — and an image that delivers those packages is one delivery
+of the set rather than the set itself.
+
+Until this server runs package-built build environments, it answers
+`send-context` with a typed refusal (`version.builder-unsatisfiable`) and no
+remote build starts. Build locally in the meantime: `mcuhome device build`
+without a build server does the same work on your own machine.
+
+Everything up to that point works and is tested — the session protocol, the
+context store, and the freeze that computes the context ID from the packages a
+context pins. The operator policy that selects an image (`allowed_environments`,
+`auto_pull`) is inert for as long as no image is selected. The tests of a
+finished remote build are kept and skipped with one reason, so the suite says
+out loud what is still owed.
+
 ## What this repository holds
 
 - The session protocol: one WebSocket endpoint, a frame envelope, and eleven

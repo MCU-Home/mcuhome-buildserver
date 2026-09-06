@@ -64,7 +64,6 @@ from mcuhome.model.context import (
     EnvironmentPin,
     SdkPin,
     context_id,
-    environment_digest,
 )
 from mcuhome.model.errors import BuildError
 from mcuhome.model.hashes import sha256_file
@@ -371,8 +370,12 @@ class ContextPins:
 
     context_version: int
     sdk: SdkPin
-    #: The image this context is compiled in, pinned to a digest. A
-    #: **decision**, not a requirement — see the class docstring.
+    #: The **packages** this context is compiled in: the workspace and the
+    #: tools package, each a ``(name, version, sha256)`` triple. A
+    #: decision, not a requirement — see the class docstring. Which
+    #: *delivery* of that set this host runs is this server's to find
+    #: (:meth:`~mcuhome.buildserver.backend.Backend.resolve_image`); the
+    #: set itself is not.
     build_environment: EnvironmentPin
     board: str
     #: What ``context.yaml`` said, kept only to be able to say what was
@@ -394,7 +397,7 @@ class ContextPins:
                 "version": self.sdk.version,
                 "package": {"url": self.sdk.url, "sha256": self.sdk.sha256},
             },
-            "build_environment": self.build_environment.reference,
+            "build_environment": self.build_environment.to_dict(url=False),
             "target": {"board": self.board},
         }
 
@@ -411,6 +414,33 @@ def _malformed(problem: str) -> ProtocolError:
     client contradicting itself, and no registered code says that.
     """
     return ProtocolError(f"The context.yaml in this context is not usable: {problem}.")
+
+
+def _environment(data: dict[str, Any]) -> EnvironmentPin:
+    """``build_environment`` as the two package pins the format defines.
+
+    Read through the shared vocabulary
+    (:meth:`~mcuhome.model.context.EnvironmentPin.from_dict`), which
+    answers what the *shape* of the block is: two entries, each a block
+    of fields. What each member may look like is
+    :func:`_check_pin_spelling`'s, a line later and by the same borrowing
+    argument it has always used — checking it twice would put a second
+    guard in front of the one that decides, and only one of them could
+    ever be the reason a document was refused.
+
+    The refusals are turned into this module's own malformed-document
+    answer, because from a client's side that is what they are: the
+    frame it sent is not the document the format describes.
+    """
+    try:
+        pin = EnvironmentPin.from_dict(data["build_environment"])
+    except KeyError as missing:
+        raise _malformed(f"it states no {missing.args[0]} for the build environment") from missing
+    except (AttributeError, TypeError) as broken:
+        raise _malformed(f"its build_environment is not a package set ({broken})") from broken
+    except BuildError as broken:
+        raise _malformed(str(broken).rstrip(".")) from broken
+    return pin
 
 
 def _string(data: dict[str, Any], *keys: str) -> str:
@@ -529,7 +559,7 @@ def parse_context_yaml(path: Path, *, expected_version: int, max_bytes: int) -> 
             url=_informational(data, "mcuhome", "package", "url"),
             sha256=_string(data, "mcuhome", "package", "sha256"),
         ),
-        build_environment=EnvironmentPin(reference=_string(data, "build_environment")),
+        build_environment=_environment(data),
         board=_string(data, "target", "board"),
         created=created if isinstance(created, str) else None,
     )
@@ -560,14 +590,17 @@ def _check_pin_spelling(pins: ContextPins) -> None:
     and this is not it.
 
     The build environment is checked by the same borrowing argument and
-    for a stronger reason than the Zephyr line it replaced: it *is* a
-    §3.3.1 value now — its digest is hashed — so a reference that names
-    no digest is not a pin at all and no ID may be computed from it.
+    for a stronger reason than the Zephyr line it replaced: all six of
+    its members are hashed, so an entry spelled any other way is not a
+    pin at all and no ID may be computed from it. ``context_id``
+    validates both entries before it hashes anything, which is why this
+    one call is the whole check and :func:`_environment` does not repeat
+    it.
     """
     try:
         context_id(
             sdk_sha256=pins.sdk.sha256,
-            environment_digest=environment_digest(pins.build_environment.reference),
+            environment=pins.build_environment,
             board=pins.board,
             files=(),
         )
@@ -742,7 +775,7 @@ def freeze_context(
     files = collect_context_files(context)
     identity = context_id(
         sdk_sha256=pins.sdk.sha256,
-        environment_digest=pins.build_environment.digest,
+        environment=pins.build_environment,
         board=pins.board,
         files=files,
     )
@@ -779,7 +812,7 @@ def recheck_locked_context(paths: SessionPaths, pins: ContextPins, *, expected_i
     itself, so what this catches is a manifest that changed *after* it
     was written — which is exactly the gap the duty names.
 
-    Under context format 3 the compared values are ``context``,
+    The compared values are ``context``,
     ``build_environment``, ``mcuhome.package.sha256`` and
     ``target.board`` — the three pins a client sent plus the format
     number. Every one of them but ``context`` is now hashed into the id,
@@ -886,10 +919,14 @@ def _pin_disagreements(recorded: ContextManifest, pins: ContextPins) -> list[str
         name
         for name, expected, found in (
             ("context", pins.context_version, recorded.context_version),
+            # The whole set and not its one-line rendering: ``described()``
+            # is name and version, and the hashes are what the identity is
+            # built on — a rewritten hash has to be *named* here, or the
+            # refusal says only that the id moved.
             (
                 "build_environment",
-                pins.build_environment.reference,
-                recorded.build_environment.reference,
+                pins.build_environment.to_dict(url=False),
+                recorded.build_environment.to_dict(url=False),
             ),
             ("mcuhome.package.sha256", pins.sdk.sha256, recorded.sdk.sha256),
             ("target.board", pins.board, recorded.board),

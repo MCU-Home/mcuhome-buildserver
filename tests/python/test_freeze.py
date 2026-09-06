@@ -33,10 +33,11 @@ from mcuhome.buildserver.errors import SessionError
 from tests.python.conftest import (
     BUILD_CONTEXT_BYTES,
     CONTEXT_YAML,
-    IMAGE,
-    IMAGE_DIGEST,
-    IMAGE_LABELS,
-    IMAGE_REFERENCE_FORMAT3,
+    ENVIRONMENT,
+    TOOLS_PACKAGE,
+    TOOLS_SHA256,
+    WORKSPACE_PACKAGE,
+    WORKSPACE_SHA256,
     ZEPHYR_LINE,
     auth,
     base_context,
@@ -107,7 +108,7 @@ async def test_the_id_is_the_models_rule_over_the_bytes_received(client) -> None
     }
     expected = context_id(
         sdk_sha256=SDK_SHA256,
-        environment_digest=IMAGE_DIGEST,
+        environment=ENVIRONMENT,
         board=BOARD,
         files=[
             ContextFile(path=path, sha256=hashlib.sha256(data).hexdigest())
@@ -161,9 +162,7 @@ async def test_an_empty_context_has_an_identity_and_may_be_locked(client) -> Non
     client sends looks like this — and the rule under test is the
     server's, which is why it is worth being able to state it at all.
     """
-    expected = context_id(
-        sdk_sha256=SDK_SHA256, environment_digest=IMAGE_DIGEST, board=BOARD, files=()
-    )
+    expected = context_id(sdk_sha256=SDK_SHA256, environment=ENVIRONMENT, board=BOARD, files=())
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         frame = await send_and_lock(
@@ -174,7 +173,7 @@ async def test_an_empty_context_has_an_identity_and_may_be_locked(client) -> Non
 
 
 async def test_two_contexts_differing_only_in_their_environment_get_two_identities(
-    client, docker
+    client,
 ) -> None:
     """What replaced the model-versus-context cross-check, and why it is better.
 
@@ -191,27 +190,16 @@ async def test_two_contexts_differing_only_in_their_environment_get_two_identiti
     is that property, measured on this server: the same bytes, one pin
     changed, two identities.
     """
-    other_digest = "sha256:" + "d" * 64
-    other = IMAGE_REFERENCE_FORMAT3.replace(IMAGE_DIGEST, other_digest)
-    # A second conforming environment on this host, so that both pins can
-    # actually be served and the only difference left is the digest.
-    second = f"{IMAGE}:zephyr-4.4.0-r11"
-    docker.images[second] = {
-        "Id": "sha256:" + "7" * 64,
-        "RepoTags": [second],
-        "RepoDigests": [f"{IMAGE}@{other_digest}"],
-        "Config": {"Labels": dict(IMAGE_LABELS)},
-    }
-    docker.listed = [*docker.listed, second]
+    other_tools_sha256 = "d" * 64
 
     identities = []
-    for pin in (IMAGE_REFERENCE_FORMAT3, other):
+    for tools_sha256 in (TOOLS_SHA256, other_tools_sha256):
         async with client.ws_connect("/ws", headers=auth()) as ws:
             session_id = await open_session(ws)
             frame = await send_and_lock(
                 ws,
                 session_id,
-                base_context(**{"context.yaml": context_yaml(build_environment=pin)}),
+                base_context(**{"context.yaml": context_yaml(tools_sha256=tools_sha256)}),
             )
             identities.append(frame)
 
@@ -276,9 +264,10 @@ async def test_the_manifest_repeats_the_pins_and_adds_the_list_and_the_id(client
         "id",
     }
     assert manifest["context"] == sessions.CONTEXT_FORMAT_MAX
-    # Verbatim from context.yaml, digest included: this server chose none
-    # of it and may not, because the digest is a hashed identity input.
-    assert manifest["build_environment"] == IMAGE_REFERENCE_FORMAT3
+    # Verbatim from context.yaml, hashes included: this server chose none
+    # of it and may not, because both package hashes are hashed identity
+    # inputs.
+    assert manifest["build_environment"] == ENVIRONMENT.to_dict(url=False)
     assert manifest["mcuhome"]["constraint"] == "^2.3.6"
     assert manifest["target"] == {"board": BOARD}
     assert manifest["id"] == frame["payload"]["context_id"]
@@ -320,7 +309,12 @@ async def test_no_hash_in_the_manifest_is_wrapped_across_two_lines(client, state
 
     assert paths is not None
     text = (paths.context / "manifest.yaml").read_text(encoding="utf-8")
-    assert f"build_environment: {IMAGE_REFERENCE_FORMAT3}" in text
+    # The build environment's two package hashes, each a single line —
+    # the same requirement the SDK hash below is checked against.
+    assert f"sha256: {WORKSPACE_SHA256}" in text
+    assert f"sha256: {TOOLS_SHA256}" in text
+    assert f"name: {WORKSPACE_PACKAGE}" in text
+    assert f"name: {TOOLS_PACKAGE}" in text
     assert f"id: {frame['payload']['context_id']}" in text
     assert f"sha256: {SDK_SHA256}" in text
     assert all(len(line) < 200 for line in text.splitlines()), "no runaway line either"
@@ -617,7 +611,7 @@ def test_the_model_keeps_both_context_documents_out_of_the_hash() -> None:
     for path in ("context.yaml", "manifest.yaml"):
         try:
             context_id(
-                environment_digest=IMAGE_DIGEST,
+                environment=ENVIRONMENT,
                 sdk_sha256=SDK_SHA256,
                 board=BOARD,
                 files=[ContextFile(path=path, sha256="c" * 64)],

@@ -12,10 +12,25 @@ has no clock worth outrunning and never dials anything.
 
 So this harness fakes nothing. It starts the server as a process, hands
 it a real SDK package, and drives ``mcuhome device build --build-mode
-remote`` at it over a real socket until a signed image exists. What it
-then checks is listed in :func:`main` and each check prints the line it
-proves, because a green job that verified nothing is the failure mode
-this file exists to prevent.
+remote`` at it over a real socket. What it then checks is listed in
+:func:`main` and each check prints the line it proves, because a green
+job that verified nothing is the failure mode this file exists to
+prevent.
+
+**What it checks today is the refusal, not a firmware.** Remote builds
+are unavailable while this server does not run package-built build
+environments (see the README's status section), so the honest end of
+this run is the typed answer a real client gets: the build stops, and it
+stops for the stated reason rather than by timing out or crashing. The
+whole chain up to that point is exercised for real — the process starts,
+the socket carries the session, the context travels, the server reads it
+and answers.
+
+The checks of a finished build are **kept below and not called**. They
+are what this run goes back to expecting when the server runs those
+environments, and deleting them would mean writing them again from
+memory; the switchover flips :func:`main`'s expectation and calls them
+again.
 
 Run it by hand exactly as CI does::
 
@@ -30,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import shutil
@@ -138,7 +154,49 @@ def server(*, sdk_dir: Path, state: Path, log: Path, token: str):
                 process.wait(timeout=10)
 
 
-def build(project: Path, *, port: int, token: str, sdk_dir: Path) -> tuple[dict, float]:
+def environment_source(sdk_dir: Path, into: Path) -> Path:
+    """A package source holding the environment packages' index entries.
+
+    A build context pins the build environment's two packages by name,
+    version and content hash, so creating one needs those hashes — and a
+    hash comes from a package index and from nowhere else. The versions
+    are the SDK release's own statement, which it carries beside its
+    archive as ``<archive>.build-environment.lock.json``; the hashes here
+    are **synthetic**, and deliberately so: this run asserts that the
+    server refuses the context, which it does before a byte of either
+    package would be fetched. Downloading two gigabytes to have them
+    refused would prove nothing and cost a runner ten minutes.
+
+    A directory of its own rather than an edit of the SDK's, so that the
+    archive and the index CI built stay exactly as they were built.
+    """
+    locks = sorted(sdk_dir.glob("*.tar.zst.build-environment.lock.json"))
+    if not locks:
+        raise Failed(
+            f"{sdk_dir} holds no environment lock beside its archive — build the SDK "
+            "package with a build_sdk_archive.py that writes one"
+        )
+    lock = json.loads(locks[-1].read_text(encoding="utf-8"))
+    packages = {}
+    for member, version in lock.items():
+        if not member.startswith("packages."):
+            continue
+        name = member[len("packages.") :]
+        digest = hashlib.sha256(f"{name} {version}".encode()).hexdigest()
+        packages[name] = {
+            version: {"file": f"{name}-{version}.tar.zst", "sha256": digest, "size": 1}
+        }
+    if not packages:
+        raise Failed(f"{locks[-1]} names no packages")
+    into.mkdir(parents=True, exist_ok=True)
+    (into / "index.json").write_text(json.dumps({"packages": packages}), encoding="utf-8")
+    print(f"environment index for {', '.join(sorted(packages))} at {into}", flush=True)
+    return into
+
+
+def build(
+    project: Path, *, port: int, token: str, sdk_dir: Path, environment_dir: Path
+) -> tuple[dict, int, float]:
     """``mcuhome device build`` through the remote method. Returns the document."""
     argv = [
         "mcuhome",
@@ -153,6 +211,11 @@ def build(project: Path, *, port: int, token: str, sdk_dir: Path) -> tuple[dict,
         token,
         "--sdk-sources",
         str(sdk_dir),
+        # Repeatable and searched in order: the SDK comes out of the
+        # directory CI built, the environment packages' index entries out
+        # of the one generated beside it.
+        "--sdk-sources",
+        str(environment_dir),
         "-o",
         "json",
     ]
@@ -165,10 +228,36 @@ def build(project: Path, *, port: int, token: str, sdk_dir: Path) -> tuple[dict,
         print(done.stderr, file=sys.stderr, flush=True)
     if not done.stdout.strip():
         raise Failed(f"the build printed no document at all (exit {done.returncode})")
-    document = json.loads(done.stdout)
-    if done.returncode != 0 or not document.get("ok"):
-        raise Failed(f"the build failed (exit {done.returncode}): {json.dumps(document, indent=2)}")
-    return document, seconds
+    return json.loads(done.stdout), done.returncode, seconds
+
+
+def check_the_build_succeeded(document: dict, code: int) -> None:
+    """Not called today — see the module docstring."""
+    if code != 0 or not document.get("ok"):
+        raise Failed(f"the build failed (exit {code}): {json.dumps(document, indent=2)}")
+
+
+def check_the_server_refused_to_select_an_environment(document: dict, code: int) -> None:
+    """The build stops, and it stops for the one reason it should.
+
+    Matched on the message rather than on a code, because what the CLI
+    prints is what a person acts on and the document a remote build
+    answers with carries no typed code of the server's. A build that
+    failed for any other reason — no runtime, no SDK package, a socket
+    nobody answered — says something else here and fails this check,
+    which is what keeps a green job from meaning "something went wrong,
+    as expected".
+    """
+    if code == 0 or document.get("ok"):
+        raise Failed(
+            "the build succeeded, and this server is not supposed to be able to "
+            "run one yet — if it now can, this run goes back to expecting a "
+            f"firmware: {json.dumps(document, indent=2)}"
+        )
+    said = json.dumps(document)
+    if "package-built build environments" not in said:
+        raise Failed(f"the build failed for another reason than the one expected: {said}")
+    print("the server refused the context and said why (remote builds unavailable)")
 
 
 # --------------------------------------------------------------------------
@@ -332,17 +421,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         with server(sdk_dir=sdk_dir, state=state, log=log, token=token) as port:
             print(f"server on 127.0.0.1:{port}, idle timeout {IDLE_TIMEOUT_SECONDS}s", flush=True)
-            document, seconds = build(project, port=port, token=token, sdk_dir=sdk_dir)
-        build_dir = Path(document["build_dir"])
+            document, code, seconds = build(
+                project,
+                port=port,
+                token=token,
+                sdk_dir=sdk_dir,
+                environment_dir=environment_source(sdk_dir, workspace / "environment-index"),
+            )
+        del seconds  # the lease is only interesting once a build runs long enough to test it
 
         print("checks:", flush=True)
-        check_the_artifacts_are_all_there(build_dir)
-        check_the_document_says_what_it_did(document)
-        check_the_lease_was_actually_tested(seconds)
-        check_no_session_was_taken_away(log)
-        check_the_private_key_never_travelled(project, build_dir, state)
-        check_the_context_holds_the_public_half(build_dir)
-        check_the_signature_verifies(project, build_dir)
+        check_the_server_refused_to_select_an_environment(document, code)
         check_the_server_kept_nothing(state)
     except Failed as failure:
         print(f"\nFAILED: {failure}\n", file=sys.stderr, flush=True)
@@ -355,7 +444,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not args.keep:
             shutil.rmtree(workspace, ignore_errors=True)
 
-    print("\nOK — one real remote build, every check held.", flush=True)
+    print(
+        "\nOK — the whole chain up to the refusal ran for real, and the refusal "
+        "was the one expected.",
+        flush=True,
+    )
     return 0
 
 

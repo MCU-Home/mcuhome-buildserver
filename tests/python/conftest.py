@@ -45,6 +45,7 @@ from typing import Any
 import pytest
 import zstandard
 from mcuhome.model.buildimage import CONTRACT_LABEL, TOOLCHAIN_LABEL, ZEPHYR_LABEL
+from mcuhome.model.context import EnvironmentPin, PackagePin
 from mcuhome.workbench import orchestrator
 from ruamel.yaml import YAML
 
@@ -55,14 +56,33 @@ from mcuhome.buildserver.config import Config
 TOKEN = "test-token-000000000000000000000000"
 
 #: The Zephyr line and revision the build image has — spelled in its label.
-#: The client pins the full reference with digest.
+#: One image this host has. Nothing pins it any more — a context pins packages.
 ZEPHYR_LINE = "4.4"
 IMAGE_REVISION = "r10"
 IMAGE_REFERENCE_FORMAT3 = (
     f"ghcr.io/mcu-home/build-container:zephyr-4.4.0-{IMAGE_REVISION}@sha256:{'b' * 64}"
 )
+#: The build environment a context pins under format 4: two packages,
+#: each a ``(name, version, sha256)`` triple. The tools entry is the
+#: **family**, which is the ordinary pin — it resolves per platform, and
+#: its hash covers every platform's package.
+WORKSPACE_PACKAGE = "mcuhome-build-workspace"
+TOOLS_PACKAGE = "mcuhome-build-tools"
+ENVIRONMENT_VERSION = "2.4.0"
+WORKSPACE_SHA256 = "7c" * 32
+TOOLS_SHA256 = "b9" * 32
+
+#: The same pin as an object, for the tests that recompute a context ID
+#: themselves rather than reading the server's answer.
+ENVIRONMENT = EnvironmentPin(
+    workspace=PackagePin(
+        name=WORKSPACE_PACKAGE, version=ENVIRONMENT_VERSION, sha256=WORKSPACE_SHA256
+    ),
+    tools=PackagePin(name=TOOLS_PACKAGE, version=ENVIRONMENT_VERSION, sha256=TOOLS_SHA256),
+)
+
 CONTEXT_YAML = f"""\
-context: 3
+context: 4
 created: 2026-08-09T10:00:00Z
 mcuhome:
   constraint: ^2.3.6
@@ -70,7 +90,15 @@ mcuhome:
   package:
     url: https://packages.mcuhome.org/mcuhome-sdk-2.4.0.tar.zst
     sha256: {"a" * 64}
-build_environment: {IMAGE_REFERENCE_FORMAT3}
+build_environment:
+  workspace:
+    name: {WORKSPACE_PACKAGE}
+    version: {ENVIRONMENT_VERSION}
+    sha256: {WORKSPACE_SHA256}
+  tools:
+    name: {TOOLS_PACKAGE}
+    version: {ENVIRONMENT_VERSION}
+    sha256: {TOOLS_SHA256}
 target:
   board: nrf7002dk/nrf5340/cpuapp
 """
@@ -104,7 +132,7 @@ def config(tmp_path: Path) -> Config:
 #: labels contract §2.1 requires of it. Spelled here so that a test that
 #: changes one can see what a conforming image looks like beside it —
 #: the ``org.mcuhome.build-environment.zephyr.version`` label above all,
-#: which is what matches the pin in :data:`IMAGE_REFERENCE_FORMAT3`.
+#: kept because the image inventory and the allowlist are still tested.
 IMAGE = "ghcr.io/mcu-home/build-container"
 IMAGE_DIGEST = "sha256:" + "b" * 64
 IMAGE_REFERENCE = f"{IMAGE}@{IMAGE_DIGEST}"
@@ -752,23 +780,26 @@ def context_yaml(
     *,
     sdk_sha256: str = "a" * 64,
     version: str = "2.4.0",
-    build_environment: str = IMAGE_REFERENCE_FORMAT3,
+    tools_sha256: str = TOOLS_SHA256,
+    build_environment: str | None = None,
 ) -> bytes:
     """A ``context.yaml`` with the pins a test wants to move.
 
-    *sdk_sha256* names a package that exists; *build_environment* is the
-    image the client pinned, which is a hashed identity input — so a test
-    that changes it is changing the context's identity, on purpose.
+    *sdk_sha256* names a package that exists; *tools_sha256* is one of
+    the six hashed members of the environment pin, so a test that changes
+    it is changing the context's identity, on purpose.
+    *build_environment* replaces the whole block verbatim, for the tests
+    that need a document the format does not describe.
     """
-    return (
-        CONTEXT_YAML.replace("sha256: " + "a" * 64, f"sha256: {sdk_sha256}")
-        .replace("version: 2.4.0", f"version: {version}")
-        .replace(
-            f"build_environment: {IMAGE_REFERENCE_FORMAT3}",
-            f"build_environment: {build_environment}",
-        )
-        .encode()
+    text = CONTEXT_YAML.replace("sha256: " + "a" * 64, f"sha256: {sdk_sha256}").replace(
+        "version: 2.4.0", f"version: {version}"
     )
+    text = text.replace(f"sha256: {TOOLS_SHA256}", f"sha256: {tools_sha256}")
+    if build_environment is not None:
+        head, _, tail = text.partition("build_environment:")
+        _, _, rest = tail.partition("target:")
+        text = f"{head}build_environment: {build_environment}\ntarget:{rest}"
+    return text.encode()
 
 
 def device_model(
@@ -803,6 +834,8 @@ def device_model(
             "sources": {
                 "sdk": "sdk/mcuhome-sdk",
                 "build_environment": "ghcr.io/mcu-home/build-container",
+                "build_workspace": "build-workspace/mcuhome-build-workspace",
+                "build_tools": "build-tools/mcuhome-build-tools",
             },
             "hardware": {"buses": [], "peripherals": []},
             "endpoints": [],
@@ -929,12 +962,45 @@ def base_context(**files: bytes) -> bytes:
     )
 
 
+#: Why a test that needs a finished remote build does not run today.
+#:
+#: The server selects a container by the image a build context names, and
+#: a context now names its build environment as **packages** instead. Until
+#: the server runs package-built build environments there is no image for
+#: it to start, so ``send-context`` answers a typed refusal and every verb
+#: behind it is unreachable.
+#:
+#: The tests this skips are not obsolete — they are the acceptance tests of
+#: that work, kept running-ready and counted here so the debt is visible in
+#: every suite run rather than deleted and rediscovered later.
+REMOTE_BUILDS_UNAVAILABLE = (
+    "remote builds unavailable until the server runs package-built build environments"
+)
+
+#: The typed code the refusal comes back under.
+BUILDER_UNSATISFIABLE = "version.builder-unsatisfiable"
+
+
+def refuses_to_select_an_environment(frame: dict) -> bool:
+    """Whether *frame* is the server saying it cannot pick a build environment."""
+    return (
+        frame.get("type") == "error" and frame.get("error", {}).get("code") == BUILDER_UNSATISFIABLE
+    )
+
+
 async def send_archive(
-    ws, verb: str, session_id: str, archive: bytes, *, seen: list | None = None, **payload
+    ws,
+    verb: str,
+    session_id: str,
+    archive: bytes,
+    *,
+    seen: list | None = None,
+    allow_refusal: bool = False,
+    **payload,
 ) -> dict:
     """Announce *archive*, push it as binary frames, return the answer.
 
-    The two halves of E41's wire shape in one helper, because every test
+    The two halves of the wire shape in one helper, because every test
     that touches the context path needs both and neither is interesting
     on its own. The chunking is deliberate — several frames per archive,
     since "multiple frames allowed" is part of the decided shape and a
@@ -943,6 +1009,13 @@ async def send_archive(
     *seen* collects every frame read on the way, for the tests that are
     about what arrives **while** a verb is still in flight rather than
     about its answer.
+
+    **A refusal to select a build environment skips the calling test**
+    (:data:`REMOTE_BUILDS_UNAVAILABLE`), unless *allow_refusal* says the
+    test is about that refusal. It is done here rather than at each call
+    site because the refusal arrives at exactly one place — the answer to
+    ``send-context`` — and one reason in one place is what makes the skip
+    count mean something.
     """
     frame_id = f"u-{verb}"
     await ws.send_json(
@@ -963,4 +1036,6 @@ async def send_archive(
         if seen is not None:
             seen.append(frame)
         if frame.get("id") == frame_id:
+            if not allow_refusal and refuses_to_select_an_environment(frame):
+                pytest.skip(REMOTE_BUILDS_UNAVAILABLE)
             return frame

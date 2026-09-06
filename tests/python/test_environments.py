@@ -27,6 +27,7 @@ from tests.python.conftest import (
     IMAGE,
     IMAGE_DIGEST,
     IMAGE_LABELS,
+    REMOTE_BUILDS_UNAVAILABLE,
     auth,
     context_yaml,
     make_archive,
@@ -165,6 +166,7 @@ def config(tmp_path) -> Config:
     )
 
 
+@pytest.mark.skip(reason=REMOTE_BUILDS_UNAVAILABLE)
 async def test_a_context_pinning_an_unlisted_repository_is_refused(client, config, docker) -> None:
     """The client's own spelling, checked at ``send-context``."""
     sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
@@ -176,6 +178,7 @@ async def test_a_context_pinning_an_unlisted_repository_is_refused(client, confi
     assert frame["error"]["details"]["repository"] == ELSEWHERE
 
 
+@pytest.mark.skip(reason=REMOTE_BUILDS_UNAVAILABLE)
 async def test_the_refusal_happens_before_docker_is_asked_anything(client, config, docker) -> None:
     """The load-bearing assertion of this file.
 
@@ -230,6 +233,7 @@ async def test_an_allowed_name_over_a_digest_that_found_another_repository_is_re
     assert frame["error"]["details"]["repository"] == ELSEWHERE
 
 
+@pytest.mark.skip(reason=REMOTE_BUILDS_UNAVAILABLE)
 async def test_an_operator_who_lists_another_repository_can_serve_it(
     aiohttp_client, config, docker
 ) -> None:

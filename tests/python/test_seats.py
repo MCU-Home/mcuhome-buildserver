@@ -484,9 +484,9 @@ async def test_the_handover_reaches_the_backend_over_the_wire(aiohttp_client, co
     released: list[tuple[str, str | None]] = []
     original = state.backend.release
 
-    async def record(session_id: str, *, reaped: str | None = None) -> None:
+    async def record(session_id: str, *, reaped: str | None = None, wait: float | None = None):
         released.append((session_id, reaped))
-        await original(session_id, reaped=reaped)
+        return await original(session_id, reaped=reaped, wait=wait)
 
     state.backend.release = record  # type: ignore[method-assign]
     client = await aiohttp_client(create_app(state))

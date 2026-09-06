@@ -107,10 +107,29 @@ TYPE_LOG = "log"
 #: — the layer set is fixed by the concept — so this constant stays
 #: until that decision is taken, rather than being replaced by a guess.
 ERROR_BAD_REQUEST = "bad_request"
-#: A bug on this side, from the command loop's catch-all. Carries no
-#: traceback; the log has it. Pre-registry for the same reason: an
-#: unexpected exception is not a verdict any layer of the protocol
-#: claims to render.
+#: A bug on this side. Carries no traceback; the log has it.
+#: Pre-registry, because an unexpected failure of this server is not a
+#: verdict any layer of the protocol claims to render — the typed codes
+#: of :mod:`mcuhome.buildserver.errors` describe what a *session* did
+#: and this describes what this server failed to do.
+#:
+#: Two things answer with it, and the second is deliberate rather than
+#: accidental.
+#:
+#: * The command loop's catch-all: any exception a handler did not turn
+#:   into a typed refusal.
+#: * ``close-session``, when the invocation it stopped did not come back
+#:   inside the liveness ladder. The session's directory is kept rather
+#:   than deleted underneath a thread that is still reading it, and that
+#:   is a failure of this server to stop its own build — no typed code
+#:   says that, and minting one is a protocol decision rather than an
+#:   implementation choice.
+#:
+#: Neither carries a machine-readable ``retryable``: a pre-registry code
+#: has no envelope and therefore no promise to make, and an unknown code
+#: is fatal to a client by rule. What follows the second one needs no
+#: client anyway — this server retries the release itself, on every
+#: sweep, until the session is gone.
 ERROR_INTERNAL = "internal_error"
 
 

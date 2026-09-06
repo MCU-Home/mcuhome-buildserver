@@ -2141,6 +2141,228 @@ async def _started(docker, *, timeout: float = 10.0) -> None:
         await asyncio.sleep(0.01)
 
 
+def _watch_rm(
+    monkeypatch, docker, paths, invocation_id: str = "inv-1"
+) -> list[tuple[str, bool, bool]]:
+    """Record what was still on disk when the container was removed.
+
+    The container is the orchestrator's, so the removal goes through its
+    seam and not through this server's own. Each entry is
+    ``(command, the session tree is there, the cancel sentinel is set)``
+    — the two facts every ordering test here is about.
+    """
+    seen: list[tuple[str, bool, bool]] = []
+    real_answer = docker.answer
+
+    def recording(argv, on_line=None):
+        if argv[1] == "rm":
+            seen.append(
+                ("rm", paths.root.exists(), (paths.invocation(invocation_id) / "cancel").exists())
+            )
+        return real_answer(argv, on_line)
+
+    from mcuhome.workbench import orchestrator
+
+    monkeypatch.setattr(orchestrator, "_run_command", recording)
+    return seen
+
+
+async def _building(aiohttp_client, config, docker, **overrides):
+    """A server with one session whose invocation hangs. Returns the lot.
+
+    The grace is zero because the ladder is walked in full here and
+    sixty seconds is a deployment's number, not a test's; the program
+    hangs because an invocation that has already finished cannot
+    demonstrate anything about the order a release does things in.
+    """
+    from mcuhome.buildserver.app import ServerState, create_app
+
+    docker.run_program = lambda action, request, on_line: FakeProcess(0, hang=True)
+    state = ServerState(replace(config, cancel_grace_seconds=0, **overrides))
+    client = await aiohttp_client(create_app(state))
+    return state, client
+
+
+async def test_the_sweep_stops_the_container_before_it_deletes_the_tree(
+    aiohttp_client, config, docker, monkeypatch
+) -> None:
+    """The reaper had the order this task took out of close-session.
+
+    ``reap()`` deleted the directory itself and the loop removed the
+    container afterwards — so a session whose hard TTL ran out under a
+    running build lost its tree while the supervisor was still reading
+    it, which is the one state neither half can recover from. The sweep
+    now marks the session and ``release_session`` walks the four steps.
+    """
+    state, client = await _building(aiohttp_client, config, docker)
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, _ = await locked(ws, state.config)
+        await call(ws, "build", {"session_id": session_id}, frame_id="b")
+        session = state.sessions.find(session_id)
+        paths = session.paths
+        record = state.backend.record(session_id, "inv-1")
+        await _started(docker)
+        seen = _watch_rm(monkeypatch, docker, paths)
+
+        # The hard TTL is the half that bounds a session which is
+        # working, so this is the sweep taking a build away.
+        session.expires_at = time.time() - 1
+        assert state.sessions.reap() == (session_id,)
+        assert paths.root.exists(), "the sweep marks it and does not delete under the build"
+        assert state.sessions.pending_releases() == (session_id,)
+
+        assert await sessions.release_pending(state) == ()
+
+    assert seen == [("rm", True, True)], "the tree was still there and the signal was set"
+    assert record.drive.done(), "and the supervisor was waited for"
+    assert not paths.root.exists()
+
+
+async def test_a_handover_stops_the_container_before_it_deletes_the_tree(
+    aiohttp_client, config, docker, monkeypatch
+) -> None:
+    """Admission takes an unattended session away, container first.
+
+    A handover only ever takes a session with nothing in flight, so
+    there is no supervisor to wait for here — but there is a container,
+    and its mounts are the tree admission used to delete before anything
+    removed it. ``open-session`` drains what admission marked and the
+    release is what deletes the directory.
+    """
+    from mcuhome.buildserver.app import ServerState, create_app
+
+    state = ServerState(replace(config, max_sessions=1, reconnect_grace_seconds=0))
+    client = await aiohttp_client(create_app(state))
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        abandoned, _ = await locked(ws, state.config)
+        # A finished invocation, so the session has a container the way a
+        # real one does — and nothing running, which is what makes it
+        # eligible at all.
+        await call(ws, "verify", {"session_id": abandoned}, frame_id="v")
+        await collect(ws, until="invocation.verdict")
+        session = state.sessions.find(abandoned)
+        paths = session.paths
+        seen = _watch_rm(monkeypatch, docker, paths)
+
+    # The client is gone and the session has been quiet since before the
+    # grace, so the next one to dial in has the better claim.
+    session.touch(now=time.time() - 60.0)
+    session.disconnected_since = time.time() - 60.0
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        await call(
+            ws,
+            "open-session",
+            {"protocol_version": sessions.SESSION_PROTOCOL_VERSION},
+            frame_id="o2",
+        )
+
+    assert session.reaped == sessions.GONE_HANDOVER
+    assert seen == [("rm", True, False)], "the container went first, with the tree still there"
+    assert not paths.root.exists()
+    assert state.sessions.pending_releases() == ()
+
+
+async def test_a_lease_that_runs_out_inside_a_verb_reaches_the_sweep(
+    aiohttp_client, config, docker, monkeypatch
+) -> None:
+    """The path that never released anything at all.
+
+    A lease noticed by ``require`` closed the session, deleted its tree
+    and stopped there: nothing ever removed the container or waited for
+    what was running in it, so both lived until the process did. The
+    session is marked instead, the client still gets its immediate
+    ``session.expired``, and the sweep does the release in the order
+    that holds.
+    """
+    state, client = await _building(aiohttp_client, config, docker)
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, _ = await locked(ws, state.config)
+        await call(ws, "build", {"session_id": session_id}, frame_id="b")
+        session = state.sessions.find(session_id)
+        paths = session.paths
+        record = state.backend.record(session_id, "inv-1")
+        await _started(docker)
+        seen = _watch_rm(monkeypatch, docker, paths)
+
+        session.expires_at = time.time() - 1
+        refused = await call(ws, "get-artifact", {"session_id": session_id}, frame_id="g")
+        assert refused["error"]["code"] == "session.expired"
+        assert paths.root.exists(), "a refusal cannot stop to remove a container"
+        assert state.sessions.pending_releases() == (session_id,)
+
+        assert await sessions.release_pending(state) == ()
+
+    assert seen == [("rm", True, True)]
+    assert record.drive.done()
+    assert not paths.root.exists()
+
+
+async def test_shutdown_stops_the_containers_before_the_trees_go(
+    aiohttp_client, config, docker, monkeypatch
+) -> None:
+    """Process exit, in the one order that protects anything.
+
+    Shutdown deleted every directory first and released the build
+    environments afterwards, which protected nothing and made exit wait
+    for a ladder per session on top. The release comes first now, under
+    one budget for the whole loop, and the trees go afterwards —
+    including the tree of a session that did not release, because a
+    stopping process is the last thing that could ever name it.
+    """
+    state, client = await _building(aiohttp_client, config, docker)
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, _ = await locked(ws, state.config)
+        await call(ws, "build", {"session_id": session_id}, frame_id="b")
+        session = state.sessions.find(session_id)
+        paths = session.paths
+        record = state.backend.record(session_id, "inv-1")
+        await _started(docker)
+        seen = _watch_rm(monkeypatch, docker, paths)
+
+    # The real thing: closing the test client runs the application's own
+    # cleanup, which is where the order lives.
+    await client.close()
+
+    assert seen == [("rm", True, True)], "the tree was still there and the signal was set"
+    assert record.drive.done(), "and the supervisor was waited for"
+    assert not paths.root.exists()
+
+
+async def test_shutdown_is_bounded_for_every_session_together(
+    aiohttp_client, config, docker, monkeypatch
+) -> None:
+    """One budget for the loop, not one ladder per session.
+
+    A stopping server is expected to be gone: waiting the full ladder
+    once per session would make exit take longer than a service manager
+    waits before it sends SIGKILL, which is a bound that buys nothing.
+    The budget is spent as a whole, what is left over is logged, and the
+    directories go regardless.
+    """
+    monkeypatch.setattr(sessions, "SHUTDOWN_RELEASE_SECONDS", 0.0)
+    state, client = await _building(aiohttp_client, config, docker)
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, _ = await locked(ws, state.config)
+        await call(ws, "build", {"session_id": session_id}, frame_id="b")
+        paths = state.sessions.find(session_id).paths
+        record = state.backend.record(session_id, "inv-1")
+        await _started(docker)
+
+        started = time.monotonic()
+        await sessions.release_every_session(state)
+        spent = time.monotonic() - started
+
+        assert spent < 5.0, "a budget of nothing is a wait of nothing"
+        assert state.sessions.pending_releases() == (session_id,)
+        state.sessions.shutdown()
+        assert not paths.root.exists(), "the trees go even for a session that did not release"
+
+        # And the supervisor still ends, because the container went
+        # before the budget did: the wait is what was skipped, not the
+        # kill.
+        await asyncio.wait_for(record.drive, timeout=10)
+
+
 async def test_close_session_refuses_when_the_supervisor_outlives_the_ladder(
     aiohttp_client, config, docker, monkeypatch
 ) -> None:
@@ -2186,13 +2408,17 @@ async def test_close_session_refuses_when_the_supervisor_outlives_the_ladder(
         assert paths.root.exists(), "the tree stayed, which is the whole point of refusing"
 
         # The container is gone, so the supervisor ends on its next poll
-        # and the retry finds nothing left to wait for.
+        # and the sweep's retry finds nothing left to wait for. It is the
+        # sweep and not a second close-session on purpose: the client
+        # that would have to send it has already thrown its session id
+        # away by the time it reads this error.
         waited[0] = 30.0
-        answered = await call(ws, "close-session", {"session_id": session_id}, frame_id="x2")
+        assert state.sessions.pending_releases() == (session_id,)
+        assert await sessions.release_pending(state) == ()
 
-    assert "error" not in answered, answered
     assert record.drive.done()
-    assert not paths.root.exists(), "and the retry is what deleted it"
+    assert state.sessions.pending_releases() == ()
+    assert not paths.root.exists(), "and the sweep is what deleted it"
 
 
 async def test_one_invocation_at_a_time_per_session(client, config, docker) -> None:

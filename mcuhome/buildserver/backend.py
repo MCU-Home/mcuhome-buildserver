@@ -116,12 +116,18 @@ CONTRACT_VERSION = 1
 #: come back. It is that ladder read off and not a second policy beside
 #: it: SIGTERM one grace period after the sentinel, SIGKILL ten seconds
 #: later, thirty more before the supervisor gives up on a process that
-#: survived SIGKILL — plus a margin for the half-second poll interval
-#: and for judging the result document, which the invocation still does
-#: after the supervisor returns. Longer than the ladder is harmless
-#: (the wait ends when the supervisor does, which in practice is one
-#: poll after the container was removed); shorter would turn a slow
-#: teardown into a refusal, so the margin errs upwards.
+#: survived SIGKILL. Forty of the forty-five are those two rungs; the
+#: remaining five are the slack the ladder walks on — it looks at the
+#: world every half second and the log pump is joined for up to four of
+#: those ticks, so about two seconds — and the judgement that follows
+#: the supervisor: reading the result document and re-hashing every
+#: declared artifact.
+#:
+#: **It is a bound and not a promise.** Re-hashing a full egress budget
+#: of artifacts can outlast the three seconds left over, and the wait
+#: would then run out on an invocation that is merely finishing. That
+#: is no longer expensive: a release that runs out of time keeps the
+#: session, and the reaper retries it until it succeeds.
 _LADDER_TAIL_SECONDS = 45.0
 
 
@@ -1227,7 +1233,9 @@ class SessionBackend:
     # Teardown
     # ----------------------------------------------------------------
 
-    async def release(self, session_id: str, *, reaped: str | None = None) -> bool:
+    async def release(
+        self, session_id: str, *, reaped: str | None = None, wait: float | None = None
+    ) -> bool:
         """Reap the session's build environment and wait for its invocation.
 
         Never raises. Answers whether the session is **released**: the
@@ -1265,6 +1273,12 @@ class SessionBackend:
         again — by the next ``close-session``, by the sweep, or by
         process shutdown — and it walks the same three steps against the
         same state.
+
+        *wait* overrides the ladder for a caller that has a deadline of
+        its own. Process shutdown is the one that does: it releases every
+        session in turn under **one** total budget, because a server
+        that stopped is expected to be gone rather than to spend the
+        ladder once per session.
         """
         runtime = self._runtimes.get(session_id)
         if reaped is not None:
@@ -1276,14 +1290,14 @@ class SessionBackend:
         self._audience.pop(session_id, None)
         if runtime is not None:
             await self._release_runtime(runtime)
-        if not await self._join_invocations(session_id):
+        if not await self._join_invocations(session_id, wait):
             return False
         self._runtimes.pop(session_id, None)
         for key in [key for key in self._records if key[0] == session_id]:
             self._records.pop(key, None)
         return True
 
-    async def _join_invocations(self, session_id: str) -> bool:
+    async def _join_invocations(self, session_id: str, wait: float | None = None) -> bool:
         """Wait for every running invocation of *session_id*. Never raises.
 
         The task is not cancelled when the wait runs out, and that is
@@ -1301,14 +1315,15 @@ class SessionBackend:
         }
         if not tasks:
             return True
-        _, pending = await asyncio.wait(tasks, timeout=_ladder_seconds(self.config))
+        seconds = _ladder_seconds(self.config) if wait is None else wait
+        _, pending = await asyncio.wait(tasks, timeout=seconds)
         if pending:
             logger.error(
-                "session %s: %d invocation(s) still running after %.0fs; the session's "
+                "session %s: %d invocation(s) still running after %.1fs; the session's "
                 "directory is kept",
                 session_id,
                 len(pending),
-                _ladder_seconds(self.config),
+                seconds,
             )
             return False
         return True
@@ -1356,15 +1371,24 @@ class SessionBackend:
                 ),
             )
 
-    async def release_all(self) -> None:
-        """Every session's build environment, for process shutdown.
+    async def release_all(self, *, deadline: float | None = None) -> None:
+        """Every build environment this server still holds, for shutdown.
 
-        A session that does not release is logged and left: the process
-        is going away, and there is nothing further this side can do
-        about a supervisor that outlived its own ladder.
+        The backstop behind
+        :func:`~mcuhome.buildserver.sessions.release_every_session`: what
+        it releases is a *session*, and this is what is left if a runtime
+        outlived the session record that named it.
+
+        *deadline* is a :func:`time.monotonic` value and bounds the whole
+        loop rather than each session, because it is one budget for
+        stopping the process. A session that does not release is logged
+        and left: the process is going away, and there is nothing
+        further this side can do about a supervisor that outlived its
+        own ladder.
         """
         for session_id in list(self._runtimes):
-            if not await self.release(session_id):
+            wait = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if not await self.release(session_id, wait=wait):
                 logger.error("session %s was not released before shutdown", session_id)
 
 

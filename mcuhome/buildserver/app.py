@@ -130,19 +130,19 @@ async def _reap_loop(state: ServerState) -> None:
             # handed-over session's build environment may still be
             # running when nobody opens a session afterwards.
             released = state.sessions.take_released()
-            # The build environment goes with the directory, and for the
+            # Both lists are already on the manager's release list, and
+            # so is every session an earlier tick could not finish and
+            # every lease that ran out inside a verb — which is why the
+            # sweep releases *that* list rather than these two. The
+            # build environment goes with the directory, and for the
             # same reason: the directory is what it works in — the
             # container's mounts in one profile, a child process's own
             # paths in the other — so anything left running against a
             # deleted tree is the one state neither half can recover
-            # from.
-            for session_id in (*reaped, *released):
-                # Why it is gone travels with it: a client still listening
-                # is owed the reason its build stopped, and this is the
-                # only place that knows it.
-                await state.backend.release(
-                    session_id, reaped=state.sessions.reaped_reason(session_id)
-                )
+            # from. `release_session` is the order that rules it out,
+            # and a session it could not release stays on the list for
+            # the next tick.
+            still_pending = await sessions.release_pending(state)
         except Exception:  # pragma: no cover - defensive; a sweep is a dict walk
             logger.exception("the session reaper failed a sweep")
         else:
@@ -153,6 +153,12 @@ async def _reap_loop(state: ServerState) -> None:
                     "released %d unattended session(s) for waiting clients: %s",
                     len(released),
                     ", ".join(released),
+                )
+            if still_pending:
+                logger.warning(
+                    "%d session(s) are still waiting to be released: %s",
+                    len(still_pending),
+                    ", ".join(still_pending),
                 )
 
 
@@ -167,21 +173,27 @@ async def _stop_reaper(app: web.Application) -> None:
 
     A stopping server's sessions are over by definition — they are
     in-memory records bound to this process — so what is left to do is
-    delete the directories, not wait for a lease.
+    stop their builds and delete the directories, not wait for a lease.
     """
     task = app[REAPER_KEY]
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
     state = app[STATE_KEY]
-    state.sessions.shutdown()
-    # And the build environments those sessions were running in. A
-    # process that is killed outright still leaves the containers
+    # The build environments first, and the directories after them. A
+    # container is what a session's directory is mounted into and a
+    # supervisor is what reads it, so deleting the trees first protected
+    # nothing and only delayed the exit it was standing in front of. The
+    # whole loop is bounded by ``sessions.SHUTDOWN_RELEASE_SECONDS``: a
+    # process that was told to stop is expected to be gone.
+    #
+    # A process that is killed outright still leaves the containers
     # behind, which is what the ``org.mcuhome.build-server.session``
     # label on each is for — there is deliberately no startup sweep, for
     # the reason ``SessionManager.shutdown`` gives about the context
     # root.
-    await state.backend.release_all()
+    await sessions.release_every_session(state)
+    state.sessions.shutdown()
 
 
 def create_app(state: ServerState) -> web.Application:

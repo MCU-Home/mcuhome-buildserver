@@ -79,6 +79,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import re
 import secrets
@@ -115,6 +116,8 @@ from mcuhome.buildserver.ingress import (
 )
 from mcuhome.buildserver.protocol import Command, ProtocolError
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
     "CONTEXT_FORMAT_MAX",
     "CONTEXT_FORMAT_MIN",
@@ -133,6 +136,7 @@ __all__ = [
     "SEAT_GRACE",
     "SESSION_PROTOCOL_VERSION",
     "SESSION_VERBS",
+    "SHUTDOWN_RELEASE_SECONDS",
     "Seat",
     "SeatQueue",
     "Session",
@@ -140,6 +144,9 @@ __all__ = [
     "UPLOAD_VERBS",
     "capabilities_payload",
     "is_patch_layer_name",
+    "release_every_session",
+    "release_pending",
+    "release_session",
 ]
 
 #: Bumped when the *session* protocol changes shape. Version 2 because
@@ -247,6 +254,26 @@ DEFAULT_IDLE_TIMEOUT = 600.0
 #: policy — the policy is the lease, and this is only how long a reaped
 #: session's directory may still be on disk after its lease ran out.
 DEFAULT_REAP_INTERVAL = 30.0
+
+#: How long process shutdown waits, **in total**, for the invocations of
+#: every session it is releasing.
+#:
+#: One budget for the whole loop and not one per session: a server that
+#: has been told to stop is expected to be gone, and spending the
+#: liveness ladder once per session would make exit take
+#: ``sessions × (cancel grace + the ladder's tail)`` — over six minutes
+#: at this server's defaults with four sessions, which is longer than a
+#: service manager waits before it sends SIGKILL and therefore a bound
+#: that buys nothing.
+#:
+#: Thirty seconds is generous for what is actually being waited on. The
+#: container of every session is removed first, and that is what stops
+#: a build; what remains is the supervisor noticing on its next
+#: half-second poll. What the wait cannot fix — a supervisor that
+#: outlived its own ladder — is not fixed by waiting longer either:
+#: the directories are deleted afterwards regardless, because a
+#: stopping process is the last thing that could ever name them.
+SHUTDOWN_RELEASE_SECONDS = 30.0
 
 #: Concurrent open sessions, per **server**. v1.0 is single-tenant and
 #: one bearer token is one principal, so a per-user quota would be a
@@ -879,6 +906,14 @@ class SessionManager:
         #: Sessions this manager has taken away and whose build
         #: environment is still running. Drained by :meth:`take_released`.
         self._released: list[str] = []
+        #: Sessions whose **release** has not finished: their container
+        #: may still be there, their invocation may still be running and
+        #: their directory may still be on disk. Every path that takes a
+        #: session away puts it here, and it stays until a release
+        #: succeeds — which is what makes cleanup this server's own job
+        #: rather than something it needs a client to come back for.
+        #: Walked by :func:`release_pending` on every sweep.
+        self._release_pending: list[str] = []
 
     @property
     def open_count(self) -> int:
@@ -929,7 +964,8 @@ class SessionManager:
                 continue
             session.state = STATE_CLOSED
             session.reaped = over
-            session.discard_context()
+            self.mark_for_release(session.id)
+            _discard_if_free(session)
             reaped.append(session.id)
         return tuple(reaped)
 
@@ -961,6 +997,14 @@ class SessionManager:
         and a startup sweep would answer it by deleting the other's live
         sessions — trading a directory nobody can reach for credentials
         somebody is using.
+
+        **The containers go first**, and not here:
+        :func:`release_every_session` runs before this and is what stops
+        the builds. This is the last step of shutdown on purpose — the
+        directories are deleted even for a session that would not
+        release, because a stopping process is the last thing that could
+        ever name them, and credentials left behind are worse than a
+        thread that is about to lose its interpreter anyway.
         """
         for session in list(self._sessions.values()):
             if session.state == STATE_OPEN:
@@ -1004,6 +1048,46 @@ class SessionManager:
         released, self._released = tuple(self._released), []
         return released
 
+    def ids(self) -> tuple[str, ...]:
+        """Every session this manager holds, in the order they opened."""
+        return tuple(self._sessions)
+
+    def find(self, session_id: str) -> Session | None:
+        """The session called *session_id*, or ``None``. Never refuses.
+
+        :meth:`require` is the verbs' door and answers a client, with
+        every refusal a client has to hear; this is for the teardown
+        paths, which are answering nobody and must not raise over a
+        session that is already gone.
+        """
+        return self._sessions.get(session_id)
+
+    def mark_for_release(self, session_id: str) -> None:
+        """Record that this session still owes a release. Idempotent.
+
+        Set by every path that takes a session away and by a release
+        that did not finish. It is the one place that knows a container,
+        an invocation or a directory may still be out there, and the
+        sweep is what acts on it.
+        """
+        if session_id not in self._release_pending:
+            self._release_pending.append(session_id)
+
+    def pending_releases(self) -> tuple[str, ...]:
+        """The sessions whose release has not finished, oldest first.
+
+        Read rather than drained: an entry goes away when the release
+        actually succeeded (:meth:`finish_release`), because a sweep
+        that forgot a session it failed to release would be exactly the
+        leak this list exists against.
+        """
+        return tuple(self._release_pending)
+
+    def finish_release(self, session_id: str) -> None:
+        """Record that this session's release is over. Idempotent."""
+        if session_id in self._release_pending:
+            self._release_pending.remove(session_id)
+
     def _handover_ready(self, session: Session, now: float) -> bool:
         """Whether this session may be taken away for a waiting client.
 
@@ -1041,7 +1125,14 @@ class SessionManager:
         for session in ready[:wanted]:
             session.state = STATE_CLOSED
             session.reaped = GONE_HANDOVER
-            session.discard_context()
+            self.mark_for_release(session.id)
+            # Nothing is in flight here — that is one of the four
+            # conditions a handover has — so what decides is whether
+            # this session ever got a build environment. One that did
+            # keeps its directory until `release_session` has removed
+            # the container that mounts it, which `open-session` does
+            # before it answers the client this session was taken for.
+            _discard_if_free(session)
             self._released.append(session.id)
             taken.append(session.id)
         return tuple(taken)
@@ -1192,13 +1283,22 @@ class SessionManager:
         if over is not None:
             session.state = STATE_CLOSED
             session.reaped = over
-            # Reaped means reaped: the context goes with the lease, not
-            # at some later sweep. It holds a device's Matter
-            # commissioning credentials, and "we will get to it" is not
-            # a retention policy for those. The periodic sweep
-            # (:meth:`reap`) does the same thing for the client that
-            # never comes back at all.
-            session.discard_context()
+            # Reaped means reaped: a context nothing is holding goes
+            # with the lease rather than at some later sweep. It holds a
+            # device's Matter commissioning credentials, and "we will
+            # get to it" is not a retention policy for those.
+            #
+            # A session with a build environment is the sweep's, and so
+            # is the environment itself: this method is synchronous — it
+            # is answering a client mid-verb — and removing a container
+            # and waiting for a supervisor is not something a refusal
+            # can stop to do. Before this list existed, that was the
+            # whole of it: a session whose lease ran out here never
+            # reached `backend.release` at all, so its container and the
+            # thread driving it lived until the process did, and the
+            # tree was deleted under both.
+            self.mark_for_release(session.id)
+            _discard_if_free(session)
         if session.reaped is not None:
             raise SessionError(
                 "session.expired",
@@ -1249,11 +1349,9 @@ class SessionManager:
                 f'This server has no session called "{session_id}".',
                 session_id=session_id,
             )
-        for invocation_id, found in session.invocations.items():
-            if found == INVOCATION_RUNNING:
-                session.invocations[invocation_id] = INVOCATION_CANCELLING
-                _signal_cancellation(session, invocation_id)
+        _signal_running(session)
         session.state = STATE_CLOSED
+        self.mark_for_release(session_id)
         return session
 
 
@@ -1453,7 +1551,12 @@ async def open_session(state: Any, connection: Any, command: Command) -> dict[st
         # refused caller can free a slot too — for the head of the queue,
         # which the reservation holds it for.
         for released in state.sessions.take_released():
-            await state.backend.release(released, reaped=GONE_HANDOVER)
+            # The whole teardown and not only the container: the session
+            # this admission took away has a directory too, and the one
+            # order that holds is the one `release_session` walks. A
+            # release that does not finish stays on the manager's
+            # pending list and the sweep tries it again.
+            await release_session(state, released)
     return {
         "session": session.to_dict(),
         "lease": session.lease_dict(),
@@ -1549,6 +1652,138 @@ def _unpack_into(
         quota_bytes=state.config.session_quota_bytes,
         allow_context_file=allow_context_file,
     )
+
+
+def _signal_running(session: Session) -> None:
+    """Raise the stop signal for every invocation of *session* that runs.
+
+    The first step of every teardown there is, and the reason it is one
+    function: ``close-session``, the sweep, a handover and process
+    shutdown all take a session away, and a session taken away without
+    the sentinel would have its supervisor sit out the whole
+    ``cancel_grace_seconds`` before anything reached it. What follows —
+    removing the container and waiting for the supervisor — is bounded
+    by the ladder, and the ladder only starts where this file exists.
+
+    Running becomes *cancelling*, which is the state the invocation is
+    actually in: something has asked it to stop and it has not stopped
+    yet.
+    """
+    for invocation_id, found in session.invocations.items():
+        if found == INVOCATION_RUNNING:
+            session.invocations[invocation_id] = INVOCATION_CANCELLING
+            _signal_cancellation(session, invocation_id)
+
+
+def _discard_if_free(session: Session) -> bool:
+    """Delete the session's directory **if nothing can be holding it**.
+
+    The one rule the synchronous teardown paths share, in one place, and
+    the whole of what they are still allowed to delete by themselves.
+
+    Two things can be holding the tree, and neither of them can be
+    stopped from a synchronous method. A **build environment**: the
+    directory is what a session's container mounts, and no session has
+    one before ``send-context`` has chosen an image for it, which is
+    what :attr:`Session.image` records. **Work in flight**: an
+    invocation running or being cancelled, an upload arriving, an image
+    being fetched — with a supervisor on a worker thread reading the
+    same tree.
+
+    Neither of them: nothing on this machine can name the directory any
+    more, so it goes here and now. That is the promise the reaper exists
+    for — the credentials in ``keys/`` go with the lease rather than
+    with some later sweep — and it is kept for exactly the sessions
+    where keeping it is free.
+
+    Either of them: the deletion belongs to :func:`release_session`,
+    which does it in the order that holds — signal, remove the
+    container, wait for the supervisor, then delete. Every path that
+    leaves a session in this state marks it for release first, so the
+    directory outlives the lease by one sweep at the most.
+
+    Answers whether the directory was discarded here.
+    """
+    if session.image is not None or _is_working(session):
+        return False
+    session.discard_context()
+    return True
+
+
+async def release_session(state: Any, session_id: str, *, wait: float | None = None) -> bool:
+    """Take one session's build environment away, then its directory.
+
+    **The single teardown for every path**: ``close-session``, the
+    reaper's sweep, the handover admission makes, a lease that ran out
+    and process shutdown all end here, because they all mean the same
+    four things in the same order.
+
+    1. The stop signal for every invocation still running
+       (:func:`_signal_running`) — without it the ladder below has not
+       started and the wait in step 3 is a wait on nothing.
+    2. The container is removed. That is the kill: the cancel sentinel
+       never reached the process inside it and killing a ``docker exec``
+       client never did either.
+    3. The invocation's supervisor is waited for, bounded by the ladder
+       (or by *wait*, for a caller with a deadline of its own).
+    4. Only then the directory, with the context and every artifact in
+       it.
+
+    Answers whether the session was released. ``False`` leaves it marked
+    for release and its directory where it is, and the sweep tries again
+    on its next tick — cleanup is this server's own job, and a client
+    that never comes back must not be able to leave a container running
+    or a device's commissioning credentials on disk.
+    """
+    session = state.sessions.find(session_id)
+    if session is not None:
+        _signal_running(session)
+    reason = None if session is None else session.reaped
+    if not await state.backend.release(session_id, reaped=reason, wait=wait):
+        state.sessions.mark_for_release(session_id)
+        return False
+    if session is not None:
+        session.discard_context()
+    state.sessions.finish_release(session_id)
+    return True
+
+
+async def release_pending(state: Any) -> tuple[str, ...]:
+    """Try again for every session whose release has not finished.
+
+    The sweep's second half and the whole of the retry: sessions land on
+    this list from the reap in the same tick, from a handover admission
+    could not finish, from a lease that ran out inside a verb, and from
+    a release that ran out of ladder. Answers the ids that are still
+    pending afterwards, for the log.
+    """
+    for session_id in state.sessions.pending_releases():
+        await release_session(state, session_id)
+    return state.sessions.pending_releases()
+
+
+async def release_every_session(state: Any) -> None:
+    """Release every session this process holds, for shutdown.
+
+    One budget for the whole loop (:data:`SHUTDOWN_RELEASE_SECONDS`) and
+    the reason is in that constant: a stopping server is expected to be
+    gone. The containers are what matter and they are removed first for
+    every session; the wait that follows is the supervisor noticing, and
+    what has not noticed inside the budget is logged rather than waited
+    for.
+
+    The directories are **not** deleted here.
+    :meth:`SessionManager.shutdown` does that, after this, for every
+    session — including one this could not release, because a stopping
+    process is the last thing that could ever name its directory.
+    """
+    deadline = time.monotonic() + SHUTDOWN_RELEASE_SECONDS
+    for session_id in tuple(state.sessions.ids()):
+        remaining = max(0.0, deadline - time.monotonic())
+        if not await release_session(state, session_id, wait=remaining):
+            logger.error("session %s did not release before shutdown", session_id)
+    # And whatever is left without a session record to name it.
+    await state.backend.release_all(deadline=deadline)
 
 
 def _signal_cancellation(session: Session, invocation_id: str) -> None:
@@ -2688,8 +2923,17 @@ async def close_session(state: Any, connection: Any, command: Command) -> dict[s
     and minting a code for it is a protocol decision rather than an
     implementation choice — the same reason ``build``'s
     one-invocation-at-a-time guard gives for its own pre-registry
-    refusal. Sending ``close-session`` again repeats all four steps
-    against the same state, which is what makes a retry meaningful.
+    refusal.
+
+    **The retry is this server's own** and the message says so. The
+    session stays on the manager's release list and the sweep finishes
+    what this verb could not, within :data:`DEFAULT_REAP_INTERVAL`
+    seconds. That is what makes the refusal survivable, and it has to
+    be: a client cannot be relied on to ask twice — the workbench's own
+    session client forgets its session id in a ``finally`` as it closes
+    and would have nothing left to name — and a container left running
+    on a server nobody asks again is not something a client's manners
+    should decide.
 
     **The client gets no result for an implicitly cancelled invocation**
     (E39), and this verb no longer promises one survives. The guarantee
@@ -2701,16 +2945,15 @@ async def close_session(state: Any, connection: Any, command: Command) -> dict[s
     """
     session_id = command.require_str("session_id")
     session = state.sessions.close(session_id)
-    if not await state.backend.release(session_id):
+    if not await release_session(state, session_id):
         raise ProtocolError(
-            f'This server could not stop the build of session "{session_id}" and kept its '
-            "files instead of deleting them underneath it. Send close-session again in a "
-            "minute; if it keeps failing, restart the build server.",
+            f'This server could not stop the build of session "{session_id}" yet and kept '
+            "its files instead of deleting them underneath it. Nothing is left for you to "
+            "do: this server finishes the cleanup by itself within the minute.",
             code=protocol.ERROR_INTERNAL,
             frame_id=command.id,
             session_id=session_id,
         )
-    session.discard_context()
     return {"session": session.to_dict()}
 
 

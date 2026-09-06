@@ -16,6 +16,7 @@ documents that come back, and what reaches the client while it happens.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -2065,9 +2066,9 @@ async def test_close_session_reaps_the_container(client, config, docker) -> None
 
 
 async def test_close_session_kills_the_container_before_it_deletes_the_tree(
-    client, config, docker, state, monkeypatch
+    aiohttp_client, config, docker, monkeypatch
 ) -> None:
-    """The order is the guarantee, and it was the other way round.
+    """The order is the guarantee, and it was the other way round twice.
 
     E39 makes close an implicit cancel, and the cancel is best-effort:
     the sentinel is set for a program that happens to be between polls,
@@ -2077,15 +2078,41 @@ async def test_close_session_kills_the_container_before_it_deletes_the_tree(
     mount source out from under a program that is still running in it,
     and it also made the sentinel meaningless: it existed for the few
     microseconds between two statements.
+
+    The second half is the one this test grew: the container being gone
+    is not the invocation being over. The supervisor runs on a worker
+    thread, and closing used to return while that thread was still
+    walking its ladder — so the tree went away underneath it, and the
+    suite met the consequence as a run that passed every test and then
+    would not exit. So the drive task is asserted done here, at the
+    moment the verb has answered.
+
+    The grace is zero for the same reason it is zero in the ladder's own
+    tests: sixty seconds is the right number for a deployment and the
+    wrong one for a test, and what is asserted is the ladder's shape and
+    never its clock.
     """
     from mcuhome.workbench import orchestrator
 
+    from mcuhome.buildserver.app import ServerState, create_app
+
     docker.run_program = lambda action, request, on_line: FakeProcess(0, hang=True)
+    state = ServerState(replace(config, cancel_grace_seconds=0))
+    client = await aiohttp_client(create_app(state))
     async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
+        session_id, _ = await locked(ws, state.config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
         session = state.sessions.require(session_id)
         paths = session.paths
+        record = state.backend.record(session_id, "inv-1")
+        # The program is registered from the worker thread that
+        # supervises it, so "it is running" is something to wait for
+        # rather than to assume. A close that overtook the registration
+        # removed a container with nothing in the list to kill, and the
+        # invocation then sat out the whole cancel grace — which is the
+        # race that made this test take five minutes and not five
+        # milliseconds.
+        await _started(docker)
 
         seen: list[tuple[str, bool, bool]] = []
         real_answer = docker.answer
@@ -2100,9 +2127,72 @@ async def test_close_session_kills_the_container_before_it_deletes_the_tree(
         # through its seam and not through this server's own.
         monkeypatch.setattr(orchestrator, "_run_command", recording)
         await call(ws, "close-session", {"session_id": session_id}, frame_id="x")
+        assert record.drive.done(), "close-session answered while the supervisor was still up"
 
     assert seen == [("rm", True, True)], "the tree was still there and the signal was set"
     assert not paths.root.exists(), "and the tree is gone once the container is"
+
+
+async def _started(docker, *, timeout: float = 10.0) -> None:
+    """Wait until the fake has a running program, and fail if it never does."""
+    deadline = time.monotonic() + timeout
+    while not docker.running:
+        assert time.monotonic() < deadline, "the invocation never started a program"
+        await asyncio.sleep(0.01)
+
+
+async def test_close_session_refuses_when_the_supervisor_outlives_the_ladder(
+    aiohttp_client, config, docker, monkeypatch
+) -> None:
+    """The wait is bounded, and running out of it is an answer.
+
+    The ladder ends in a rung that gives up, so a supervisor that is
+    still there afterwards is not a slow build — it is a defect on this
+    side. Two things then must not happen: the verb must not delete the
+    session's files underneath the thread that is still reading them,
+    and it must not answer ``result`` as though it had. So the directory
+    stays, and the client is told.
+
+    The code is the pre-registry ``internal_error``: no code in the
+    typed registry means "this server could not stop its own build", and
+    minting one is a protocol decision rather than an implementation
+    choice.
+
+    And the refusal leaves the session in a state a retry can finish,
+    which is the second half of the test: nothing was forgotten, so the
+    same verb sent again walks the same steps and this time gets to the
+    end of them.
+    """
+    from mcuhome.buildserver import backend
+    from mcuhome.buildserver.app import ServerState, create_app
+
+    # The ladder as this test has it: nothing at all the first time
+    # round, so the wait runs out while the supervisor is still between
+    # two polls, and the real one afterwards.
+    waited = [0.0]
+    monkeypatch.setattr(backend, "_ladder_seconds", lambda config: waited[0])
+    docker.run_program = lambda action, request, on_line: FakeProcess(0, hang=True)
+    state = ServerState(config)
+    client = await aiohttp_client(create_app(state))
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, _ = await locked(ws, state.config)
+        await call(ws, "build", {"session_id": session_id}, frame_id="b")
+        paths = state.sessions.require(session_id).paths
+        record = state.backend.record(session_id, "inv-1")
+        await _started(docker)
+
+        refused = await call(ws, "close-session", {"session_id": session_id}, frame_id="x")
+        assert refused["error"]["code"] == "internal_error"
+        assert paths.root.exists(), "the tree stayed, which is the whole point of refusing"
+
+        # The container is gone, so the supervisor ends on its next poll
+        # and the retry finds nothing left to wait for.
+        waited[0] = 30.0
+        answered = await call(ws, "close-session", {"session_id": session_id}, frame_id="x2")
+
+    assert "error" not in answered, answered
+    assert record.drive.done()
+    assert not paths.root.exists(), "and the retry is what deleted it"
 
 
 async def test_one_invocation_at_a_time_per_session(client, config, docker) -> None:

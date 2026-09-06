@@ -50,6 +50,13 @@ jobs:
     name: Test (pytest)
     needs: check-gates
     runs-on: ubuntu-latest
+    # The suite is a four-minute job and starts nothing that waits on the
+    # outside world, so anything past twenty minutes is a hang and not a
+    # slow runner. It is worth bounding explicitly: a suite that passed
+    # every test and then would not exit held a runner for the default
+    # six hours once, and a job that fails after twenty minutes says what
+    # happened while one that is cancelled by hand says nothing.
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -2652,7 +2652,7 @@ def _last_seq(lines: tuple[dict[str, Any], ...], fallback: int) -> int:
 async def close_session(state: Any, connection: Any, command: Command) -> dict[str, Any]:
     """``close-session`` — release the session and reap its container.
 
-    Three things go, **in this order**, and the order is the whole of
+    Four things go, **in this order**, and the order is the whole of
     what this verb guarantees.
 
     1. The stop signal is set for every running invocation. It is
@@ -2661,13 +2661,35 @@ async def close_session(state: Any, connection: Any, command: Command) -> dict[s
     2. The container is removed, ``--force``. That is the kill — the
        cancel sentinel never reached the process inside the container,
        and killing a ``docker exec`` client never did either.
-    3. The per-session directory is deleted, with the context and every
+    3. The invocation is **waited for**: its supervisor holds a worker
+       thread, and that thread is what would otherwise still be reading
+       the directory the next step deletes. Removing the container ends
+       the program it supervises, so this is a moment in the normal
+       case; it is bounded by the liveness ladder for the case where it
+       is not.
+    4. The per-session directory is deleted, with the context and every
        artifact in it, which is why ``get-artifact`` has to run before
        this.
 
     Deleting the tree *before* removing the container was the order this
     verb had, and it was wrong in the one way that matters: it pulls the
     mount source out from under a program that is still running in it.
+    Deleting it before the supervisor came back was the same mistake one
+    layer up — the container was gone, but the thread driving it was
+    still there, and the suite met that as a process which passed every
+    test and then would not exit.
+
+    **A supervisor that outlives its own ladder is refused, not ignored.**
+    If the wait runs out, the session stays closed, its directory is
+    kept, and the client is told so instead of being handed an answer
+    that says the session's files are gone while a thread is still in
+    them. The code is the pre-registry ``internal_error``: nothing in
+    the typed registry means "this server could not stop its own build",
+    and minting a code for it is a protocol decision rather than an
+    implementation choice — the same reason ``build``'s
+    one-invocation-at-a-time guard gives for its own pre-registry
+    refusal. Sending ``close-session`` again repeats all four steps
+    against the same state, which is what makes a retry meaningful.
 
     **The client gets no result for an implicitly cancelled invocation**
     (E39), and this verb no longer promises one survives. The guarantee
@@ -2679,7 +2701,15 @@ async def close_session(state: Any, connection: Any, command: Command) -> dict[s
     """
     session_id = command.require_str("session_id")
     session = state.sessions.close(session_id)
-    await state.backend.release(session_id)
+    if not await state.backend.release(session_id):
+        raise ProtocolError(
+            f'This server could not stop the build of session "{session_id}" and kept its '
+            "files instead of deleting them underneath it. Send close-session again in a "
+            "minute; if it keeps failing, restart the build server.",
+            code=protocol.ERROR_INTERNAL,
+            frame_id=command.id,
+            session_id=session_id,
+        )
     session.discard_context()
     return {"session": session.to_dict()}
 

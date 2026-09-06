@@ -36,6 +36,7 @@ import hashlib
 import io
 import json
 import tarfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -291,6 +292,21 @@ class FakeDocker:
         #: this to a describe result document (JSON text).
         self.static_description: str | None = None
         self.static_reads: list[str] = []
+        #: Guards :attr:`running` and :attr:`removed`. Two threads reach
+        #: them and they reach them about each other: an invocation
+        #: registers its program from the worker thread supervising it,
+        #: while ``docker rm`` sweeps the same list from whichever
+        #: thread is tearing the session down. Without the lock the two
+        #: race, and the race is not a lost update but a program nobody
+        #: kills — which is what made one test wait out the whole cancel
+        #: grace and the suite hang behind it.
+        self._lock = threading.Lock()
+        #: How many invocation supervisors (``Invocation.run``, which is
+        #: what runs on a worker thread of the loop's default executor)
+        #: have been entered and left. Their difference is what
+        #: :func:`no_supervisor_outlives_a_test` asserts away.
+        self.supervisors_entered = 0
+        self.supervisors_left = 0
         if self.program is None:
             self.program = json.loads(json.dumps(PROGRAM))
         if self.run_program is None:
@@ -354,7 +370,6 @@ class FakeDocker:
                 self.mounts[PurePosixPath(target)] = Path(source)
             return container.Completed(status=0, output=identity + "\n")
         if rest[:1] == ["rm"]:
-            self.removed.append(rest[-1])
             # Removing a container ends what was running in it, which is
             # the whole reason the ladder's last rung is a teardown and
             # not a signal: killing a `docker exec` client never reached
@@ -362,9 +377,20 @@ class FakeDocker:
             # outlive its container would make that rung untestable —
             # and would hang every test that ends a session while a
             # build is still running, which is most of them.
-            for process in self.running:
+            #
+            # The removal is recorded **before** the sweep and under the
+            # lock, so that a program still being started on another
+            # thread finds it: `drive` kills what it registers into a
+            # container that is already gone. Either order of the two
+            # threads therefore ends the program, which is what a real
+            # `docker rm --force` guarantees and what a plain list did
+            # not.
+            with self._lock:
+                self.removed.append(rest[-1])
+                ending = list(self.running)
+                self.running.clear()
+            for process in ending:
                 process.kill()
-            self.running.clear()
             return container.Completed(status=0, output="")
         raise AssertionError(f"the fake docker was asked something unexpected: {argv}")
 
@@ -433,8 +459,31 @@ class FakeDocker:
         request = json.loads(request_path.read_text())
         self.invocations.append(Invocation(action=argv[-2], argv=argv, request=request))
         process = self.run_program(argv[-2], self.host_view(request), on_line or (lambda _: None))
-        self.running.append(process)
+        # `docker exec [--user U] <container> <program> <action> <request>`:
+        # the container this program runs in is the fourth from the end,
+        # and it is the only thing that says whether the program is
+        # already over before it was registered.
+        identity = argv[-4]
+        with self._lock:
+            self.running.append(process)
+            removed = identity in self.removed
+        if removed:
+            process.kill()
         return _Driven(process)
+
+    def supervisor_entered(self) -> None:
+        with self._lock:
+            self.supervisors_entered += 1
+
+    def supervisor_left(self) -> None:
+        with self._lock:
+            self.supervisors_left += 1
+
+    @property
+    def supervising(self) -> int:
+        """How many invocation supervisors are running right now."""
+        with self._lock:
+            return self.supervisors_entered - self.supervisors_left
 
     async def spawn(self, argv, *, on_line):
         self.calls.append(list(argv))
@@ -640,7 +689,49 @@ def docker(monkeypatch) -> FakeDocker:
     monkeypatch.setattr(container, "spawn_docker", fake.spawn)
     monkeypatch.setattr(orchestrator, "_run_command", fake.answer)
     monkeypatch.setattr(orchestrator, "_spawn_command", fake.drive)
+
+    # And a fifth seam, which fakes nothing: `Invocation.run` is what the
+    # backend hands to `asyncio.to_thread`, so entering and leaving it
+    # is exactly "a worker thread of the loop's default executor is
+    # supervising a build". Counting it is the only way a test can see
+    # that thread at all — a pool thread stays alive between work items,
+    # so `threading.enumerate` cannot tell a busy one from an idle one.
+    supervise = orchestrator.Invocation.run
+
+    def counted(invocation, **kwargs):
+        fake.supervisor_entered()
+        try:
+            return supervise(invocation, **kwargs)
+        finally:
+            fake.supervisor_left()
+
+    monkeypatch.setattr(orchestrator.Invocation, "run", counted)
     return fake
+
+
+@pytest.fixture(autouse=True)
+def no_supervisor_outlives_a_test(docker: FakeDocker):
+    """Fail the test that leaves an invocation supervisor running.
+
+    A session is released when its container is gone **and** the thread
+    supervising it has returned; the second half used to be nobody's
+    job, and what it cost was not a failing test but a passing suite
+    that would not exit — asyncio waits five minutes for the default
+    executor at interpreter exit and then says so in a warning, long
+    after the test that caused it is out of sight.
+
+    So it is stated here, once, for every test: at teardown the last
+    session is over — closed by the test, reaped by admission or taken
+    away by the app's own cleanup — and no supervisor of it may still be
+    running. The assertion is immediate and names the test that did it.
+    """
+    yield
+    running = docker.supervising
+    assert running == 0, (
+        f"{running} invocation supervisor(s) still running when the test ended: a worker "
+        "thread of the event loop's default executor outlived the session it belonged to, "
+        "which is what makes the suite hang at interpreter exit instead of failing here"
+    )
 
 
 def write_sdk_package(directory: Path, version: str, *, entries: dict[str, bytes] | None = None):

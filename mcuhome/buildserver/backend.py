@@ -110,6 +110,30 @@ ACTION_BUILD = "build"
 #: described by a specification the backend does not have."
 CONTRACT_VERSION = 1
 
+#: What the orchestrator's liveness ladder can still cost **after** the
+#: grace period, and the whole of what :meth:`SessionBackend.release`
+#: adds to ``cancel_grace_seconds`` when it waits for a supervisor to
+#: come back. It is that ladder read off and not a second policy beside
+#: it: SIGTERM one grace period after the sentinel, SIGKILL ten seconds
+#: later, thirty more before the supervisor gives up on a process that
+#: survived SIGKILL — plus a margin for the half-second poll interval
+#: and for judging the result document, which the invocation still does
+#: after the supervisor returns. Longer than the ladder is harmless
+#: (the wait ends when the supervisor does, which in practice is one
+#: poll after the container was removed); shorter would turn a slow
+#: teardown into a refusal, so the margin errs upwards.
+_LADDER_TAIL_SECONDS = 45.0
+
+
+def _ladder_seconds(config: Config) -> float:
+    """The whole ladder, from the cancel sentinel to the last rung.
+
+    The grace period is the operator's number and the tail is the
+    orchestrator's; a caller that has to wait for a cancelled invocation
+    waits for both, and for nothing it made up itself.
+    """
+    return config.cancel_grace_seconds + _LADDER_TAIL_SECONDS
+
 
 # --------------------------------------------------------------------------
 # What a build environment is, and what a session runs on
@@ -304,6 +328,14 @@ class InvocationRecord:
     #: request document, the sentinel and the judgement; this record owns
     #: the id, the wire and the replay.
     invocation: Any = None
+    #: The task running :meth:`SessionBackend._drive` for this
+    #: invocation, from ``invoke`` until the verdict is out. It is here
+    #: because :meth:`SessionBackend.release` has to wait for it: the
+    #: task holds a worker thread that is supervising a container, and a
+    #: thread still in that supervisor when the session's directory is
+    #: deleted is the one state neither half can recover from. ``None``
+    #: only in the window before ``invoke`` has started it.
+    drive: asyncio.Task[None] | None = None
     #: Filled when the invocation ends. Until then the artifact list is
     #: empty, which is the truthful answer to ``get-artifact``: nothing
     #: has been declared, so nothing has been verified.
@@ -964,6 +996,9 @@ class SessionBackend:
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        # Kept on the record and not only in `_tasks`, because release
+        # has to wait for *this session's* invocations and no others.
+        record.drive = task
         return record
 
     async def _drive(self, session: Any, runtime: SessionRuntime, record: InvocationRecord) -> None:
@@ -1192,8 +1227,14 @@ class SessionBackend:
     # Teardown
     # ----------------------------------------------------------------
 
-    async def release(self, session_id: str, *, reaped: str | None = None) -> None:
-        """Reap the session's build environment, if it had one. Never raises.
+    async def release(self, session_id: str, *, reaped: str | None = None) -> bool:
+        """Reap the session's build environment and wait for its invocation.
+
+        Never raises. Answers whether the session is **released**: the
+        container is gone and no invocation of it is running any more.
+        ``False`` is the one case a caller has to act on — the supervisor
+        did not come back inside the ladder — and it means the session's
+        directory must stay where it is.
 
         *reaped* is the half of the lease that ran out, and it is set by
         the sweep alone: a session this server took away owes its
@@ -1208,16 +1249,69 @@ class SessionBackend:
         working area of a child of this process. Either way, something
         still running against a deleted tree is the one state neither
         half can recover from.
+
+        **The order is the guarantee**, and the wait is the rung that was
+        missing from it. The container is removed first, because that —
+        and not a signal — is what stops a build; then this waits for the
+        invocation's own task, which is what holds the worker thread the
+        supervisor runs in; only then is the session forgotten and its
+        directory the caller's to delete. Removing the container ends the
+        ``docker exec`` client, so the wait is normally one poll long;
+        it is bounded by :func:`_ladder_seconds` for the case where it is
+        not.
+
+        A session that did not release keeps its runtime and its records:
+        nothing here has been forgotten, so the same call can be made
+        again — by the next ``close-session``, by the sweep, or by
+        process shutdown — and it walks the same three steps against the
+        same state.
         """
-        runtime = self._runtimes.pop(session_id, None)
+        runtime = self._runtimes.get(session_id)
         if reaped is not None:
             self._announce_reaping(session_id, reaped)
+        # Before the wait, so that the verdict this invocation is about
+        # to publish reaches nobody: the audience was told why the
+        # session went, and a second verdict frame would contradict the
+        # first.
         self._audience.pop(session_id, None)
+        if runtime is not None:
+            await self._release_runtime(runtime)
+        if not await self._join_invocations(session_id):
+            return False
+        self._runtimes.pop(session_id, None)
         for key in [key for key in self._records if key[0] == session_id]:
             self._records.pop(key, None)
-        if runtime is None:
-            return
-        await self._release_runtime(runtime)
+        return True
+
+    async def _join_invocations(self, session_id: str) -> bool:
+        """Wait for every running invocation of *session_id*. Never raises.
+
+        The task is not cancelled when the wait runs out, and that is
+        deliberate: it is blocked in :func:`asyncio.to_thread`, where
+        cancelling the task abandons the worker thread instead of
+        stopping it — which is precisely the state this method exists to
+        rule out. So a wait that ran out answers ``False`` and leaves the
+        thread the only thing that can end it: the ladder, whose own last
+        rung gives up on a process that survived SIGKILL.
+        """
+        tasks = {
+            record.drive
+            for (owner, _), record in self._records.items()
+            if owner == session_id and record.drive is not None and not record.drive.done()
+        }
+        if not tasks:
+            return True
+        _, pending = await asyncio.wait(tasks, timeout=_ladder_seconds(self.config))
+        if pending:
+            logger.error(
+                "session %s: %d invocation(s) still running after %.0fs; the session's "
+                "directory is kept",
+                session_id,
+                len(pending),
+                _ladder_seconds(self.config),
+            )
+            return False
+        return True
 
     def _announce_reaping(self, session_id: str, reaped: str) -> None:
         """Tell whoever is still listening that this session was taken away.
@@ -1263,8 +1357,15 @@ class SessionBackend:
             )
 
     async def release_all(self) -> None:
+        """Every session's build environment, for process shutdown.
+
+        A session that does not release is logged and left: the process
+        is going away, and there is nothing further this side can do
+        about a supervisor that outlived its own ladder.
+        """
         for session_id in list(self._runtimes):
-            await self.release(session_id)
+            if not await self.release(session_id):
+                logger.error("session %s was not released before shutdown", session_id)
 
 
 # --------------------------------------------------------------------------

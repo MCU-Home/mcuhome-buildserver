@@ -49,5 +49,6 @@
 #       "mcuhome-workbench @ git+https://github.com/mcu-home/mcuhome-workbench" \
 #       -e . --group dev
 -e ../mcuhome-sdk/packaging/model
+-e ../mcuhome-packagetool
 -e ../mcuhome-workbench
 -e .

@@ -71,6 +71,15 @@ jobs:
           repository: mcu-home/mcuhome-workbench
           path: .deps/mcuhome-workbench
 
+      # The workbench imports mcuhome.packagetool; it publishes no
+      # distribution of its own, so this sibling checkout satisfies that
+      # import the same way mcuhome-sdk and mcuhome-workbench above do.
+      - name: Checkout mcuhome-packagetool
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mcu-home/mcuhome-packagetool
+          path: .deps/mcuhome-packagetool
+
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -81,7 +90,9 @@ jobs:
           python -m venv .venv
           .venv/bin/pip install --disable-pip-version-check -U pip
           .venv/bin/pip install --disable-pip-version-check ./.deps/mcuhome-sdk/packaging/model
-          .venv/bin/pip install --disable-pip-version-check ./.deps/mcuhome-workbench
+          .venv/bin/pip install --disable-pip-version-check \
+            -e ./.deps/mcuhome-packagetool \
+            ./.deps/mcuhome-workbench
           .venv/bin/pip install --disable-pip-version-check -e . --group dev
 
       - name: scripts/test pytest
@@ -137,6 +148,15 @@ jobs:
           repository: mcu-home/mcuhome-workbench
           path: .deps/mcuhome-workbench
 
+      # The workbench imports mcuhome.packagetool; it publishes no
+      # distribution of its own, so this sibling checkout satisfies that
+      # import the same way the other three checkouts above/below do.
+      - name: Checkout mcuhome-packagetool
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mcu-home/mcuhome-packagetool
+          path: .deps/mcuhome-packagetool
+
       - name: Checkout mcuhome-cli
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -160,6 +180,7 @@ jobs:
           .venv/bin/pip install --disable-pip-version-check \
             -e ./.deps/mcuhome-sdk/packaging/model \
             -e ./.deps/mcuhome-sdk/packaging/compiler \
+            -e ./.deps/mcuhome-packagetool \
             -e './.deps/mcuhome-workbench[remote]' \
             -e ./.deps/mcuhome-cli \
             -e .

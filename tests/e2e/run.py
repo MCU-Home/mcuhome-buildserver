@@ -51,6 +51,13 @@ import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
 
+# The one thing under the context root that is not a session's: the
+# package registry's verified documents, which the server keeps because
+# they are its own. Taken from the server's own constant rather than
+# spelled again, so that a rename there cannot silently widen the check
+# that uses it.
+from mcuhome.buildserver.backend import REGISTRY_CACHE_DIR
+
 HERE = Path(__file__).resolve().parent
 FIXTURE = HERE / "project"
 DEVICE = "e2e-node"
@@ -218,9 +225,11 @@ def check_no_session_was_taken_away(log: Path) -> None:
         if marker in text:
             lines = [line for line in text.splitlines() if marker in line]
             raise Failed(f"the server log says {marker!r}: {lines[0]}")
-    if "container" not in text:
-        raise Failed("the server log never mentions a container — did this build run remotely?")
-    say("no session was reaped, and the server did start a container")
+    if "build environment" not in text:
+        raise Failed(
+            "the server log never names a build environment — did this build run remotely?"
+        )
+    say("no session was reaped, and the server did resolve a build environment")
 
 
 def check_the_private_key_never_travelled(project: Path, build_dir: Path, state: Path) -> None:
@@ -293,11 +302,21 @@ def check_the_signature_verifies(project: Path, build_dir: Path) -> None:
 
 
 def check_the_server_kept_nothing(state: Path) -> None:
-    """ADR 0019: a context lives for the session and is deleted with it."""
-    leftovers = [path for path in state.rglob("*") if path.is_file()]
+    """A context lives for the session and is deleted with it.
+
+    Everything under the context root except the server's own package
+    cache: the registry documents it verified are a property of the
+    *server* and not of any session — they are what makes the next
+    session's package lookup cheap — and deleting them with a session
+    would be reading "a context is deleted with its session" as "a
+    server forgets what it learned".
+    """
+    cache = state / REGISTRY_CACHE_DIR
+    kept = (path for path in state.rglob("*") if path.is_file())
+    leftovers = [path for path in kept if cache not in (path, *path.parents)]
     if leftovers:
         raise Failed(f"the server kept {len(leftovers)} file(s) after the session: {leftovers[:3]}")
-    say("the server kept nothing after the session closed")
+    say("the server kept no session file after the session closed")
 
 
 def check_the_document_says_what_it_did(document: dict) -> None:

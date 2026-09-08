@@ -966,7 +966,6 @@ class SessionBackend:
         action: str,
         pins: ContextPins,
         context_id: str,
-        mode: str | None = None,
     ) -> InvocationRecord:
         """Start one working invocation and answer immediately (E46).
 
@@ -976,16 +975,14 @@ class SessionBackend:
         minutes to hours long and a command frame that waited for it
         would make every client's socket a build timer.
 
-        *mode* is the ``build`` verb's operand and does not travel. Every
+        The ``build`` verb's ``mode`` does not reach here at all: every
         step of this profile runs in a **fresh container**, which is what
-        makes the specification's pristine-tree guarantee free — so a
-        step that was asked to be incremental is answered with a clean
-        build rather than with a promise this profile cannot keep.
-        ``verify`` starts nothing at all: it is answered from this
+        makes the specification's pristine-tree guarantee free, and a
+        container that starts empty has nothing to build incrementally
+        on. ``verify`` starts nothing at all — it is answered from this
         server's own measurement of the locked context, which the caller
         has already made.
         """
-        del mode
         if action == ACTION_VERIFY:
             return self._verify(session, connection, context_id=context_id)
         runtime = await self.ensure_runtime(session, pins, context_id=context_id)

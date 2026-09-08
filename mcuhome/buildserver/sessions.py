@@ -2380,15 +2380,15 @@ async def lock_context(state: Any, connection: Any, command: Command) -> dict[st
 
 
 async def _start_working(
-    state: Any, connection: Any, command: Command, *, action: str, mode: str | None = None
+    state: Any, connection: Any, command: Command, *, action: str
 ) -> dict[str, Any]:
     """The shared body of ``verify`` and ``build``.
 
-    One function because the two differ in exactly two things — the
-    action in ``argv[1]`` and whether a ``mode`` travels with it — and
-    everything in front of that is identical: the same state-machine
-    gates, the same integrity re-check, the same lazily materialized
-    container, the same immediate answer.
+    One function because the two differ in exactly one thing — what the
+    invocation is asked to do — and everything in front of that is
+    identical: the same state-machine gates, the same integrity
+    re-check, the same lazily materialized environment, the same
+    immediate answer.
 
     **The context is re-measured before every working invocation**
     rather than trusted from the lock (product-owner decision). Contexts
@@ -2428,7 +2428,6 @@ async def _start_working(
         action=action,
         pins=session.pins,
         context_id=session.context_id,
-        mode=mode,
     )
     return {
         "session_id": session.id,
@@ -2523,7 +2522,7 @@ async def build(state: Any, connection: Any, command: Command) -> dict[str, Any]
             "release artifact requires.",
             frame_id=command.id,
         )
-    answer = await _start_working(state, connection, command, action="build", mode=mode)
+    answer = await _start_working(state, connection, command, action="build")
     # What this server will actually do, which is the only honest thing
     # to answer: a client that asked for `incremental` gets a clean build
     # and is told so here rather than finding out from a build log.

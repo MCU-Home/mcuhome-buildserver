@@ -813,9 +813,18 @@ def buildable_context(sdk_sha256: str, **files: bytes) -> bytes:
     The difference from :func:`base_context` is one field: the SDK pin
     names a package the configured source directory holds. Everything
     else about a context is the same whether it is ever built or not,
-    which is why only the tests that build need this one.
+    which is why only the tests that build need this one — and the
+    generator declaration is here for the same reason it is in every
+    context a workbench writes: without it there is no build context at
+    all (build environment specification §9), and this server refuses one.
     """
-    return make_archive({"context.yaml": context_yaml(sdk_sha256=sdk_sha256), **files})
+    return make_archive(
+        {
+            "build-context.json": BUILD_CONTEXT_JSON.encode(),
+            "context.yaml": context_yaml(sdk_sha256=sdk_sha256),
+            **files,
+        }
+    )
 
 
 async def collect(ws, *, until: str, timeout: float = 15) -> list[dict]:

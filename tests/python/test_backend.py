@@ -36,18 +36,24 @@ from mcuhome.buildserver import sessions
 from tests.python.conftest import (
     BUILD_CONTEXT_BYTES,
     ENVIRONMENT,
+    ENVIRONMENT_VERSION,
     IMAGE,
     IMAGE_DIGEST,
+    IMAGE_LABELS,
     IMAGE_RUNNABLE,
+    IMAGE_TAG,
+    TOOLS_PACKAGE,
     FakeProcess,
     auth,
     buildable_context,
     call,
     collect,
     conforming_environment,
+    context_yaml,
     environment_labels,
     failing_environment,
     hanging_environment,
+    make_archive,
     send_archive,
     silent_environment,
     write_result,
@@ -424,6 +430,8 @@ async def test_a_working_verb_answers_the_invocation_id_immediately(client, conf
             "invocation_id": "inv-1",
             "action": "build",
             "context_id": context_id,
+            # What this server will actually do, whatever was asked for.
+            "mode": "clean",
         }
         frames = await collect(ws, until="invocation.verdict")
 
@@ -1950,3 +1958,214 @@ async def test_the_result_document_is_not_reported_as_a_leftover(
         record.getMessage() for record in caplog.records if "undeclared" in record.getMessage()
     ]
     assert noted == ["invocation inv-1: 1 undeclared file(s) left in out"], noted
+
+
+async def test_a_package_this_host_cannot_resolve_is_a_package_refusal(
+    client, config, docker
+) -> None:
+    """Which packages, and which image, are two questions with two answers.
+
+    A context pins the tools package by its family and an index says
+    which concrete package this host needs. An index that does not carry
+    that version answers nothing about any image — a client told "no
+    image declares this set" would go looking through repositories for a
+    set that was never resolved in the first place.
+    """
+    write_sdk_package(config.sdk_sources[0], "2.4.0")
+    index = config.sdk_sources[0] / "index.json"
+    index.write_text(json.dumps({"packages": {}}), encoding="utf-8")
+
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        frame = await send_archive(ws, "send-context", session_id, buildable_context("a" * 64))
+
+    assert frame["error"]["code"] == "sdk.unavailable", frame
+    assert "package" in frame["error"]["message"]
+
+
+async def test_a_package_index_naming_other_bytes_is_refused_as_a_package(
+    client, config, docker
+) -> None:
+    """Same version, different hash — the one thing that must never be shopped for.
+
+    A source that publishes the pinned version under other bytes is not
+    "this source does not have it": it is an answer an operator has to
+    see, and it is about a package rather than about an image.
+    """
+    write_sdk_package(config.sdk_sources[0], "2.4.0")
+    index = config.sdk_sources[0] / "index.json"
+    document = json.loads(index.read_text(encoding="utf-8"))
+    document["packages"][TOOLS_PACKAGE][ENVIRONMENT_VERSION]["sha256"] = "1" * 64
+    index.write_text(json.dumps(document), encoding="utf-8")
+
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        frame = await send_archive(ws, "send-context", session_id, buildable_context("a" * 64))
+
+    assert frame["error"]["code"] == "sdk.unavailable", frame
+
+
+async def test_no_image_declares_the_set_names_every_candidate_and_its_reason(
+    client, config, registry
+) -> None:
+    """The refusal comes after every candidate was tried, and says why for each.
+
+    An image built from the same package *versions* under other bytes and
+    an image that was never published read identically in a one-line
+    message, and the difference is the whole point: one is a different
+    environment that must never be substituted, the other is nothing at
+    all. So the refusal carries what was wanted, which repositories this
+    server may look in, and the workbench's own account of each
+    candidate.
+    """
+    registry.tags_ = (IMAGE_TAG, "2.4.0-r2")
+    registry.labels_ = environment_labels(workspace=f"{ENVIRONMENT_VERSION}@sha256:{'1' * 64}")
+
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+        frame = await send_archive(ws, "send-context", session_id, buildable_context(sha256))
+
+    error = frame["error"]
+    assert error["code"] == "version.builder-unsatisfiable"
+    assert error["retryable"] is False
+    assert error["details"]["required"] == ENVIRONMENT.described()
+    assert error["details"]["allowed"] == [IMAGE]
+    problem = error["details"]["problem"]
+    for tag in registry.tags_:
+        assert f"{IMAGE}:{tag}" in problem, problem
+    assert "1" * 64 in problem, "the near miss is named by the bytes that differ"
+
+
+async def test_the_allowlist_is_walked_in_order_and_the_first_match_wins(
+    aiohttp_client, config, docker, registry
+) -> None:
+    """Two repositories, and the order is the operator's statement.
+
+    The list is a search list as well as a boundary: an operator who puts
+    their own mirror first means their own mirror, and a resolver that
+    asked the second one anyway would be deciding where a build's bytes
+    come from.
+    """
+    from mcuhome.buildserver.app import ServerState, create_app
+
+    mirror = "registry.example.test/mcuhome/build-environment"
+    registry.repositories = {mirror: IMAGE_LABELS, IMAGE: IMAGE_LABELS}
+    state = ServerState(replace(config, allowed_environments=(mirror, IMAGE)))
+    client = await aiohttp_client(create_app(state))
+    # The bytes the first repository answers with are on this host, so
+    # nothing is fetched and the choice is the only thing under test.
+    docker.images[f"{mirror}@{IMAGE_DIGEST}"] = {
+        "Id": "sha256:" + "c" * 64,
+        "RepoTags": [],
+        "RepoDigests": [f"{mirror}@{IMAGE_DIGEST}"],
+        "Config": {"Labels": dict(IMAGE_LABELS)},
+    }
+
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        sha256 = write_sdk_package(state.config.sdk_sources[0], "2.4.0")
+        frame = await send_archive(ws, "send-context", session_id, buildable_context(sha256))
+
+    assert frame["type"] == "result", frame
+    assert frame["payload"]["container"]["build_environment"].startswith(mirror)
+    assert all(not asked.startswith(IMAGE) for asked in registry.asked), (
+        "the second repository was asked although the first one answered"
+    )
+
+
+async def test_a_context_without_a_generator_declaration_is_refused(client, config) -> None:
+    """A context that says nothing about who wrote it is not a build context.
+
+    The build environment specification makes ``build-context.json`` and
+    a readable ``generator`` in it part of what a build context *is*, and
+    has the orchestrator refuse one that carries neither before the
+    environment is started. It has to be refused rather than passed on,
+    because that chain is what the environment's own "which contexts do I
+    accept" declaration is checked against: read as empty, the check
+    would silently pass for a context no environment ever agreed to.
+    """
+    sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        frame = await send_archive(
+            ws,
+            "send-context",
+            session_id,
+            make_archive({"context.yaml": context_yaml(sdk_sha256=sha256)}),
+        )
+
+    error = frame["error"]
+    assert error["code"] == "context.missing"
+    assert error["retryable"] is False
+    assert "build-context.json" in error["message"]
+
+
+async def test_an_unreadable_generator_declaration_is_refused_too(client, config) -> None:
+    """Present and unreadable is the same answer as absent.
+
+    Half a declaration is not a weaker statement than none: either way
+    there is nothing to hold an environment's constraint against, and a
+    reader that recovered from it would be inventing the one value the
+    check is made of.
+    """
+    sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        frame = await send_archive(
+            ws,
+            "send-context",
+            session_id,
+            make_archive(
+                {
+                    "build-context.json": b"{not json",
+                    "context.yaml": context_yaml(sdk_sha256=sha256),
+                }
+            ),
+        )
+
+    assert frame["error"]["code"] == "context.missing"
+
+
+async def test_a_build_asked_for_incrementally_is_answered_as_the_clean_one_it_is(
+    client, config
+) -> None:
+    """The verb answers what will happen, not what was asked for.
+
+    Every step runs in a fresh container, so there is nothing for an
+    incremental build to be incremental against. Answering a clean build
+    is never wrong — it is what was asked for plus time — but leaving a
+    client to assume its word was honoured would be, so the mode this
+    server will use is in the acknowledgement.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, _ = await locked(ws, config)
+        answer = await call(
+            ws, "build", {"session_id": session_id, "mode": "incremental"}, frame_id="b"
+        )
+        await collect(ws, until="invocation.verdict")
+
+    assert answer["payload"]["mode"] == "clean"
+
+
+async def test_a_verify_answers_its_verb_before_it_reports_the_verdict(client, config) -> None:
+    """The frame that names an invocation comes before the frames about it.
+
+    A verify is over before its handler returns — this server answers it
+    from its own measurement — so the two events it produces would
+    otherwise be queued in front of the result frame that first tells the
+    client what the invocation is called. The frames of one connection go
+    out in the order they were queued, so the fix is to queue them after,
+    and the order is worth pinning because it is the one an ordinary
+    client reads without thinking about it.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, _ = await locked(ws, config)
+        await ws.send_json({"id": "v", "type": "verify", "payload": {"session_id": session_id}})
+        frames = await collect(ws, until="invocation.verdict")
+
+    kinds = [
+        frame.get("event") if frame.get("type") == "event" else frame.get("type")
+        for frame in frames
+    ]
+    assert kinds == ["result", "invocation.started", "invocation.verdict"], frames

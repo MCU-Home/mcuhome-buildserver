@@ -65,17 +65,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from mcuhome.model.buildenvironment import Declaration
+from mcuhome.model.buildenvironment import Declaration, PackageMember
 from mcuhome.model.context import (
     BUILD_CONTEXT_FILE,
     DeveloperEnvironment,
     format_generator_chain,
 )
-from mcuhome.model.errors import BuildError
+from mcuhome.model.errors import BuildError, MCUHomeError
 from mcuhome.model.jobs import BuildLimits
 from mcuhome.model.sdkindex import SDK_PACKAGE_NAME
 from mcuhome.workbench import api as workbench
-from mcuhome.workbench import buildenvsession, containerbuild, packagefetch, packageregistry
+from mcuhome.workbench import (
+    buildenvsession,
+    containerbuild,
+    packagefetch,
+    packageregistry,
+    resolve_pins,
+)
 from mcuhome.workbench import resolve_image as image_lookup
 from mcuhome.workbench.buildenvsession import LocalOutcome
 from mcuhome.workbench.buildprocess import current_user
@@ -103,6 +109,7 @@ _LOGGER = logging.getLogger(__name__)
 __all__ = [
     "ACTION_BUILD",
     "ACTION_VERIFY",
+    "REGISTRY_CACHE_DIR",
     "SPEC_GENERATION",
     "EnvironmentProfile",
     "InvocationRecord",
@@ -128,6 +135,12 @@ ACTION_VERIFY = "verify"
 #: workbench's session object and there is exactly one generation in
 #: play at a time.
 SPEC_GENERATION = buildenvsession.SPEC_GENERATION
+
+#: Where the package registry's verified documents are kept: under the
+#: context root, beside the session directories and never inside one. It
+#: is the server's own state — one operator directory holds everything
+#: this process writes — and it survives the sessions that filled it.
+REGISTRY_CACHE_DIR = ".registry"
 
 #: The statuses a verdict frame carries. Three of them are the result
 #: document's (§6.2); ``cancelled`` is this server's own, for an
@@ -236,7 +249,11 @@ class EnvironmentProfile:
             "packages": {
                 name: member.value() for name, member in sorted(declaration.packages.items())
             },
-            "actions": [ACTION_BUILD],
+            # What a client may ask this session for, which is this
+            # server's answer and not the image's: `build` is the one
+            # action an environment is started for, and `verify` is
+            # answered here without starting anything.
+            "actions": [ACTION_BUILD, ACTION_VERIFY],
         }
 
 
@@ -490,26 +507,26 @@ class SessionBackend:
                 what="the image this build was pinned to",
             )
         await asyncio.to_thread(self._require_runtime)
+        # The two halves are asked separately because they fail
+        # differently and a client can act on exactly one of the two
+        # answers. **Which packages** this host needs is a question about
+        # packages: the index does not carry the version, it carries it
+        # under other bytes, or it cannot be read at all — and none of
+        # that is a statement about any image. **Which image delivers
+        # them** is the question that comes after, and only its refusal
+        # may say that no image declares the set.
+        try:
+            wanted = await asyncio.to_thread(self._concrete_packages, environment)
+        except workbench.MCUHomeError as unresolvable:
+            raise _unresolvable_packages(unresolvable) from unresolvable
         try:
             match = await asyncio.to_thread(
-                containerbuild.image_for_context,
-                environment,
-                repositories=self.config.allowed_environments,
-                image_pin=image_pin,
-                # The operator's own package directories first, exactly
-                # as the SDK is acquired: a host that mirrors what its
-                # sessions pin resolves the set without a network.
-                sources=tuple(self.config.sdk_sources),
-                registry=self._package_registry(),
-                images=self._images,
+                image_lookup.image_for_packages,
+                wanted,
+                registry=self._images,
+                repositories=tuple(self.config.allowed_environments),
+                pin=pin,
             )
-        except packageregistry.PackageRegistryError as unreadable:
-            # The packages could not be resolved at all — the index that
-            # says which concrete package this host needs was not
-            # readable. That is a statement about a package and not about
-            # any image, and saying "no image declares this set" would
-            # send an operator looking in the wrong place.
-            raise _materialization_refusal(unreadable) from unreadable
         except workbench.MCUHomeError as refusal:
             raise _no_image_for_a_package_set(
                 pins, refusal, allowed=self.config.allowed_environments
@@ -518,6 +535,40 @@ class SessionBackend:
         self._check_declaration(profile, context)
         fetched = await self._present(profile, on_progress=on_progress)
         return EnvironmentProfile(match=match, fetched=fetched)
+
+    def _concrete_packages(self, environment: Any) -> dict[str, PackageMember]:
+        """The packages **this host** needs, out of what the context pins.
+
+        A context pins the tools package by its *family* — that is what
+        lets one context build the same firmware on hosts of two
+        architectures — while an image contains one platform's package
+        and declares it by its concrete name. The resolution is the
+        workbench's own (:func:`~mcuhome.workbench.resolve_pins.concrete_package`,
+        the same call a local build provisions from, which also checks
+        the pinned hash against the family's entry), asked here rather
+        than inside the image lookup so that a package this host cannot
+        resolve is answered as a package and not as a missing image.
+
+        The operator's own directories are searched first and MCUHome's
+        package registry behind them, exactly as the SDK is acquired: a
+        host that mirrors what its sessions pin resolves the set without
+        a network.
+        """
+        wanted: dict[str, PackageMember] = {}
+        for package, source in (
+            (environment.workspace, resolve_pins.BUILD_WORKSPACE_SOURCE),
+            (environment.tools, resolve_pins.BUILD_TOOLS_SOURCE),
+        ):
+            found = resolve_pins.concrete_package(
+                package,
+                source=source,
+                sources=tuple(self.config.sdk_sources),
+                registry=self._package_registry(),
+            )
+            wanted[found.name] = PackageMember(
+                name=found.name, version=found.version, sha256=found.sha256
+            )
+        return wanted
 
     def _check_declaration(self, profile: EnvironmentProfile, context: Path) -> None:
         """What the image declares, against what this context needs.
@@ -616,7 +667,13 @@ class SessionBackend:
             # file entirely, and this server has no project.
             project_root=self.config.context_root,
             settings=(packageregistry.RegistrySettings(base_domain=domain, anchor=anchor),),
-            into=self.config.context_root / ".registry",
+            # Under the context root and **outside every session**: the
+            # documents a registry serves are verified once and are the
+            # *server's*, not any one session's — a cache thrown away
+            # with a session would be re-fetched by the next one. The
+            # context root is the directory this server was given to own,
+            # which makes it the one place an operator has to know about.
+            into=self.config.context_root / REGISTRY_CACHE_DIR,
             on_warning=lambda line: logger.warning("registry: %s", line),
         )
         return self._registry
@@ -629,11 +686,20 @@ class SessionBackend:
         """The image this session was answered with, still on this host.
 
         The whole of "one session, one build environment": the profile is
-        the one :meth:`resolve_image` produced at ``send-context`` and
-        ``lock-context`` froze into ``manifest.yaml``, taken off the
-        session rather than chosen again. What is checked here is only
-        that it is still present, because a build that started against an
-        image removed in between would fail somewhere unhelpful.
+        the one :meth:`resolve_image` produced at ``send-context``, held
+        on the session and taken off it rather than chosen again. What is
+        checked here is only that it is still present, because a build
+        that started against an image removed in between would fail
+        somewhere unhelpful.
+
+        **The frozen manifest does not record it, and cannot.** A context
+        pins the environment's *packages* and its identity is computed
+        over them; an image is one delivery of that set, and writing the
+        delivery into the document that defines the identity would make
+        two builds of one context on two hosts two different contexts.
+        Which delivery ran is answered where it belongs — at
+        ``send-context``, and in the verdict a client keeps — rather than
+        in the record of what was built.
         """
         profile = session.image
         assert isinstance(profile, EnvironmentProfile)  # noqa: S101 - resolve_image's own type
@@ -984,7 +1050,6 @@ class SessionBackend:
         session.invocations[record.id] = _RUNNING
         self._records[(session.id, record.id)] = record
         self.attach(session.id, connection)
-        self._emit(record, "invocation.started", action=ACTION_VERIFY, context=context_id)
         outcome = LocalOutcome(
             action=ACTION_VERIFY,
             context_id=context_id,
@@ -995,8 +1060,22 @@ class SessionBackend:
         record.outcome = outcome
         session.invocations[record.id] = _FINISHED
         session.touch()
-        self._emit_verdict(record, outcome)
+        # **After the verb's own answer, and that is the whole reason
+        # this is deferred.** The frames of one connection go out in the
+        # order they were queued, and this invocation is over before the
+        # handler returns — so queueing them here would put the verdict
+        # of an invocation on the wire in front of the frame that first
+        # names its id. The callback runs on the next turn of the loop,
+        # by which time the result frame is queued.
+        asyncio.get_running_loop().call_soon(self._answer_verify, record, outcome, context_id)
         return record
+
+    def _answer_verify(
+        self, record: InvocationRecord, outcome: LocalOutcome, context_id: str
+    ) -> None:
+        """The two frames a verify produces, once its own answer has gone out."""
+        self._emit(record, "invocation.started", action=ACTION_VERIFY, context=context_id)
+        self._emit_verdict(record, outcome)
 
     async def _drive(self, session: Any, runtime: SessionRuntime, record: InvocationRecord) -> None:
         """Run the invocation to its end, whatever its end turns out to be.
@@ -1279,7 +1358,7 @@ class SessionBackend:
         invocation's own task, which is what holds the worker thread the
         supervisor runs in; only then is the session forgotten and its
         directory the caller's to delete. Removing the container ends the
-        ``docker exec`` client, so the wait is normally one poll long;
+        step it supervises, so the wait is normally one poll long;
         it is bounded by :func:`_ladder_seconds` for the case where it is
         not.
 
@@ -1470,6 +1549,33 @@ def _materialization_refusal(refusal: Exception) -> SessionError:
     return SessionError(code, str(refusal.message), problem=str(refusal))
 
 
+def _unresolvable_packages(refusal: Exception) -> SessionError:
+    """A package this server could not resolve, whatever went wrong with it.
+
+    Three things can: the sources do not carry the version, one of them
+    carries it under *other bytes* — which is never shopped around for —
+    or the registry behind them could not be read. All three are
+    ``sdk.unavailable``: this server has no such package, and the
+    workbench's own sentence in the details is what says which of the
+    three it was.
+
+    The typed refusals that carry their own detail shape keep it
+    (:func:`_materialization_refusal`); everything else is a package
+    refusal in words, and a refusal in words is still a refusal about a
+    package rather than a defect on this side.
+    """
+    try:
+        return _materialization_refusal(refusal)
+    except Exception:  # noqa: BLE001 - a refusal this table does not know by type
+        return SessionError(
+            "sdk.unavailable",
+            "This server could not resolve a package this context pins. Its packages "
+            "come from the directories its operator configured and from MCUHome's own "
+            "package registry behind them.",
+            problem=str(refusal),
+        )
+
+
 def _no_image_for_a_package_set(
     pins: ContextPins, refusal: Exception, *, allowed: Sequence[str]
 ) -> SessionError:
@@ -1564,19 +1670,32 @@ def _wire_status(outcome: LocalOutcome, record: InvocationRecord) -> str:
 
 
 def _generator_chain(context: Path) -> str:
-    """The generator chain of the context at *context*, for §9.1's check.
+    """The generator chain of the context at *context*, or a refusal.
 
     Read with the workbench's own reader, so that the one place that
-    knows what a chain looks like is the one place that parses it. A
-    context without a readable one answers empty, and the check is then
-    not made here — the environment refuses such a context itself, and
-    inventing a chain to check against would be this server answering for
-    it.
+    knows what a chain looks like is the one place that parses it.
+
+    **A context without one is refused here**, and that is the
+    specification's own rule rather than this server's strictness: §9
+    makes ``build-context.json`` and a readable ``generator`` in it part
+    of what a build context *is*, and says the orchestrator refuses a
+    context that has neither "before your environment is started". It has
+    to be this side, too, because the chain is what §9.1's constraint
+    check is made against: a missing chain read as an empty one would
+    turn "this environment accepts nothing of yours" into a check that
+    silently passed.
     """
     try:
         return format_generator_chain(read_generator_chain(context / BUILD_CONTEXT_FILE))
-    except Exception:  # noqa: BLE001 - an unreadable chain is simply not checked here
-        return ""
+    except MCUHomeError as unreadable:
+        raise SessionError(
+            "context.missing",
+            f"This build context carries no readable {BUILD_CONTEXT_FILE}. It is what "
+            "says which tool wrote the context, and a build environment declares which "
+            "tools' contexts it accepts — without it there is nothing to hold that "
+            "declaration against, so no environment may be started for it.",
+            problem=str(unreadable),
+        ) from unreadable
 
 
 def _described(limits: BuildLimits) -> str:

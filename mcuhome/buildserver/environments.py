@@ -54,9 +54,7 @@ from mcuhome.model.imageref import DOCKER_HUB, parse_reference
 from mcuhome.buildserver.errors import SessionError
 
 __all__ = [
-    "digest_of",
     "check_allowed",
-    "digest_reference",
     "repository_of",
 ]
 
@@ -112,41 +110,3 @@ def check_allowed(reference: str, *, allowed: Iterable[str], what: str) -> None:
         repository=repository,
         allowed=sorted(listed),
     )
-
-
-def digest_of(reference: str) -> str:
-    """The ``sha256:…`` half of *reference*, or ``""`` when it has none.
-
-    The value an image is matched by: a reference is a name and names
-    move, so what decides whether this host has the right bytes is the
-    digest and nothing else. A reference without one answers empty rather
-    than raising — the caller then finds no image, which is the truthful
-    outcome for a name that pins nothing.
-    """
-    try:
-        parsed = parse_reference(reference, default_registry=DOCKER_HUB)
-    except Exception:  # noqa: BLE001 - a name the caller will fail on anyway
-        return ""
-    return parsed.digest or ""
-
-
-def digest_reference(reference: str) -> str:
-    """*reference* as ``repository@digest`` — the name docker reports back.
-
-    A pinned reference carries a tag *and* a digest, which docker
-    resolves without complaint but never *reports*: what an image
-    inspect lists are the names it has, and those are repo tags and repo
-    digests, never a mixture. So a lookup that has to recognize its own
-    answer asks by the half that appears in ``RepoDigests``.
-
-    A reference with no digest answers as itself: the caller is asking
-    about something that was never pinned, and inventing a spelling for
-    it would be worse than passing the one it was given.
-    """
-    try:
-        parsed = parse_reference(reference, default_registry=DOCKER_HUB)
-    except Exception:  # noqa: BLE001 - a name the caller will fail on anyway
-        return reference
-    if parsed.digest is None:
-        return reference
-    return f"{parsed.repository}@{parsed.digest}"

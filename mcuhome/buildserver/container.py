@@ -155,10 +155,10 @@ def _no_runtime(program: str, what: str) -> SessionError:
 class Docker:
     """The container runtime, as this server uses it.
 
-    One object per server process, holding the program name and the two
-    seam functions. Nothing here is cached — :class:`ImageFacts` are
-    cheap and ``describe`` is what the backend caches, because
-    ``describe`` is what costs a container start.
+    One object per server process, holding the program name and the one
+    seam function. Nothing is cached: :class:`ImageFacts` are two cheap
+    commands, and nothing here is asked often enough to be worth a memo
+    that could come to mean a different image.
     """
 
     def __init__(
@@ -166,11 +166,9 @@ class Docker:
         program: str = "docker",
         *,
         runner: Callable[[Sequence[str]], Any] | None = None,
-        spawner: Callable[..., Any] | None = None,
     ) -> None:
         self.program = program
         self._runner = runner
-        self._spawner = spawner
 
     async def _run(self, *arguments: str) -> Completed:
         argv = [self.program, *arguments]
@@ -317,11 +315,10 @@ def _addressable(line: str) -> str | None:
 def _reference_of(data: dict[str, Any], references: Sequence[str]) -> str | None:
     """Which of *references* this ``image inspect`` object is about.
 
-    The three fields that name an image, in the order the two callers
-    use them: :meth:`Docker.inventory` asks by ``repository:tag`` and
-    :meth:`Docker.image` asks by ``repository@digest``, and the id is
-    there because ``docker image inspect`` accepts one and an operator's
-    reference may be one.
+    The three fields that name an image, in the order the caller uses
+    them: :meth:`Docker.inventory` asks by ``repository:tag`` or by
+    ``repository@digest``, and the id is there because ``docker image
+    inspect`` accepts one and an operator's reference may be one.
     """
     names = {str(entry) for entry in _string_list(data.get("RepoTags"))}
     names |= {str(entry) for entry in _string_list(data.get("RepoDigests"))}

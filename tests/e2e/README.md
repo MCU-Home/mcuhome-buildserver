@@ -1,7 +1,7 @@
 # The end-to-end job
 
 One real remote build, with nothing faked: this server as a process, a
-real build container, `mcuhome device build --build-mode remote` driven
+real build container, `mcuhome device build --build-target remote` driven
 at it over a real socket, and a signed image at the end.
 
 ## Why it exists

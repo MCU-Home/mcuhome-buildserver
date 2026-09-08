@@ -153,6 +153,26 @@ def server(*, sdk_dir: Path, state: Path, log: Path, token: str):
                 process.wait(timeout=10)
 
 
+def initialize(project: Path) -> None:
+    """Make the copied fixture a project the way a person's own is.
+
+    The fixture carries devices and a configuration file, and its
+    ``secrets/`` is deliberately not in the repository — so the copy has
+    no trust anchor, and a client that resolves the build environment's
+    packages against the package registry stops there before it ever
+    reaches the server. ``project init`` over the copy writes exactly
+    what a real project gets, out of the workbench's own bundled anchor,
+    which is what the harness is supposed to be exercising.
+    """
+    subprocess.run(  # noqa: S603
+        ["mcuhome", "project", "init", ".", "--force"],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+
 def build(project: Path, *, port: int, token: str, sdk_dir: Path) -> tuple[dict, int, float]:
     """``mcuhome device build`` at the remote target. Returns the document."""
     argv = [
@@ -356,6 +376,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     state = workspace / "server-state"
     log = workspace / "server.log"
     shutil.copytree(FIXTURE, project)
+    initialize(project)
     state.mkdir()
 
     print(f"workspace {workspace}", flush=True)

@@ -12,7 +12,7 @@
 # key needed since the repositories went public (ADR 0024).
 #
 # test-e2e is one real remote build: this server as a process, a real
-# build container, `mcuhome device build --build-mode remote` against
+# build container, `mcuhome device build --build-target remote` against
 # it, and a signed image at the end. The unit suite fakes docker —
 # correctly, a build server is an orchestrator — and that is exactly why
 # three lease-versus-time defects and one address parsed as a URL

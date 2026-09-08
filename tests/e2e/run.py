@@ -11,7 +11,7 @@ own build — and one was about an address being parsed as a URL. A fake
 has no clock worth outrunning and never dials anything.
 
 So this harness fakes nothing. It starts the server as a process, hands
-it a real SDK package, and drives ``mcuhome device build --build-mode
+it a real SDK package, and drives ``mcuhome device build --build-target
 remote`` at it over a real socket. What it then checks is listed in
 :func:`main` and each check prints the line it proves, because a green
 job that verified nothing is the failure mode this file exists to
@@ -154,13 +154,13 @@ def server(*, sdk_dir: Path, state: Path, log: Path, token: str):
 
 
 def build(project: Path, *, port: int, token: str, sdk_dir: Path) -> tuple[dict, int, float]:
-    """``mcuhome device build`` through the remote method. Returns the document."""
+    """``mcuhome device build`` at the remote target. Returns the document."""
     argv = [
         "mcuhome",
         "device",
         "build",
         DEVICE,
-        "--build-mode",
+        "--build-target",
         "remote",
         "--build-server",
         f"127.0.0.1:{port}",

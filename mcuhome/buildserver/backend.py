@@ -104,8 +104,6 @@ from mcuhome.buildserver.contextstore import (
 from mcuhome.buildserver.errors import SessionError
 from mcuhome.buildserver.processes import LineSink
 
-_LOGGER = logging.getLogger(__name__)
-
 __all__ = [
     "ACTION_BUILD",
     "ACTION_VERIFY",

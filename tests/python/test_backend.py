@@ -1597,7 +1597,7 @@ async def test_verify_is_answered_without_starting_anything(client, config, dock
     assert not any(argv[1:2] == ["run"] for argv in docker.calls)
 
 
-async def test_a_context_that_moved_fails_verify_without_poisoning_the_session(
+async def test_a_session_still_answers_attach_session_after_a_failed_verify(
     client, config, state
 ) -> None:
     """A mismatch is a failed invocation and not a dead session.

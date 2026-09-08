@@ -782,15 +782,16 @@ async def test_cancel_racing_a_natural_completion_is_not_an_error(client, state)
     assert frame["payload"]["already_finished"] is True
 
 
-async def test_the_exits_of_a_session_stay_open_after_a_failed_build(client, state) -> None:
-    """A session that failed at work still answers the verbs that get the work out.
+async def test_the_exits_of_a_session_answer_while_an_invocation_is_running(client, state) -> None:
+    """A locked, busy session still answers the verbs that get the work out.
 
     There is no terminal state below ``closed`` any more, and there is
     nothing left that could create one: a step builds in a container that
     is thrown away, so no failure can leave this session's next build a
-    different one. What is worth pinning is the consequence — after a
-    failure a client can still ask for what the invocation declared,
-    still stop what is running, and still close.
+    different one. What is worth pinning is that while the context is
+    locked and an invocation is still running, a client can ask for what
+    that invocation declared, stop it, and close the session — none of
+    the three is refused for being asked too early.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await _open(ws)

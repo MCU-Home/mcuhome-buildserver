@@ -41,7 +41,7 @@ workspace somebody maintains themselves names no packages anybody else has, and
 this server says so instead of guessing. Neither can a context that does not say
 which tool wrote it: the declaration is what a build environment's own "which
 contexts do I accept" is checked against, so a context without it is refused
-before an environment is chosen for it.
+before an environment is started for it.
 
 ## What this repository holds
 

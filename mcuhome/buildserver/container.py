@@ -284,17 +284,6 @@ class Docker:
             facts.append(_facts_from(reference, data))
         return tuple(facts)
 
-    # ----------------------------------------------------------------
-    # Containers
-    # ----------------------------------------------------------------
-
-
-def _first_line(output: str) -> str:
-    for line in output.splitlines():
-        if line.strip():
-            return line.strip()
-    return "no output"
-
 
 def _addressable(line: str) -> str | None:
     """One ``image ls`` line as a reference to inspect, or nothing.

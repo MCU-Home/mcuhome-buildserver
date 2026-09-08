@@ -140,6 +140,28 @@ async def test_send_context_answers_the_serving_container(client, package_source
     assert serving["actions"] == ["build", "verify"]
 
 
+async def test_a_digest_only_pin_is_answered_without_a_tag(client, package_source) -> None:
+    """A digest names one image; there is no tag to record beside it.
+
+    The other three pin forms are reached through a repository or a
+    search list that carries a tag along, so ``build_environment`` reads
+    ``<repository>:<tag>@sha256:…`` there. A bare ``@sha256:…`` pin never
+    saw a tag at all, and the same spelling a local container build would
+    use for it is the untagged ``<repository>@sha256:…`` — the form
+    ``runnable()`` and this pin already agree on.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        frame = await send_archive(
+            ws, "send-context", session_id, base_context(), container_image=f"@{IMAGE_DIGEST}"
+        )
+
+    assert frame["type"] == "result", frame
+    serving = frame["payload"]["container"]
+    assert serving["build_environment"] == IMAGE_RUNNABLE
+    assert serving["digest"] == IMAGE_DIGEST
+
+
 async def test_an_image_this_host_lacks_is_fetched(client, docker, package_source) -> None:
     """A missing image is a fetch, not a refusal — the labels already decided which bytes.
 

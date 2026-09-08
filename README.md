@@ -5,25 +5,39 @@ on a machine other than the one asking for it. It is the remote half of the
 build path: it serves the session protocol and drives build environments
 without ever being one.
 
-## Status: remote builds are unavailable
+## Status: remote builds run on the build-environment image
 
-This server selects the container it builds in by the image a build context
-names. A build context now names its build environment as **packages**
-instead — the workspace and the tools package, each pinned by name, version
-and content hash — and an image that delivers those packages is one delivery
-of the set rather than the set itself.
+A build environment is a container image that declares the packages it was
+assembled from, and this server runs one. A build context pins those
+**packages** — the workspace and the tools package, each by name, version and
+content hash — and this server finds the image whose labels declare exactly
+that set, in a repository its operator allows, and starts one fresh container
+per build step in it. What comes back is an unsigned image and the build report
+its client signs from; this server holds no key and never signs.
 
-Until this server runs package-built build environments, it answers
-`send-context` with a typed refusal (`version.builder-unsatisfiable`) and no
-remote build starts. Build locally in the meantime: `mcuhome device build`
-without a build server does the same work on your own machine.
+**What it accepts.** A build may carry an image pin, in the `send-context`
+payload and never inside the context — a context references packages and never
+an image. Four forms: none at all, a bare repository, `:<tag>` or
+`@sha256:<digest>` on their own, or the canonical `<repository>:<tag>` /
+`<repository>@sha256:<digest>`. A pin narrows which images are looked at and
+never what is accepted: the labels are checked either way, and an image that
+declares a different package set is a different environment and is refused. A
+pin naming a repository outside `--allow-environment` is refused before any
+registry is asked; without a pin the allowed repositories are searched in
+order, newest assembly revision first. The digest that actually ran is in the
+build's own record.
 
-Everything up to that point works and is tested — the session protocol, the
-context store, and the freeze that computes the context ID from the packages a
-context pins. The operator policy that selects an image (`allowed_environments`,
-`auto_pull`) is inert for as long as no image is selected. The tests of a
-finished remote build are kept and skipped with one reason, so the suite says
-out loud what is still owed.
+**One limitation worth stating plainly.** The packages a context pins are
+fetched from the directories the operator configured (`--sdk-source`) and,
+behind them, from MCUHome's own package registry — `packages.mcuhome.org`,
+checked against the trust anchor the workbench ships. There is no option for a
+different registry and none for a different trust anchor: a build server is an
+operator's machine and not a project, and a trust root that a flag could point
+elsewhere would be a trust decision made where nobody looks.
+
+**A developer build cannot be built here.** A context created against a west
+workspace somebody maintains themselves names no packages anybody else has, and
+this server says so instead of guessing.
 
 ## What this repository holds
 
@@ -34,8 +48,9 @@ out loud what is still owed.
 - The context store: streaming ingress caps, safe extraction into a per-session
   directory this server owns, and the freeze that computes the context ID and
   writes the manifest beside the uploaded pins.
-- The build-environment half of a session: one container per session, the
-  invocation record, the event and log relay, and artifact egress.
+- The build-environment half of a session: the image lookup by package labels,
+  one fresh container per build step, the invocation record, the event and log
+  relay, and artifact egress.
 - Policy an operator sets: the repositories a build environment may come from,
   bearer-token authentication, same-host pairing for the Home Assistant case,
   session seats, and the caps that bound uploads, disk and container resources.
@@ -52,17 +67,22 @@ mcuhome-buildserver --token-file /path/to/token
 ```
 
 A client opens a session, uploads a build context, locks it, and asks for a
-verify or a build; what comes back over the same session is an unsigned image
-and the build report its client signs from.
+build; what comes back over the same session is an unsigned image and the build
+report its client signs from. `verify` is answered by this server itself — it
+re-measures the locked context against what it froze, which is the one question
+a build environment could not answer better.
 
 ## How it fits into MCUHome
 
-Builds here run through [`mcuhome-workbench`](https://github.com/mcu-home/mcuhome-workbench),
-whose build API materializes a session's build environment — the same object a
-local build gets. The context ID that both ends compute comes from
-`mcuhome-model`, which [`mcuhome-sdk`](https://github.com/mcu-home/mcuhome-sdk)
-publishes along with the build environments themselves; a client pins one by
-digest in the context it uploads. The clients that open sessions are
+Builds here run through the container profile of
+[`mcuhome-workbench`](https://github.com/mcu-home/mcuhome-workbench) — the
+image lookup, the launcher and the judgement of what came back are the same
+code a local container build runs, so a fix to either is a fix to both. What a
+build environment is, and what it may assume, is the build environment
+specification in [`mcuhome-sdk`](https://github.com/mcu-home/mcuhome-sdk),
+which also publishes the packages a context pins and the images that deliver
+them. The context ID that both ends compute comes from `mcuhome-model`. The
+clients that open sessions are
 [`mcuhome-cli`](https://github.com/mcu-home/mcuhome-cli) and
 [`mcuhome-ui`](https://github.com/mcu-home/mcuhome-ui), each through the
 session client on the caller's side of the protocol, and neither a dependency

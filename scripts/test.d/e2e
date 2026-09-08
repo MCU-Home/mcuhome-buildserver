@@ -2,29 +2,21 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
 #
-# One real remote session against this server (tests/e2e/run.py).
+# One real remote build against this server (tests/e2e/run.py).
 #
-# What it asserts today is the server's REFUSAL, not a firmware: remote
-# builds are unavailable while this server does not run package-built
-# build environments (see the README's status section). The mechanics and
-# the prerequisites below are unchanged on purpose — the process, the
-# socket, the SDK archive, the container runtime are all still exercised
-# for real — so that the switchover flips one expectation back and this
-# wrapper does not have to be rebuilt from memory.
-#
-# Unlike
-# the other wrappers this one has prerequisites the wrapper cannot
-# create for itself, so each is checked up front and reported as a
-# failure with a one-line notice — never a silent skip:
+# Unlike the other wrappers this one has prerequisites it cannot create
+# for itself, so each is checked up front and reported as a failure with
+# a one-line notice — never a silent skip:
 #
 #   - a container runtime reachable as `docker`
-#   - the exact build-container image this server's own code pins
-#     (never pulled here: CI pulls it in a step before calling this
-#     wrapper; locally, pull it yourself)
 #   - an SDK archive directory (holding index.json and the SDK package),
 #     passed as this wrapper's first argument or in the
 #     MCUHOME_E2E_SDK_DIR environment variable; CI builds this directory
 #     in a step before calling this wrapper (build_sdk_archive.py)
+#   - the `mcuhome` command, because this harness drives the real client
+#   - a network that reaches the registries the build environment image
+#     and the packages a context pins come from, unless this host already
+#     holds all of them
 #
 # Everything else (siblings, the four-distribution install) is a CI
 # preparation step, not this wrapper's job — see ci-test.yml.
@@ -43,13 +35,13 @@ if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! image="$("$venv/bin/python" -c 'from mcuhome.model.buildimage import IMAGE; print(IMAGE)' 2>/dev/null)"; then
+if ! "$venv/bin/python" -c 'import mcuhome.model.context' >/dev/null 2>&1; then
   echo "test.d/e2e: mcuhome-model is not importable from this .venv. Install the sibling checkouts this e2e run needs (mcuhome-sdk's model and compiler, mcuhome-workbench with the remote extra, mcuhome-cli), as ci-test.yml's test-e2e job does." >&2
   exit 1
 fi
 
-if ! docker image inspect "$image" >/dev/null 2>&1; then
-  echo "test.d/e2e: build-container image '$image' is not present locally. Pull it first (docker pull $image) — this wrapper never pulls it." >&2
+if ! command -v mcuhome >/dev/null 2>&1; then
+  echo "test.d/e2e: the mcuhome command is not on PATH. This harness drives the real client; install mcuhome-cli into this venv, as ci-test.yml's test-e2e job does." >&2
   exit 1
 fi
 

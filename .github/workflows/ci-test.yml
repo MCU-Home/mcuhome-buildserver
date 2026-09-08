@@ -218,24 +218,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # This server pulls nothing, by design: it runs the exact image the
-      # context pins and refuses when it does not have it. So the image
-      # has to be here first, and the reference comes from the one place
-      # that states it — the same constant the SDK repository tags and a
-      # client resolves to, so no two parties can disagree about what
-      # "the build container" is. The client reaches it through the
-      # moving tag; the bytes are the same, which is what makes the pin
-      # it writes match what this pull put here.
-      - name: Pull the build container
-        run: |
-          reference="$(.venv/bin/python -c '
-          from mcuhome.model.buildimage import IMAGE
-          print(IMAGE)')"
-          echo "::notice::pulling $reference"
-          docker pull --quiet "$reference"
+      # The image is not pulled here. This server finds the build
+      # environment by the labels of whatever the allowed repository
+      # publishes for the package set the context pins, and fetches it
+      # itself when the operator allows fetching — which is the default
+      # and what this job exercises. Naming a reference here would pull
+      # bytes the run may not even choose.
 
       # Preparation is done: scripts/test e2e itself re-checks the
-      # runtime, the image and the archive directory, and then drives
+      # runtime, the client and the archive directory, and then drives
       # tests/e2e/run.py against them.
       - name: scripts/test e2e
         run: scripts/test e2e "$PWD/dist/sdk"

@@ -135,7 +135,9 @@ async def test_send_context_answers_the_serving_container(client, package_source
         WORKSPACE_PACKAGE: f"{ENVIRONMENT_VERSION}@sha256:{WORKSPACE_SHA256}",
         TOOLS_PACKAGE: f"{ENVIRONMENT_VERSION}@sha256:{TOOLS_SHA256}",
     }
-    assert serving["actions"] == ["build"]
+    # What a client may ask this session for: the one action an
+    # environment is started for, and the one this server answers itself.
+    assert serving["actions"] == ["build", "verify"]
 
 
 async def test_an_image_this_host_lacks_is_fetched(client, docker, package_source) -> None:
@@ -753,6 +755,7 @@ async def test_the_archives_own_mode_bits_are_discarded(client, state, package_s
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w") as tar:
         for name, data, mode in (
+            ("build-context.json", BUILD_CONTEXT_BYTES, 0o644),
             ("context.yaml", CONTEXT_YAML.encode(), 0o644),
             ("model/device-model.json", MODEL, 0o4777),
         ):
@@ -1014,7 +1017,9 @@ async def test_an_oversize_context_yaml_is_an_ingress_refusal(client) -> None:
     this server where a small input can buy unbounded work.
     """
     padded = CONTEXT_YAML + "# " + "x" * (70 * 1024) + "\n"
-    archive = make_archive({"context.yaml": padded.encode()})
+    archive = make_archive(
+        {"build-context.json": BUILD_CONTEXT_BYTES, "context.yaml": padded.encode()}
+    )
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         frame = await send_archive(ws, "send-context", session_id, archive)
@@ -1040,7 +1045,12 @@ async def test_the_context_yaml_bound_is_the_operators_number(
     async with raised.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         frame = await send_archive(
-            ws, "send-context", session_id, make_archive({"context.yaml": padded.encode()})
+            ws,
+            "send-context",
+            session_id,
+            make_archive(
+                {"build-context.json": BUILD_CONTEXT_BYTES, "context.yaml": padded.encode()}
+            ),
         )
     assert frame["type"] == "result", "the document the default refuses, accepted"
 
@@ -1097,7 +1107,10 @@ async def test_the_context_format_is_the_one_the_session_was_admitted_on(
         )
         newer = frame["payload"]["session"]["id"]
         accepted = await send_archive(
-            ws, "send-context", newer, make_archive({"context.yaml": document})
+            ws,
+            "send-context",
+            newer,
+            make_archive({"build-context.json": BUILD_CONTEXT_BYTES, "context.yaml": document}),
         )
         assert accepted["type"] == "result", accepted
         assert accepted["payload"]["context"]["format"] == ahead

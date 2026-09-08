@@ -158,17 +158,6 @@ REGISTRY: dict[str, ErrorCode] = _seed(
         summary="the command is outside the session's declared profile",
     ),
     ErrorCode(
-        # ADR 0019's second amendment: the interrupted patch application
-        # is "terminal for the session" — every further working command
-        # is refused, while get-artifact and close-session stay
-        # permitted, because the moment a session poisons is the moment
-        # its owner most needs the logs that explain what happened.
-        "session.poisoned",
-        retryable=False,
-        summary="the session can no longer do work (an interrupted patch application "
-        "poisoned it); artifacts stay collectable, close-session cleans up",
-    ),
-    ErrorCode(
         "session.not-implemented",
         retryable=False,
         summary="the verb is part of the protocol and its server logic is not built yet",

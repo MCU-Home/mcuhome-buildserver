@@ -158,17 +158,29 @@ async def test_an_empty_context_has_an_identity_and_may_be_locked(client, packag
     beyond existence, ``keys/signing.pub`` above all, are checked by
     ``build``, which is where the contract scopes them.
 
-    The archive is assembled here rather than through ``base_context``
-    because that fixture carries the generator declaration, which is
-    content and would make this context exactly not empty. Nothing a real
-    client sends looks like this — and the rule under test is the
-    server's, which is why it is worth being able to state it at all.
+    "Empty" is about *content*: the two documents that make a context a
+    context — the pins and the generator declaration — are there, because
+    without the second one there is no build context at all (build
+    environment specification §9) and no environment may be started for
+    it. What is absent is everything a build would compile.
     """
-    expected = context_id(sdk_sha256=SDK_SHA256, environment=ENVIRONMENT, board=BOARD, files=())
+    generator = ContextFile(
+        path="build-context.json", sha256=hashlib.sha256(BUILD_CONTEXT_BYTES).hexdigest()
+    )
+    expected = context_id(
+        sdk_sha256=SDK_SHA256, environment=ENVIRONMENT, board=BOARD, files=(generator,)
+    )
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         frame = await send_and_lock(
-            ws, session_id, make_archive({"context.yaml": CONTEXT_YAML.encode()})
+            ws,
+            session_id,
+            make_archive(
+                {
+                    "build-context.json": BUILD_CONTEXT_BYTES,
+                    "context.yaml": CONTEXT_YAML.encode(),
+                }
+            ),
         )
 
     assert frame["payload"]["context_id"] == expected

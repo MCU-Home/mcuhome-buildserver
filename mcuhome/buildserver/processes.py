@@ -33,9 +33,9 @@ SIGKILL that reached only the program would leave that tree running,
 unreaped, against a session directory this server is about to delete;
 §1.2 makes cancellability one of the two promises the ``subprocess``
 profile keeps, and it is kept here or nowhere. The ``container`` profile
-is unaffected by construction: its child is a short-lived ``docker exec``
-client with no descendants of its own, so a group of one behaves exactly
-as the single pid did.
+is unaffected by construction: its build runs inside a container, which
+is stopped by removing it rather than by signalling anything on this
+side.
 
 **Merged output, always.** Contract §8 says the two streams *are* one
 stream: "standard output and standard error together are one raw, opaque

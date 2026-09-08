@@ -36,6 +36,7 @@ from mcuhome.workbench.containerbuild import ENTRY_POINT_PATH
 from mcuhome.buildserver import sessions
 from mcuhome.buildserver.app import ServerState, create_app
 from tests.python.conftest import (
+    BUILD_CONTEXT_BYTES,
     ENVIRONMENT_DENIED,
     IMAGE,
     IMAGE_REFERENCE,
@@ -97,6 +98,7 @@ def hostile_model() -> bytes:
 def hostile_context(sha256: str) -> bytes:
     return make_archive(
         {
+            "build-context.json": BUILD_CONTEXT_BYTES,
             "context.yaml": context_yaml(sdk_sha256=sha256),
             "model/device-model.json": hostile_model(),
             "keys/signing.pub": MARKERS["key"].encode(),
@@ -202,7 +204,12 @@ async def test_the_image_a_build_names_still_has_to_pass_the_allowlist(
     runtime is asked anything.
     """
     sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
-    context = make_archive({"context.yaml": context_yaml(sdk_sha256=sha256)})
+    context = make_archive(
+        {
+            "build-context.json": BUILD_CONTEXT_BYTES,
+            "context.yaml": context_yaml(sdk_sha256=sha256),
+        }
+    )
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         frame = await send_archive(

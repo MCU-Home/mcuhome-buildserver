@@ -782,30 +782,24 @@ async def test_cancel_racing_a_natural_completion_is_not_an_error(client, state)
     assert frame["payload"]["already_finished"] is True
 
 
-async def test_a_poisoned_session_refuses_work_and_keeps_its_exits(client, state) -> None:
-    """`session.poisoned` for every working verb; the exits stay open (E39).
+async def test_the_exits_of_a_session_stay_open_after_a_failed_build(client, state) -> None:
+    """A session that failed at work still answers the verbs that get the work out.
 
-    The session is deliberately not reaped: the moment it poisons is the
-    moment its owner most needs the logs and partial artifacts that
-    explain what happened. get-artifact still answers (its own
-    not-implemented refusal, not the poison), cancel still works on a
-    running invocation, and close-session cleans up as always.
+    There is no terminal state below ``closed`` any more, and there is
+    nothing left that could create one: a step builds in a container that
+    is thrown away, so no failure can leave this session's next build a
+    different one. What is worth pinning is the consequence — after a
+    failure a client can still ask for what the invocation declared,
+    still stop what is running, and still close.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await _open(ws)
         session = state.sessions.require(session_id)
         session.context_state = sessions.CONTEXT_LOCKED
         session.invocations["inv-1"] = sessions.INVOCATION_RUNNING
-        session.poison()
 
-        for verb in ("send-context", "extend-context", "lock-context", "verify", "build"):
-            frame = await call(ws, verb, {"session_id": session_id}, frame_id=f"p-{verb}")
-            assert frame["error"]["code"] == "session.poisoned", verb
-
-        # The exit that matters most: `get-artifact` answers about the
-        # invocation rather than about the poison. This one declared
-        # nothing (it never ran), so the answer is `artifact.unknown`
-        # with the declared paths — not a refusal of the session.
+        # This one declared nothing (it never ran), so the answer is
+        # about the artifact rather than about the session.
         artifact = await call(
             ws,
             "get-artifact",

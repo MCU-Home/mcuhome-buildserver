@@ -242,20 +242,14 @@ class SessionPaths:
       lets it be handed over *writable* when the ``sdk`` layer carries
       patches without an overlay and without anybody else's tree being
       at risk.
-    * ``inv/<id>/`` is the **backend-owned per-invocation
-      directory** of §5.1 step 1, holding ``out/``, ``tmp/``, the
-      request document, the result document, the events file and the
-      cancel sentinel. It is outside the context, which is exactly what
-      lets ``context`` be a kernel-enforced read-only mount, and it is
-      per invocation, which removes the data race two concurrent
-      ``docker exec`` invocations had over one fixed path.
+    * ``inv/<id>/`` is this server's own per-invocation directory, and
+      what it holds is the events file it writes for that invocation.
+      The step's own tree — the request document, ``work``, the cache
+      tiers — belongs to the builder session under ``work/`` and is laid
+      out by the workbench's container profile, because that tree is the
+      build environment specification's §4 and nothing this side invents.
     * ``downloads/`` is where ``get-artifact`` builds the archive it is
       about to stream, and nothing else lives there.
-
-    ADR 0019 §2 spells the per-invocation area ``/out/<invocation-id>/``.
-    That is superseded prose rather than a layout to mimic: ``out`` is
-    one of *five* things an invocation needs a directory for, and the
-    contract that came after names all five.
     """
 
     root: Path
@@ -770,10 +764,13 @@ def freeze_context(
     **This server adds nothing to the document it freezes.** Everything
         the manifest states is either in the pins the client sent or derived
         from the files it sent, so two servers handed the same bytes write
-        the same manifest — including which image built it, because the
-        client decided that too. The previous format had the locking party
-        supply the container it had chosen, and that made the manifest a
-        joint work.
+        the same manifest. **Which image ran is deliberately not in it**:
+        a context pins the environment's packages, an image is one
+        delivery of that set, and recording the delivery in the document
+        that defines the identity would make two builds of one context on
+        two hosts two different contexts. The server answers its choice
+        at ``send-context`` instead, where it is a fact about this
+        session rather than about the context.
 
         Before any of it, ``context.yaml`` is re-hashed and compared against
         the hash ``send-context`` recorded when it accepted the pins. That

@@ -31,6 +31,7 @@ from mcuhome.buildserver.app import ServerState, create_app
 from mcuhome.buildserver.config import load_config
 from mcuhome.buildserver.errors import SessionError
 from tests.python.conftest import (
+    BUILD_CONTEXT_BYTES,
     ENVIRONMENT_DENIED,
     IMAGE,
     IMAGE_DIGEST,
@@ -49,7 +50,12 @@ ELSEWHERE = "registry.example.test/somebody/else"
 
 def mcuhome_context(sha256: str) -> bytes:
     """A context pinning MCUHome's own package set — the ordinary one."""
-    return make_archive({"context.yaml": context_yaml(sdk_sha256=sha256)})
+    return make_archive(
+        {
+            "build-context.json": BUILD_CONTEXT_BYTES,
+            "context.yaml": context_yaml(sdk_sha256=sha256),
+        }
+    )
 
 
 async def open_session(ws) -> str:

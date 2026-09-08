@@ -438,11 +438,6 @@ class Session:
     #: that order — the lock is a boundary, not a mode.
     context_state: str = CONTEXT_NONE
     last_command_at: float = 0.0
-    #: Poisoned means "can no longer do work": the second amendment's
-    #: terminal state after an interrupted patch application. One-way.
-    #: Deliberately NOT a session state — the session stays OPEN so
-    #: get-artifact and close-session keep working, which is the point.
-    poisoned: bool = False
     #: Every invocation this session ever ran, id -> INVOCATION_* state.
     #: The bookkeeping `cancel` addresses; the container backend
     #: populates it and flips entries to FINISHED.
@@ -544,32 +539,6 @@ class Session:
                 context_state=self.context_state,
             )
 
-    def require_workable(self) -> None:
-        """Refuse every working command of a poisoned session.
-
-        The second amendment's terminal state: an interrupted patch
-        application "fails typed, and every further working command in
-        that session is refused". The session is deliberately NOT reaped
-        on the spot — ``get-artifact`` and ``close-session`` stay
-        permitted, because the moment a session poisons is exactly the
-        moment its owner most wants the logs and partial artifacts that
-        explain what happened, and destroying them to simplify the state
-        machine would trade diagnosis for tidiness. Cleanup happens where
-        it always happens: ``close-session`` or lease expiry.
-
-        ``cancel`` deliberately does not pass through here: it stops
-        work rather than doing any, and a poisoned session may still
-        have an invocation worth stopping.
-        """
-        if self.poisoned:
-            raise SessionError(
-                "session.poisoned",
-                f'Session "{self.id}" can no longer do work: a patch application was '
-                "interrupted and the trees cannot be trusted. Collect what get-artifact "
-                "still offers, close the session, and start a new one with pristine trees.",
-                session_id=self.id,
-            )
-
     def touch(self, *, now: float | None = None) -> None:
         """Mark the session as having just done something.
 
@@ -580,10 +549,6 @@ class Session:
         nothing until it is over.
         """
         self.last_command_at = time.time() if now is None else now
-
-    def poison(self) -> None:
-        """One-way. The caller is the future container backend (§6.3)."""
-        self.poisoned = True
 
     def require_context(self) -> None:
         """Refuse a command that has no context to work on.
@@ -1735,9 +1700,8 @@ async def release_session(state: Any, session_id: str, *, wait: float | None = N
     1. The stop signal for every invocation still running
        (:func:`_signal_running`) — without it the ladder below has not
        started and the wait in step 3 is a wait on nothing.
-    2. The container is removed. That is the kill: the cancel sentinel
-       never reached the process inside it and killing a ``docker exec``
-       client never did either.
+    2. The container is removed. That is the kill: a build runs inside
+       it, so nothing outside it stops one.
     3. The invocation's supervisor is waited for, bounded by the ladder
        (or by *wait*, for a caller with a deadline of its own).
     4. Only then the directory, with the context and every artifact in
@@ -1888,7 +1852,6 @@ async def send_context(state: Any, connection: Any, command: Command) -> dict[st
     """
     session = state.sessions.require(command.require_str("session_id"), connection)
     image_pin = command.optional_str("container_image")
-    session.require_workable()
     session.require_writable_context()
     with _context_work(session):
         session.require_no_context()
@@ -2145,7 +2108,6 @@ async def extend_context(state: Any, connection: Any, command: Command) -> dict[
     the named paths existed, so a typo is still visible.
     """
     session = state.sessions.require(command.require_str("session_id"), connection)
-    session.require_workable()
     session.require_writable_context()
     paths = _require_paths(session)
     removals = _removals(command)
@@ -2392,7 +2354,6 @@ async def lock_context(state: Any, connection: Any, command: Command) -> dict[st
     it waited.
     """
     session = state.sessions.require(command.require_str("session_id"), connection)
-    session.require_workable()
     session.require_writable_context()
     with _context_work(session):
         paths = _require_paths(session)
@@ -2435,9 +2396,9 @@ async def _start_working(
     cannot: the manifest and the files are compared *now*, so an
     invocation is never attributed to an identity that moved after it
     was answered. A disagreement is ``context.integrity-mismatch``
-    naming every offending path, and it does **not** poison the session
-    — nothing was applied to any tree, and a client that fixes its
-    context is fixing something this session never acted on.
+    naming every offending path, and it ends nothing but the invocation:
+    a step builds in a container that is thrown away, so a client that
+    fixes its context is fixing something this session never acted on.
 
     **The answer is the invocation id and nothing else** (E46). A build
     is minutes to hours; a command frame that waited for it would make
@@ -2452,7 +2413,6 @@ async def _start_working(
     event) is a different frame that arrives before it (E58).
     """
     session = state.sessions.require(command.require_str("session_id"), connection)
-    session.require_workable()
     session.require_locked_context()
     paths = _require_paths(session)
     if session.pins is None or session.context_id is None:  # pragma: no cover - set together
@@ -2483,31 +2443,31 @@ async def verify(state: Any, connection: Any, command: Command) -> dict[str, Any
 
     A working command, so it runs **only from the lock onwards** and
     answers ``context.not-locked`` before it. That gate repairs the verb
-    rather than restricting it: with a manifest frozen at admission and
-    mid-session extension allowed, every added file was reported
-    "present but not in the integrity list" and the check returned
-    ``ok == False`` by construction. ``lock-context`` gives the
+    rather than restricting it: with mid-session extension allowed, every
+    added file would be reported "present but not in the integrity list"
+    and the check would fail by construction. ``lock-context`` gives the
     integrity list a defined moment — after the last extension, before
     the first working action — which is what leaves something to check
     against.
 
-    It applies no patches and touches no source tree (contract §7.3), and
-    the writable views §4.1 requires are still supplied: "verify simply
-    does not use them, and a view it never writes to is
-    indistinguishable from one it was not given". What is **not**
-    supplied is a ``required`` pointer at any of them — demanding that a
-    verify honour a tree it is forbidden to write would ask a conforming
-    program to refuse for the wrong reason.
+    **This server answers it itself, and starts nothing.** Checking a
+    context is not an action a build environment has: the orchestrating
+    side creates the context, hashes it and delivers it, and the
+    environment is forbidden to modify it — so there is nothing an
+    environment could confirm that this side does not already know from
+    its own bytes. The measurement is the one made before every working
+    invocation
+    (:func:`~mcuhome.buildserver.contextstore.recheck_locked_context`),
+    and it is this verb's whole content.
 
-    A mismatch the program reports is a **failed invocation and not a
-    poisoned session**. The distinction is the one §6.2 draws: a session
-    poisons when an interrupted patch application leaves trees no future
-    build may trust, and a verify never touches a tree. So the client
-    gets ``status: "failure"`` with ``error.context.mismatch`` on the
-    invocation's own event, and the session stays usable — which matters,
-    because the obvious next move is to open a new session with a
-    corrected context rather than to discover that this one is now dead
-    for having been checked.
+    So the answers are two. The context is what its lock says it is, and
+    the invocation's verdict says ``success`` with no artifacts — there
+    is nothing to deliver, and inventing an empty delivery would be a
+    second spelling of the verdict. Or it is not, and the verb is refused
+    ``context.integrity-mismatch`` naming every offending path, which
+    ends the invocation and nothing else: a step builds in a container
+    that is thrown away, so a client that fixes its context is fixing
+    something this session never acted on.
 
     Optional even when real: the fast path skips it, and it is not a
     complete integrity check on its own.
@@ -2515,11 +2475,16 @@ async def verify(state: Any, connection: Any, command: Command) -> dict[str, Any
     return await _start_working(state, connection, command, action="verify")
 
 
-#: The two modes contract §7.2 defines. ``clean`` is the default and the
-#: safe one — an absent ``params``, a ``params`` without ``mode`` and an
-#: empty ``params`` all mean it — because it is the mode that never
-#: silently reuses state, and it is what a release artifact requires.
-BUILD_MODES = ("clean", "incremental")
+#: The two modes the verb accepts. ``clean`` is the default and the one
+#: that is always used — an absent ``mode`` means it, and so does
+#: ``incremental`` here — because it is the mode that never silently
+#: reuses state and the only one a container that starts empty can be.
+#: The only mode this server runs, and what the ``build`` verb answers
+#: whatever it was asked for: one fresh container per step has nothing to
+#: be incremental against.
+MODE_CLEAN = "clean"
+
+BUILD_MODES = (MODE_CLEAN, "incremental")
 
 
 async def build(state: Any, connection: Any, command: Command) -> dict[str, Any]:
@@ -2534,19 +2499,21 @@ async def build(state: Any, connection: Any, command: Command) -> dict[str, Any]
 
         {"session_id": "s-…", "mode": "clean"}   # mode optional
 
-    ``mode`` is the one parameter, and an unknown value is refused here
-    rather than passed on. §5.2 makes the *value* count in ``required``
-    and not only the pointer, so a mode this server does not know would
-    be a mode it demanded a program honour without knowing what it
-    means. ``incremental`` is session-private and falls back to
-    ``clean`` inside the container when there is no prior state of this
-    session in ``work``.
+    ``mode`` is the one parameter and an unknown value is refused here
+    rather than passed on — but **every build this server runs is
+    clean**, and the answer says so rather than leaving a client to
+    assume otherwise. A step runs in a fresh container that is thrown
+    away afterwards, which is what makes the pristine tree free and
+    leaves nothing for an incremental build to be incremental against;
+    answering a clean build is never wrong — it is what was asked for
+    plus time — while honouring the word would be a promise nothing
+    behind it keeps.
 
     Every invocation gets a server-assigned invocation id, and it is
     what ``get-artifact`` and ``cancel`` address. It is never named to
-    the program: contract §5.2 has no invocation field, and the backend
-    addresses an invocation by the ``out``, ``result`` and ``events``
-    paths it chose for it.
+    the environment: the request document carries a session and an
+    invocation of its own, and the artifacts of a step are found where
+    the tree says they are.
     """
     mode = command.optional_str("mode", "clean") or "clean"
     if mode not in BUILD_MODES:
@@ -2556,26 +2523,29 @@ async def build(state: Any, connection: Any, command: Command) -> dict[str, Any]
             "release artifact requires.",
             frame_id=command.id,
         )
-    return await _start_working(state, connection, command, action="build", mode=mode)
+    answer = await _start_working(state, connection, command, action="build", mode=mode)
+    # What this server will actually do, which is the only honest thing
+    # to answer: a client that asked for `incremental` gets a clean build
+    # and is told so here rather than finding out from a build log.
+    answer["mode"] = MODE_CLEAN
+    return answer
 
 
 async def cancel(state: Any, connection: Any, command: Command) -> dict[str, Any]:
-    """``cancel(invocation id)`` — abort one invocation. **Seam. Stub.**
+    """``cancel(invocation id)`` — stop one invocation, and keep the session.
 
-    The second verb of ADR 0019's amendment. It aborts the running
-    invocation, and **the session and its warm container survive** —
-    that is the whole promise, and it is why this handler neither closes
-    the session nor touches the context state.
+    It aborts the running invocation and **the session survives** — that
+    is the whole promise, and it is why this handler neither closes the
+    session nor touches the context state.
 
     It is a necessity rather than a convenience, for one mechanical
-    reason: **killing a ``docker exec`` client does not stop the process
-    inside the container.** A local backend that merely drops the exec
-    connection leaves the compile running and the session's resources
-    held. At the protocol level it is the deliberate counterpart to
-    ``attach-session``: a running build continues detached across a lost
-    connection, and the idle timeout counts absent *commands* rather
-    than absent connections — so a closed socket can never mean "stop",
-    and cancellation has to be something a client *says*.
+    reason: **a build runs inside a container, and signalling the client
+    that started it reaches nothing.** At the protocol level it is the
+    deliberate counterpart to ``attach-session``: a running build
+    continues detached across a lost connection, and the idle timeout
+    counts absent *commands* rather than absent connections — so a closed
+    socket can never mean "stop", and cancellation has to be something a
+    client *says*.
 
     The id it addresses is the **server-assigned** invocation id that
     ``build`` hands out. ADR 0019 names the operand and no document
@@ -2596,11 +2566,13 @@ async def cancel(state: Any, connection: Any, command: Command) -> dict[str, Any
       and both parties behaved correctly;
     * a running one is marked :data:`INVOCATION_CANCELLING` and
       acknowledged — idempotently, so the second cancel of a race gets
-      the same answer as the first.
+      the same answer as the first. Its verdict then says ``cancelled``:
+      a stopped step writes no result document, and reporting that as a
+      plain failure would hide that the failure was asked for.
 
-    It is deliberately not gated on the lock and not gated on poison:
-    only working commands produce invocations, and a poisoned session
-    may still have an invocation worth stopping. What the
+    It is deliberately not gated on the lock: only working commands
+    produce invocations, and this one stops work rather than doing any.
+    What the
     acknowledgement promises is the backend's
     :meth:`~mcuhome.buildserver.backend.SessionBackend.signal_cancellation`:
     the stop sentinel of the running step is raised, and the liveness
@@ -2691,13 +2663,12 @@ async def get_artifact(state: Any, connection: Any, command: Command) -> None:
     nothing said how long, while the directory it kept alive holds a
     device's Matter commissioning credentials.
 
-    Like ``cancel``, it is deliberately not gated on the lock and not
-    gated on poison. The flow diagram lists it after ``verify``/
-    ``build``, but only those two carry the "only from here"
-    qualification, and an invocation id can only exist because a working
-    command produced one. On a poisoned session it is the verb that
-    matters most: that is exactly the moment its owner wants the logs
-    and partial artifacts that explain what happened.
+    Like ``cancel``, it is deliberately not gated on the lock. The flow
+    diagram lists it after ``verify``/``build``, but only those two carry
+    the "only from here" qualification, and an invocation id can only
+    exist because a working command produced one. After a build that
+    failed it is the verb that matters most: that is exactly the moment
+    its owner wants what the invocation did produce.
     """
     session = state.sessions.require(command.require_str("session_id"), connection)
     invocation_id = command.require_str("invocation_id")
@@ -2886,11 +2857,10 @@ async def close_session(state: Any, connection: Any, command: Command) -> dict[s
     what this verb guarantees.
 
     1. The stop signal is set for every running invocation. It is
-       best-effort: a program polls the sentinel on its own schedule,
-       and nothing here waits for it to notice.
-    2. The container is removed, ``--force``. That is the kill — the
-       cancel sentinel never reached the process inside the container,
-       and killing a ``docker exec`` client never did either.
+       best-effort: the supervising loop looks at it on its own
+       schedule, and nothing here waits for it to notice.
+    2. The container is removed, ``--force``. That is the kill — a build
+       runs inside it, so nothing outside it stops one.
     3. The invocation is **waited for**: its supervisor holds a worker
        thread, and that thread is what would otherwise still be reading
        the directory the next step deletes. Removing the container ends
@@ -2964,9 +2934,8 @@ async def close_session(state: Any, connection: Any, command: Command) -> dict[s
 #: ``lock-context`` and ``cancel`` were the two missing, and neither is
 #: optional: without ``lock-context`` a client can never reach
 #: ``build``, and without ``cancel`` a closed socket would be the only
-#: stop signal a client had — which ADR 0019 says is no stop signal at
-#: all, because killing a ``docker exec`` client does not stop the
-#: process inside the container.
+#: stop signal a client had — which is no stop signal at all, because a
+#: build runs inside a container and nothing outside it stops one.
 #: The verbs whose body arrives as BINARY frames after the JSON that
 #: announced it (E41). The transport needs this and cannot derive it: a
 #: binary frame carries no id, so the reader has to know **before** it

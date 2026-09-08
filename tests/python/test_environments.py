@@ -3,14 +3,21 @@
 """Which build environments this server runs, and when it decides that.
 
 The allowlist is the one gate here that is not a conformance check, and
-it exists because every conformance check costs a container: reading an
-image's static self-description runs it (``docker run <image> cat …``
-does not displace an image's ``ENTRYPOINT``), and ``describe`` runs its
-program on purpose. A label is a string in somebody's Dockerfile.
+it exists because every conformance check costs a network round trip or a
+container: reading an image's labels means asking a registry, and running
+it costs a container start. A repository name is a string anybody can
+publish under.
 
 So these tests assert two things above all: that an unlisted repository
-is refused, and that it is refused **before docker is asked anything at
+is refused, and that it is refused **before anything else is asked at
 all** — the second being the whole point of the first.
+
+**A build context never names an image.** It pins the environment's
+*packages* (workspace and tools, by name, version and hash), and this
+server finds the image that delivers that set. The only per-build
+override a client has is the ``container_image`` field of ``send-context``
+itself — never a value inside the context — so every test here that wants
+to name an image states it there.
 """
 
 from __future__ import annotations
@@ -19,39 +26,37 @@ from dataclasses import replace
 
 import pytest
 
-from mcuhome.buildserver import environments
+from mcuhome.buildserver import environments, sessions
 from mcuhome.buildserver.app import ServerState, create_app
-from mcuhome.buildserver.config import Config, load_config
+from mcuhome.buildserver.config import load_config
 from mcuhome.buildserver.errors import SessionError
 from tests.python.conftest import (
+    ENVIRONMENT_DENIED,
     IMAGE,
     IMAGE_DIGEST,
     IMAGE_LABELS,
-    REMOTE_BUILDS_UNAVAILABLE,
     auth,
+    call,
     context_yaml,
     make_archive,
+    refused_with,
+    send_archive,
     write_sdk_package,
 )
-from tests.python.test_backend import open_session, send_archive
 
 ELSEWHERE = "registry.example.test/somebody/else"
 
 
 def mcuhome_context(sha256: str) -> bytes:
-    """A context pinning MCUHome's own build container — the ordinary one."""
+    """A context pinning MCUHome's own package set — the ordinary one."""
     return make_archive({"context.yaml": context_yaml(sdk_sha256=sha256)})
 
 
-def elsewhere_context(sha256: str) -> bytes:
-    """A context pinning a repository no default list carries."""
-    return make_archive(
-        {
-            "context.yaml": context_yaml(
-                sdk_sha256=sha256, build_environment=f"{ELSEWHERE}@{IMAGE_DIGEST}"
-            )
-        }
+async def open_session(ws) -> str:
+    frame = await call(
+        ws, "open-session", {"protocol_version": sessions.SESSION_PROTOCOL_VERSION}, frame_id="o"
     )
+    return frame["payload"]["session"]["id"]
 
 
 # --------------------------------------------------------------------------
@@ -114,7 +119,7 @@ def test_a_reference_that_does_not_parse_is_refused_as_itself() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_the_default_list_is_mcuhomes_own_build_container() -> None:
+def test_the_default_list_is_mcuhomes_own_build_environment() -> None:
     """A server nobody configured serves the images it exists to run, and no others."""
     assert load_config(["--token", "x" * 32], env={}).allowed_environments == (IMAGE,)
 
@@ -153,96 +158,72 @@ def test_auto_pull_is_on_by_default_and_switchable_both_ways() -> None:
 # --------------------------------------------------------------------------
 
 
-@pytest.fixture
-def config(tmp_path) -> Config:
-    """The suite's config, with this file's own image kept off the list."""
-    return Config(
-        host="127.0.0.1",
-        port=0,
-        token="test-token-000000000000000000000000",
-        pair_file=None,
-        context_root=tmp_path / "sessions",
-        sdk_sources=(tmp_path / "packages",),
-    )
+async def test_a_send_context_naming_an_unlisted_repository_is_refused(
+    client, config, docker
+) -> None:
+    """The client's own spelling, checked at ``send-context``.
 
-
-@pytest.mark.skip(reason=REMOTE_BUILDS_UNAVAILABLE)
-async def test_a_context_pinning_an_unlisted_repository_is_refused(client, config, docker) -> None:
-    """The client's own spelling, checked at ``send-context``."""
+    A build context pins packages and never an image (build environment
+    specification §4), so the one thing a client can name here is the
+    ``container_image`` field of ``send-context`` itself — never a value
+    inside the context, which would change nothing about what is being
+    built and everything about which bytes it is built in.
+    """
     sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
-    context = elsewhere_context(sha256)
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
-        frame = await send_archive(ws, "send-context", session_id, context)
-    assert frame["error"]["code"] == "policy.environment-denied"
+        frame = await send_archive(
+            ws,
+            "send-context",
+            session_id,
+            mcuhome_context(sha256),
+            container_image=f"{ELSEWHERE}@{IMAGE_DIGEST}",
+        )
+    assert refused_with(frame, ENVIRONMENT_DENIED)
     assert frame["error"]["details"]["repository"] == ELSEWHERE
 
 
-@pytest.mark.skip(reason=REMOTE_BUILDS_UNAVAILABLE)
 async def test_the_refusal_happens_before_docker_is_asked_anything(client, config, docker) -> None:
     """The load-bearing assertion of this file.
 
-    Reading an image's labels means running it, so a gate that sat after
-    the conformance checks would decide whether a stranger's image may
-    execute *by executing it*. Nothing may reach the runtime first — not
-    even the liveness check, which is why the assertion is on the whole
-    command list and not on a subset of it.
+    Reading an image's labels means asking a registry, and running one
+    means starting a container — a gate that sat after either would
+    decide whether a stranger's image may execute *by asking about it or
+    running it*. Nothing may reach the runtime first, which is why the
+    assertion is on the whole call list and not on a subset of it.
     """
     sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
-    context = elsewhere_context(sha256)
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
-        frame = await send_archive(ws, "send-context", session_id, context)
-    assert frame["error"]["code"] == "policy.environment-denied"
+        frame = await send_archive(
+            ws,
+            "send-context",
+            session_id,
+            mcuhome_context(sha256),
+            container_image=f"{ELSEWHERE}@{IMAGE_DIGEST}",
+        )
+    assert refused_with(frame, ENVIRONMENT_DENIED)
     assert docker.calls == []
 
 
-def only_image_is_elsewhere(docker) -> None:
-    """This host has exactly one build environment, and it is not MCUHome's.
-
-    Its repo digest is the one every context in this file pins, which is
-    what puts the two claims in disagreement: the reference names one
-    repository, the digest finds another.
-    """
-    docker.images.clear()
-    docker.listed = [f"{ELSEWHERE}:latest"]
-    docker.images[f"{ELSEWHERE}:latest"] = {
-        "Id": "sha256:" + "c" * 64,
-        "RepoTags": [f"{ELSEWHERE}:latest"],
-        "RepoDigests": [f"{ELSEWHERE}@{IMAGE_DIGEST}"],
-        "Config": {"Labels": dict(IMAGE_LABELS)},
-    }
-
-
-async def test_an_allowed_name_over_a_digest_that_found_another_repository_is_refused(
-    client, config, docker
-) -> None:
-    """An image is matched by digest alone, so the name is only a claim.
-
-    A context that names a listed repository while its pin belongs to an
-    image from somewhere else is the case a check on the client's
-    spelling would wave through — and it is the reachable one, because
-    the digest is what decides which of this host's images is started.
-    """
-    only_image_is_elsewhere(docker)
-    sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id = await open_session(ws)
-        frame = await send_archive(ws, "send-context", session_id, mcuhome_context(sha256))
-    assert frame["error"]["code"] == "policy.environment-denied"
-    assert frame["error"]["details"]["repository"] == ELSEWHERE
-
-
-@pytest.mark.skip(reason=REMOTE_BUILDS_UNAVAILABLE)
 async def test_an_operator_who_lists_another_repository_can_serve_it(
-    aiohttp_client, config, docker
+    aiohttp_client, config, docker, registry
 ) -> None:
-    """The other direction: the list decides, not the name MCUHome ships."""
-    only_image_is_elsewhere(docker)
+    """The other direction: the list decides, not the repository MCUHome ships.
+
+    The image is found by its labels, in whichever repositories the
+    operator searches — here, one that is not MCUHome's own — and this
+    host already has the exact bytes the search settles on, so the build
+    is served rather than fetched.
+    """
+    registry.repositories = {ELSEWHERE: IMAGE_LABELS}
+    docker.images[f"{ELSEWHERE}@{IMAGE_DIGEST}"] = {"Id": "sha256:" + "c" * 64}
     state = ServerState(replace(config, allowed_environments=(ELSEWHERE,)))
     client = await aiohttp_client(create_app(state))
     sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
-        frame = await send_archive(ws, "send-context", session_id, elsewhere_context(sha256))
+        frame = await send_archive(ws, "send-context", session_id, mcuhome_context(sha256))
     assert frame["type"] == "result", frame
+    served = frame["payload"]["container"]["build_environment"]
+    assert served.startswith(f"{ELSEWHERE}:") and served.endswith(f"@{IMAGE_DIGEST}"), served

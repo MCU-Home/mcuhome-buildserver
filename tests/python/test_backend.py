@@ -1,17 +1,21 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""The container backend, over the wire: argv, documents, events, artifacts.
+"""The backend, over the wire: argv, documents, events, artifacts.
 
 Every test here drives the real verbs over a real socket against a
-docker that is stubbed at the seam (:class:`~tests.conftest.FakeDocker`).
-**No container is ever started and no build is ever run**, which is a
-rule of this suite rather than a convenience: the machine that runs it
-has one build's worth of RAM, and a suite that could start a real
-container would eventually start one on somebody's laptop.
+container runtime that is stubbed at the seam
+(:class:`~tests.python.conftest.FakeDocker`). **No container is ever
+started and no build is ever run**, which is a rule of this suite rather
+than a convenience: the machine that runs it has one build's worth of
+RAM, and a suite that could start a real container would eventually
+start one on somebody's laptop.
 
-What is asserted is therefore exactly what a backend is: the argv it
-composes, the request documents it writes, what it makes of the result
-documents that come back, and what reaches the client while it happens.
+What is asserted is therefore exactly what this backend is: the ``run``
+it composes for one step, the request document it writes, what it makes
+of the result document that comes back, and what reaches the client
+while it happens. The step itself — the tree, the judgement, the
+liveness ladder — is the workbench's container profile, the same code a
+local container build runs, and is tested there.
 """
 
 from __future__ import annotations
@@ -19,35 +23,33 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import os
 import threading
 import time
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from mcuhome.model import containerpaths
-from mcuhome.model.buildimage import CONTRACT_LABEL, ZEPHYR_LABEL
+from mcuhome.workbench import buildenvsession, buildprocess, containerbuild
 from ruamel.yaml import YAML
 
 from mcuhome.buildserver import sessions
 from tests.python.conftest import (
-    BUILD_REPORT,
+    BUILD_CONTEXT_BYTES,
     ENVIRONMENT,
     IMAGE,
     IMAGE_DIGEST,
-    IMAGE_LABELS,
-    IMAGE_REFERENCE,
-    IMAGE_REFERENCE_FORMAT3,
+    IMAGE_RUNNABLE,
     FakeProcess,
     auth,
-    base_context,
     buildable_context,
     call,
     collect,
-    emit,
-    manifest_id,
+    conforming_environment,
+    environment_labels,
+    failing_environment,
+    hanging_environment,
     send_archive,
+    silent_environment,
     write_result,
     write_sdk_package,
 )
@@ -58,12 +60,11 @@ PATCH = b"--- a/x\n+++ b/x\n"
 
 @pytest.fixture
 def config(config):
-    """The suite's config, with the four contract layers allowed.
+    """The suite's config, with the patch layers this protocol knows allowed.
 
     Overridden for this module alone. The config **is** the patch policy
     and unlisted layers are denied by default, which is right everywhere
-    else; here it would mean no test could ever reach a patched tree,
-    and the writable views of §6.2 are half of what this module is about.
+    else; here it would mean no test could ever send a patched context.
     """
     return replace(config, allowed_patch_layers=sessions.PATCH_LAYERS)
 
@@ -86,427 +87,320 @@ async def locked(ws, config, **files: bytes) -> tuple[str, str]:
     return session_id, frozen["payload"]["context_id"]
 
 
-# --------------------------------------------------------------------------
-# The argv: what a backend actually says to a container runtime
-# --------------------------------------------------------------------------
-
-
-async def test_the_session_container_is_started_with_the_contracts_two_flags(
-    client, config, docker
-) -> None:
-    """``--network=none`` and ``--init``, plus this backend's own policy.
-
-    The first is contract §9.1 made checkable rather than asserted:
-    "everything a build needs is mounted or in the image" is not a
-    property one can read off a build log, and taking the network away
-    turns the claim into something the build either satisfies or does
-    not. The second is arithmetic: a build spawns hundreds of
-    short-lived children and PID 1 has to reap them.
-
-    The rest is backend policy, which §11 leaves free — and it is
-    asserted anyway, because the composed command is the interface
-    between the contract and the runtime.
-    """
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config, **{"model/device-model.json": MODEL})
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.verdict")
-
-    started = next(
-        argv for argv in docker.calls if argv[:2] == ["docker", "run"] and "--detach" in argv
-    )
-    assert "--network=none" in started
-    assert "--init" in started
-    assert "--user" in started
-    # The image is named with the digest it was pinned to. A tag carries
-    # no compatibility meaning and no identity (ADR 0018 §7); it rides
-    # along inside the pinned reference as the only human-readable part
-    # of it, and docker binds to the digest either way.
-    assert any(IMAGE_DIGEST in argument for argument in started)
-    # The container's main process is the backend's to choose, and the
-    # image must not depend on its own ENTRYPOINT or CMD (§2.2).
-    assert started[-3:] == ["/bin/sh", "-c", "while :; do sleep 86400; done"]
+async def built(ws, config, **files: bytes) -> tuple[str, list[dict]]:
+    """One session that locked a context and ran one build to its verdict."""
+    session_id, _ = await locked(ws, config, **files)
+    await call(ws, "build", {"session_id": session_id}, frame_id="b")
+    return session_id, await collect(ws, until="invocation.verdict")
 
 
 def _volumes(argv: list[str]) -> list[str]:
     return [item for index, item in enumerate(argv) if argv[index - 1] == "--volume"]
 
 
-async def test_the_session_tree_is_mounted_piece_by_piece_and_never_wholesale(
-    client, config, docker, state
+# --------------------------------------------------------------------------
+# The step: what this backend actually says to a container runtime
+# --------------------------------------------------------------------------
+
+
+async def test_the_step_runs_the_entry_point_the_specification_fixes(
+    client, config, docker
 ) -> None:
-    """The whole ``-v`` set, because what is *absent* from it is the point.
+    """§6: the entry point at its fixed path, with **no arguments**.
 
-    §9.1 write-protects ``context`` and every non-``writable`` tree
-    "with the strongest means its profile has", and §4.1 makes
-    ``writable`` a thing the backend **asserts** and the program may
-    never probe — so the assertion has to be true of the mount set as a
-    whole rather than of one mount read in isolation. One bind mount of
-    the session root satisfied neither: the SDK is unpacked into
-    ``<root>/sdk`` and mounted read-only at the path ``describe`` names,
-    so a root mount exposed the same host directory writable under its
-    other name, and ``trees.sdk.writable: false`` was a claim this
-    server was making falsely.
-
-    So the container sees exactly the paths the request document names,
-    each at its own host path, and nothing else of the session tree —
-    not ``staging``, not the upload spool, and above all not
-    ``downloads``, where ``get-artifact`` builds the archive it is about
-    to stream to a client.
+    Composed from the base directory and the path the specification
+    fixes, never taken from the image's own ``CMD``: an image is not
+    required to name one, and an environment that did would be telling
+    the orchestrator how to start it — which is the one thing §6 puts on
+    this side.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.verdict")
+        await built(ws, config, **{"model/device-model.json": MODEL})
+
+    started = docker.step
+    assert started[-1] == "/mcuhome/bin/build-environment-entry"
+    assert started[-2] == IMAGE_RUNNABLE
+    environment = [started[index + 1] for index, item in enumerate(started) if item == "--env"]
+    assert environment == ["MCUHOME_BUILDER_BASE_DIR=/"]
+
+
+async def test_the_step_gets_one_fresh_container_and_no_network(client, config, docker) -> None:
+    """The flags that make a step a step, and the reason for each.
+
+    ``--rm`` and one container per step is how the specification's
+    pristine-tree guarantee (§3) is met for free: nothing a step wrote
+    survives the container it ran in. ``--network none`` is §11's "no
+    network" made checkable rather than asserted — "everything a build
+    needs is in your packages, in the SDK, or in the build context" is
+    not a property one can read off a build log. ``--init`` is
+    arithmetic: a build spawns hundreds of short-lived children and PID 1
+    has to reap them. ``--name`` is what lets a step that was stopped be
+    reaped by name rather than by hope.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, _ = await built(ws, config)
+
+    started = docker.step
+    assert started[:2] == ["docker", "run"]
+    assert "--rm" in started
+    assert "--init" in started
+    assert started[started.index("--network") + 1] == "none"
+    assert "--user" in started
+    assert started[started.index("--name") + 1] == f"mcuhome-{session_id}-1"
+
+
+async def test_the_tree_is_mounted_piece_by_piece_and_never_wholesale(
+    client, config, docker, state
+) -> None:
+    """§4's tree, and what is **absent** from the mount set is the point.
+
+    The specification makes ``build-context`` a directory the
+    environment may never write and ``sdk`` one it should treat as
+    read-only, and in this profile the strongest means of saying so is a
+    read-only bind mount — kernel-enforced rather than a promise the
+    environment is asked to keep. One bind mount of the session root
+    would satisfy neither, and it would hand the step ``downloads``,
+    where ``get-artifact`` builds the archive it is about to stream to a
+    client.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, _ = await built(ws, config)
         paths = state.sessions.require(session_id).paths
 
-    started = next(argv for argv in docker.calls if "--detach" in argv)
-    assert sorted(_volumes(started)) == sorted(
-        [
-            f"{paths.context}:{containerpaths.CONTEXT}:ro",
-            f"{paths.work}:{containerpaths.WORK}",
-            f"{paths.invocations}:{containerpaths.INVOCATIONS}",
-            f"{paths.sdk}:{containerpaths.SDK}:ro",
-        ]
-    )
-    root = paths.root
-    assert f"{root}:{root}" not in _volumes(started)
-    assert not any(str(paths.downloads) in volume for volume in _volumes(started))
-    assert not any(str(paths.staging) in volume for volume in _volumes(started))
+    mounted = _volumes(docker.step)
+    targets = {volume.removesuffix(":ro").rsplit(":", 1)[1] for volume in mounted}
+    assert targets == {
+        "/mcuhome/invocation-request.json",
+        "/mcuhome/sdk",
+        "/mcuhome/build-context",
+        "/mcuhome/out",
+        "/mcuhome/cache/local",
+    }
+    assert f"{paths.context}:/mcuhome/build-context:ro" in mounted
+    assert f"{paths.sdk}:/mcuhome/sdk:ro" in mounted
+    assert not any(volume.startswith(f"{paths.root}:") for volume in mounted)
+    assert not any(str(paths.downloads) in volume for volume in mounted)
+    assert not any(str(paths.staging) in volume for volume in mounted)
+
+
+async def test_work_is_not_mounted_and_out_is(client, config, docker) -> None:
+    """§4: ``work`` is empty at the start of every step, ``out`` survives it.
+
+    A fresh container gives the first for nothing — mounting anything at
+    ``work`` would hand the step a directory that outlives it — while
+    ``out`` "holds the artifacts of the whole session" and is therefore
+    the one writable thing this side provides.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        await built(ws, config)
+
+    mounted = _volumes(docker.step)
+    assert not any(volume.endswith(":/mcuhome/work") for volume in mounted)
+    out = next(volume for volume in mounted if volume.endswith(":/mcuhome/out"))
+    assert not out.endswith(":ro")
+
+
+async def test_the_image_is_named_by_digest_and_never_by_tag(client, config, docker) -> None:
+    """A tag can be made to point at other bytes; a digest cannot.
+
+    The image was chosen by the labels of one manifest, and it is that
+    manifest's digest which runs — so a build cannot be served by bytes
+    other than the ones whose declaration was checked.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        await built(ws, config, **{"model/device-model.json": MODEL})
+
+    named = [argument for argument in docker.step if argument.startswith(IMAGE)]
+    assert named
+    assert all(IMAGE_DIGEST in argument for argument in named)
+
+
+async def test_the_step_is_started_with_this_servers_hard_limits(client, config, docker) -> None:
+    """The numbers the configuration carries, on the container itself.
+
+    The orchestrating side cannot trust an environment to stay inside a
+    recommendation — it may have a bug and run amok — so the guard is
+    outside it, and §11 tells the environment plainly that whatever
+    budget was set may be enforced hard. The memory ceiling is this
+    server's own default; the CPU figure is this host, unless an
+    operator said otherwise.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        await built(ws, config)
+
+    started = docker.step
+    assert started[started.index("--memory") + 1] == "8589934592"
+    assert started[started.index("--pids-limit") + 1] == str(config.container_pids) == "4096"
+    assert float(started[started.index("--cpus") + 1]) > 0
+
+
+async def test_an_operator_moves_both_halves_of_the_budget_at_once(
+    aiohttp_client, config, docker
+) -> None:
+    """``--container-cpus`` and ``--container-memory``, in both places.
+
+    The same two numbers are the recommendation in the request document
+    and the hard limits on the container, and they have to be the same
+    two numbers: an environment told it may use four cores while the
+    runtime holds it to one would size its parallelism from a budget it
+    does not have.
+    """
+    from mcuhome.buildserver.app import ServerState, create_app
+
+    state = ServerState(replace(config, container_cpus="2.5", container_memory="6g"))
+    client = await aiohttp_client(create_app(state))
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        await built(ws, state.config)
+
+    started = docker.step
+    assert started[started.index("--cpus") + 1] == "2.5"
+    assert started[started.index("--memory") + 1] == str(6 * 1024**3)
+    limits = docker.invocations[-1].request["limits"]
+    assert limits == {"cpus": 2.5, "memory_bytes": 6 * 1024**3}
+
+
+async def test_a_server_that_bounds_no_memory_states_none(aiohttp_client, config, docker) -> None:
+    """The empty string is an operator saying "not by memory, here".
+
+    A figure that bounds nothing is left unstated rather than written as
+    a zero: ``--memory 0`` is the runtime's own spelling for *no limit*,
+    and ``"memory_bytes": 0`` in the request document would tell an
+    environment to fit in nothing.
+    """
+    from mcuhome.buildserver.app import ServerState, create_app
+
+    state = ServerState(replace(config, container_memory=""))
+    client = await aiohttp_client(create_app(state))
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        await built(ws, state.config)
+
+    assert "--memory" not in docker.step
+    assert "memory_bytes" not in docker.invocations[-1].request["limits"]
+
+
+# --------------------------------------------------------------------------
+# The request document (§6.1)
+# --------------------------------------------------------------------------
+
+
+async def test_the_request_document_carries_every_field_the_specification_defines(
+    client, config, docker
+) -> None:
+    """§6.1's object, and nothing invented beside it.
+
+    The generation this side speaks, the two identifiers, the action and
+    its parameters. ``session_id`` is opaque — "never build a path from
+    it" — and ``invocation_id`` is the one the result document is named
+    after.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, _ = await built(ws, config)
+
+    document = docker.invocations[-1].request
+    assert document["spec_generation"] == buildenvsession.SPEC_GENERATION
+    assert document["session_id"] == session_id
+    assert document["invocation_id"] == f"{session_id}-1"
+    assert document["action"] == "build"
+    assert document["parameters"] == {}
+    assert set(document) <= {
+        "spec_generation",
+        "session_id",
+        "invocation_id",
+        "action",
+        "parameters",
+        "limits",
+    }
 
 
 async def test_a_request_document_never_names_this_machine(client, config, docker, state) -> None:
     """A build cannot tell this server from a workbench building locally.
 
-    Every path the program is given is one of the four the container
-    profile fixes, identical on every machine and for every session. It
-    is a property worth pinning rather than a coincidence: the compiler
-    cache is keyed on the compile command line, into which Zephyr puts
-    three absolute paths, so one session directory leaking into the
-    document would give this server a cache per session — which is no
-    cache at all.
+    Nothing in the document is a path at all — the tree is where §4 says
+    it is, identical on every machine and for every session. It is worth
+    pinning rather than assuming: the compiler cache is keyed on the
+    compile command line, into which Zephyr puts absolute paths, so one
+    session directory leaking through would give this server a cache per
+    session, which is no cache at all.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.verdict")
+        session_id, _ = await built(ws, config)
         paths = state.sessions.require(session_id).paths
 
-    document = docker.invocations[-1].request
-    for key in ("result", "out", "work", "tmp", "context", "events", "cancel"):
-        assert document[key].startswith(f"{containerpaths.ROOT}/"), key
-    assert document["trees"]["sdk"]["path"].startswith(f"{containerpaths.ROOT}/")
-    assert str(paths.root) not in json.dumps(document)
-    assert session_id not in json.dumps({k: v for k, v in document.items() if k != "session"})
+    document = json.dumps(docker.invocations[-1].request)
+    assert str(paths.root) not in document
+    assert "/tmp" not in document
 
 
-async def test_a_read_only_tree_has_no_writable_second_name(client, config, docker, state) -> None:
-    """The mutation the old layout was: ``trees.sdk.writable`` is false,
-    and no mount makes that directory writable under any other path.
+async def test_the_mode_a_client_asks_for_does_not_travel(client, config, docker) -> None:
+    """Every step of this profile is clean, so ``incremental`` is answered clean.
 
-    This is the assertion that survives a refactor of the layout, because
-    it is stated about the two things that have to agree — what the
-    request document asserts about a tree, and what the mount set does
-    with the host directory behind it.
-    """
-    docker.program["trees"]["sdk"] = {"path": "/opt/mcuhome-sdk"}
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.verdict")
-        paths = state.sessions.require(session_id).paths
-
-    document = docker.invocations[-1].request
-    assert document["trees"]["sdk"] == {"path": "/opt/mcuhome-sdk", "writable": False}
-    started = next(argv for argv in docker.calls if "--detach" in argv)
-    assert f"{paths.sdk}:/opt/mcuhome-sdk:ro" in _volumes(started)
-    writable = [volume for volume in _volumes(started) if not volume.endswith(":ro")]
-    assert not any(
-        Path(volume.split(":")[0]) in (paths.sdk, *paths.sdk.parents) for volume in writable
-    ), writable
-
-
-async def test_the_session_container_is_started_with_this_servers_resource_limits(
-    client, config, docker
-) -> None:
-    """The composed ``run``, with the numbers the config carries.
-
-    §1.2's ``container`` row promises "per-session resource limits" and
-    §9.1 makes them the backend's to enforce, and
-    ``abi.request_document`` leans on exactly that when it omits
-    ``limits.memory_bytes``: "enforcement is the backend's … this server
-    enforces memory through the container runtime rather than by
-    asking". That sentence was true of nothing until these flags
-    existed.
-    """
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.verdict")
-
-    started = next(argv for argv in docker.calls if "--detach" in argv)
-    assert started[started.index("--memory") + 1] == config.container_memory == "8g"
-    assert started[started.index("--pids-limit") + 1] == str(config.container_pids) == "4096"
-    assert "--cpus" not in started
-    # And the document still says nothing about memory: the runtime
-    # enforces it, so the program is not asked to.
-    assert "memory_bytes" not in docker.invocations[-1].request["limits"]
-
-
-async def test_the_describe_probe_is_mounted_and_has_no_network(client, config, docker) -> None:
-    """The other ``docker run`` this server composes, asserted as one.
-
-    ``describe`` is an invocation, so §9.1's "no network during an
-    invocation" is about it too — and the probe directory holds the
-    request document the program reads and the result document it
-    writes, neither of which exists inside the container without a
-    mount. The fake refuses a request path no ``--volume`` reaches, so
-    the mount is exercised here rather than assumed.
-    """
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        await locked(ws, config)
-
-    described = next(argv for argv in docker.calls if argv[-2:-1] == ["describe"])
-    assert described[:5] == ["docker", "run", "--rm", "--init", "--network=none"]
-    assert "--user" in described
-    request = Path(described[-1])
-    volumes = _volumes(described)
-    assert volumes == [f"{request.parent}:{request.parent}"]
-    assert described[-4:-1] == [IMAGE_REFERENCE, "/mcuhome/run", "describe"]
-
-
-async def test_two_describes_of_one_image_do_not_share_a_probe_directory(
-    client, config, docker, state
-) -> None:
-    """§5.1 step 1's per-invocation directory, applied to ``describe``.
-
-    The fixed path it replaced is named in the contract — "it removes
-    the data race the fixed path ``/ctx/.mcuhome/command.json`` had,
-    where two concurrent ``docker exec`` invocations overwrote each
-    other's document" — and a probe directory keyed by the image id is
-    that path again: nothing serializes two callers, and the second
-    caller's ``result.unlink`` deletes the first caller's answer, which
-    reads back as "no result document was written" and disqualifies a
-    good image.
-    """
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        await locked(ws, config)
-        # The memo is what normally makes the second describe never
-        # happen; dropping it is how a *concurrent* pair is reproduced
-        # without racing the test itself.
-        state.backend._images.clear()
-        sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
-        second = await open_session(ws)
-        await send_archive(ws, "send-context", second, buildable_context(sha256))
-
-    described = [argv for argv in docker.calls if argv[-2:-1] == ["describe"]]
-    assert len(described) == 2
-    assert Path(described[0][-1]).parent != Path(described[1][-1]).parent
-
-
-async def test_the_invocation_is_two_positional_operands_and_never_a_flag(
-    client, config, docker
-) -> None:
-    """§5.1, frozen: ``/mcuhome/run <action> <absolute request path>``.
-
-    "Exactly two positional operands, both mandatory, **never a flag**."
-    The argv is frozen and never grows, because a new operand breaks
-    every third-party container that does not know it while an unknown
-    JSON field costs an older program nothing.
-    """
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.verdict")
-
-    executed = next(argv for argv in docker.calls if argv[1] == "exec")
-    program = executed.index("/mcuhome/run")
-    assert executed[program:] == ["/mcuhome/run", "verify", executed[-1]]
-    assert Path(executed[-1]).is_absolute()
-    assert Path(executed[-1]).name == "request.json"
-    # And the frame in front of the program, which the assertion above
-    # says nothing about: the exec is what writes into `out` and `work`,
-    # so it is the one that must not run as root.
-    assert executed[:3] == ["docker", "exec", "--user"]
-    assert executed[3] == f"{os.getuid()}:{os.getgid()}"
-
-
-# --------------------------------------------------------------------------
-# The request document
-# --------------------------------------------------------------------------
-
-
-async def test_the_request_document_carries_every_mandatory_field(client, config, docker) -> None:
-    """§5.2's list for a working action, and the preamble in front of it.
-
-    "Mandatory in v1: ``request`` and ``result`` for every action.
-    Additionally for every working action: ``session``, ``out``,
-    ``work``, ``tmp``, ``context``, ``trees.sdk``, ``limits.jobs``."
-    Every path value is absolute, and the document lives outside the
-    context.
-    """
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.verdict")
-
-    document = docker.invocations[-1].request
-    assert document["request"] == 1
-    for field in ("result", "out", "work", "tmp", "context", "events", "cancel"):
-        assert Path(document[field]).is_absolute(), field
-    # `session` is an **opaque token** and the one field that is not a
-    # path: "a program MUST NOT compose any path from it".
-    assert document["session"] == session_id
-    assert document["trees"]["sdk"]["path"]
-    assert document["limits"]["jobs"] >= 1
-    # Outside the context, so that the context can be a kernel-enforced
-    # read-only mount (§5.1 step 1).
-    assert not str(Path(document["result"])).startswith(document["context"] + "/")
-
-
-async def test_the_request_document_names_no_invocation_id(client, config, docker) -> None:
-    """§5.2: "There is **no invocation ID** in the request document."
-
-    The backend addresses an invocation by the ``out``, ``result`` and
-    ``events`` paths it chose for it, so a token the program could only
-    echo back would be one more field for a third party to get right for
-    nothing. This server assigns one anyway — ``get-artifact`` and
-    ``cancel`` address it — and never tells the program.
-    """
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        answer = await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.verdict")
-
-    assert answer["payload"]["invocation_id"] == "inv-1"
-    assert "invocation" not in docker.invocations[-1].request
-    assert "inv-1" not in json.dumps(docker.invocations[-1].request["trees"])
-
-
-async def test_limits_are_authoritative_and_memory_is_not_promised(client, config, docker) -> None:
-    """``limits.jobs`` is resolved host-side; ``memory_bytes`` is absent.
-
-    The job count "is not a hint … the container sees the host CPU count
-    but not the RAM budget", so it is written and it is the operator's
-    number. ``memory_bytes`` is advisory and enforcement is the
-    backend's, so a number written into the document that nothing behind
-    it enforces would be a promise to the program that no one keeps.
-    """
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.verdict")
-
-    limits = docker.invocations[-1].request["limits"]
-    assert limits["jobs"] == config.build_jobs == 2
-    assert limits["deadline_seconds"] == 5400
-    assert limits["cancel_grace_seconds"] == 60
-    assert "memory_bytes" not in limits
-
-
-async def test_build_states_its_mode_and_demands_it_be_honoured(client, config, docker) -> None:
-    """``/params/mode`` in ``required``, with the value it sends (§5.2).
-
-    "The *value* counts, not only the name": a program that knows the
-    pointer but not the value MUST refuse rather than accept the job and
-    quietly deliver something else. So the mode is written explicitly
-    even though its default is defined by absence — the value has to be
-    there to be honoured.
+    The build action takes no parameters at all, and the reason is the
+    profile rather than the vocabulary: one fresh container per step is
+    what makes the pristine-tree guarantee free, and a container that
+    starts empty has nothing to build incrementally on. Answering a
+    clean build is never wrong — it is slower than what was asked for and
+    is what was asked for plus safety — while a parameter this side
+    invented would be a promise nothing keeps.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id, "mode": "incremental"}, frame_id="b")
-        await collect(ws, until="invocation.verdict")
+        frames = await collect(ws, until="invocation.verdict")
 
-    document = docker.invocations[-1].request
-    assert document["params"] == {"mode": "incremental"}
-    assert "/params/mode" in document["required"]
+    assert frames[-1]["payload"]["status"] == "success"
+    assert docker.invocations[-1].request["parameters"] == {}
 
 
-async def test_verify_gets_the_trees_and_demands_nothing(client, config, docker) -> None:
-    """§7.3: the writable views are still supplied, and never demanded.
+# --------------------------------------------------------------------------
+# The cache tiers (§8)
+# --------------------------------------------------------------------------
 
-    "The backend still supplies the writable views §4.1 requires for
-    every patched layer — ``verify`` simply does not use them, and a
-    view it never writes to is indistinguishable from one it was not
-    given." Demanding one through ``required`` would ask a conforming
-    program to refuse for not using something it is forbidden to use.
+
+@pytest.fixture
+def cached(config, tmp_path):
+    return replace(config, ccache_dir=tmp_path / "ccache")
+
+
+async def test_the_shared_cache_is_offered_read_only(aiohttp_client, cached, docker) -> None:
+    """§8: ``shared`` belongs to the orchestrator, and here it is read-only.
+
+    A build server serves contexts it does not trust and has no cache
+    warming verb, so there is deliberately no writable mode: an option
+    that made an untrusted build's shared cache writable would be the one
+    setting that turns a shared cache into a shared attack surface.
     """
+    from mcuhome.buildserver.app import ServerState, create_app
+
+    # The directory is the operator's to create: the tier is offered
+    # read-only, so an empty one behaves exactly like no mount, and a
+    # server that made it would be claiming a cache nobody warmed.
+    cached.ccache_dir.mkdir(parents=True, exist_ok=True)
+    state = ServerState(cached)
+    client = await aiohttp_client(create_app(state))
     async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config, **{"patches/zephyr/0001-fix.patch": PATCH})
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.verdict")
+        await built(ws, cached)
 
-    document = docker.invocations[-1].request
-    assert document["trees"]["zephyr"] == {"path": "/opt/zephyr", "writable": True}
-    assert "required" not in document
-    assert "params" not in document
+    mounted = _volumes(docker.step)
+    assert f"{cached.ccache_dir}:/mcuhome/cache/shared:ro" in mounted
 
 
-@pytest.mark.parametrize("layer", ["zephyr", "chip", "mcuboot"])
-async def test_a_patched_in_image_tree_is_writable_where_describe_put_it(
-    client, config, docker, layer
+async def test_without_a_configured_cache_only_the_local_tier_exists(
+    client, config, docker
 ) -> None:
-    """E47: the container's own copy-on-write layer **is** the view.
+    """§8: a tier the orchestrator provides nothing for is simply absent.
 
-    "In the ``container`` profile the container's own copy-on-write
-    layer is that view, and it costs nothing to provide": the image's
-    trees are writable inside the container by construction, one session
-    is one container, and the container is discarded at
-    ``close-session``. So the backend asserts ``writable: true`` for an
-    in-image tree at the path ``describe`` reported, and the assertion
-    is truthful because the layer makes it so.
-
-    The consequence asserted here is the negative one: **no mount is
-    involved at all.** No overlay, no copy, no ``docker cp`` — the tree
-    is already in the image.
+    "May be missing entirely" is the specification's own wording, and an
+    empty directory would be a warm cache that is not one.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config, **{f"patches/{layer}/0001-fix.patch": PATCH})
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.verdict")
+        await built(ws, config)
 
-    document = docker.invocations[-1].request
-    declared = document["trees"][layer]
-    assert declared["writable"] is True
-    assert declared["path"].startswith("/opt/")
-    assert f"/trees/{layer}" in document["required"]
-    started = next(argv for argv in docker.calls if "--detach" in argv)
-    assert not any(declared["path"] in argument for argument in started)
-    assert not any(argv[1] == "cp" for argv in docker.calls)
-
-
-async def test_an_unpatched_tree_gets_no_entry_at_all(client, config, docker) -> None:
-    """§4.1: "the program then uses its own".
-
-    A ``trees`` entry is what a backend supplies, and supplying one for
-    a tree the image already carries and nothing patches would be the
-    backend naming a path it has no reason to have an opinion about.
-    """
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.verdict")
-
-    assert set(docker.invocations[-1].request["trees"]) == {"sdk"}
-
-
-async def test_a_patched_sdk_is_handed_over_writable(client, config, docker) -> None:
-    """The SDK is the one tree that is a mount, so its mode is a mount mode.
-
-    Unpatched it is read-only; patched it is the writable view §6.2
-    asks for, and it needs neither an overlay nor a copy to be one: it
-    was unpacked into this session's own directory and dies with the
-    session.
-    """
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config, **{"patches/sdk/0001-fix.patch": PATCH})
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.verdict")
-
-    assert docker.invocations[-1].request["trees"]["sdk"]["writable"] is True
-    started = next(argv for argv in docker.calls if "--detach" in argv)
-    assert not any(argument.endswith("/sdk:ro") for argument in started)
+    tiers = [
+        volume.removesuffix(":ro").rsplit(":", 1)[1]
+        for volume in _volumes(docker.step)
+        if "/mcuhome/cache/" in volume
+    ]
+    assert tiers == ["/mcuhome/cache/local"]
 
 
 # --------------------------------------------------------------------------
@@ -515,7 +409,7 @@ async def test_a_patched_sdk_is_handed_over_writable(client, config, docker) -> 
 
 
 async def test_a_working_verb_answers_the_invocation_id_immediately(client, config) -> None:
-    """E46: ``build`` and ``verify`` answer ``{invocation_id}`` at once.
+    """``build`` answers ``{invocation_id}`` at once.
 
     A build is minutes to hours; a command frame that waited for it
     would make every client's socket a build timer, and a client that
@@ -536,149 +430,74 @@ async def test_a_working_verb_answers_the_invocation_id_immediately(client, conf
     finished = frames[-1]["payload"]
     assert finished["status"] == "success"
     assert finished["error"] is None
-    assert [entry["path"] for entry in finished["artifacts"]] == [
-        "firmware.hex",
-        "firmware.bin",
+    assert sorted(entry["path"] for entry in finished["artifacts"]) == [
         "build-report.json",
+        "firmware.bin",
+        "firmware.hex",
     ]
 
 
-async def test_the_finished_event_attributes_to_the_servers_own_context_id(client, config) -> None:
-    """§9.3: "Attribution always uses the context ID the backend computed
-    itself; ``result.context`` exists only to be compared against it."
+async def test_the_verdict_attributes_to_the_servers_own_context_id(client, config) -> None:
+    """Attribution always uses the identity this server computed itself.
+
+    It is the value the freeze wrote and the one every invocation is
+    re-measured against, so it is the only one that says what was
+    actually built.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, context_id = await locked(ws, config)
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
+        await call(ws, "build", {"session_id": session_id}, frame_id="b")
         frames = await collect(ws, until="invocation.verdict")
 
     assert frames[-1]["payload"]["context"] == context_id
 
 
-async def test_program_events_are_relayed_verbatim_with_the_servers_addressing(
-    client, config, docker
-) -> None:
-    """§8: fields intact, never rewritten, never dropped — unknown names too.
-
-    "A backend passes an event whose name it does not know through to
-    its client verbatim, with its fields intact, and never drops it,
-    never rewrites it and never treats it as an error." That is what
-    lets a third-party program report its own phases under ``x-`` names
-    through a server that has never heard of them.
-    """
-
-    def program(action, request, on_line):
-        emit(request, "invocation.started", 1, action=action)
-        emit(request, "x-acme.flashing", 2, chip="nrf5340", progress=0.5)
-        write_result(
-            request,
-            {
-                "result": 1,
-                "status": "success",
-                "action": action,
-                "session": request["session"],
-                "reason": None,
-                "error": None,
-                "context": manifest_id(request),
-            },
-        )
-        emit(request, "invocation.finished", 3, status="success")
-        return FakeProcess(0)
-
-    docker.run_program = program
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        frames = await collect(ws, until="invocation.verdict")
-
-    unknown = next(frame for frame in frames if frame.get("event") == "x-acme.flashing")
-    assert unknown["payload"]["chip"] == "nrf5340"
-    assert unknown["payload"]["progress"] == 0.5
-    assert unknown["payload"]["seq"] == 2
-    assert unknown["payload"]["invocation_id"] == "inv-1"
-    assert unknown["payload"]["session_id"] == session_id
-
-
 async def test_the_raw_log_is_its_own_frame_type_with_its_own_counter(
     client, config, docker
 ) -> None:
-    """E46: the log is a separate kind, and it counts its own lines.
+    """The log is a separate kind of frame, and it counts its own lines.
 
-    Contract §8 makes the two different things: events are a typed,
-    registered vocabulary a consumer matches on, while stdout and stderr
-    together are "one raw, opaque log stream" consumers "MUST NOT parse
-    for machine decisions". The counter is what makes the transport's
-    drop-the-oldest policy safe for it — a client that sees the numbers
-    jump knows it lost lines.
+    Standard output and standard error together are one raw, opaque
+    stream that a consumer must not parse for machine decisions, while
+    an event is something a consumer matches on. The counter is what
+    makes the transport's drop-the-oldest policy safe for the first: a
+    client that sees the numbers jump knows it lost lines rather than
+    believing it read a complete log with a silent hole in it.
     """
 
-    def program(action, request, on_line):
+    def talkative(request, out, on_line):
         on_line("-- west build")
         on_line("-- ninja: no work to do")
-        write_result(
-            request,
-            {
-                "result": 1,
-                "status": "success",
-                "action": action,
-                "session": request["session"],
-                "reason": None,
-                "error": None,
-                "context": manifest_id(request),
-            },
-        )
-        emit(request, "invocation.finished", 1, status="success")
-        return FakeProcess(0)
+        return conforming_environment(request, out, on_line)
 
-    docker.run_program = program
+    docker.run_program = talkative
     async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        frames = await collect(ws, until="invocation.verdict")
+        _, frames = await built(ws, config)
 
     logs = [frame for frame in frames if frame.get("type") == "log"]
-    assert [entry["payload"]["seq"] for entry in logs] == [1, 2]
+    assert [entry["payload"]["seq"] for entry in logs][:2] == [1, 2]
     assert logs[0]["payload"]["line"] == "-- west build"
     assert logs[0]["payload"]["invocation_id"] == "inv-1"
 
 
-async def test_an_over_long_event_line_is_discarded_and_not_an_abort(
-    client, config, docker
-) -> None:
-    """§8: over 8192 bytes is "discarded and counted, never an abort".
+async def test_the_events_are_this_servers_own_and_are_numbered(client, config) -> None:
+    """A build environment has no event channel, so the stream is this side's.
 
-    A program that writes rubbish into its own event stream has not
-    failed its build, and a backend that stopped on one would turn a
-    cosmetic defect into a lost invocation.
+    The specification gives an environment a request document, a result
+    document and a log — and nothing else. What a client follows is
+    therefore what this server did: the invocation started, and the
+    verdict it reached. Numbering them is what makes the file
+    ``attach-session`` replays resumable.
     """
-
-    def program(action, request, on_line):
-        Path(request["events"]).write_text(
-            json.dumps({"event": "x-huge", "seq": 1, "pad": "z" * 9000}) + "\n"
-        )
-        emit(request, "invocation.finished", 2, status="success")
-        write_result(
-            request,
-            {
-                "result": 1,
-                "status": "success",
-                "action": action,
-                "session": request["session"],
-                "reason": None,
-                "error": None,
-                "context": manifest_id(request),
-            },
-        )
-        return FakeProcess(0)
-
-    docker.run_program = program
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
+        await ws.send_json({"id": "b", "type": "build", "payload": {"session_id": session_id}})
         frames = await collect(ws, until="invocation.verdict")
 
-    assert not any(frame.get("event") == "x-huge" for frame in frames)
-    assert frames[-1]["payload"]["status"] == "success"
+    events = [frame for frame in frames if frame.get("type") == "event"]
+    assert [frame["event"] for frame in events] == ["invocation.started", "invocation.verdict"]
+    assert [frame["payload"]["seq"] for frame in events] == [1, 2]
+    assert all(frame["payload"]["invocation_id"] == "inv-1" for frame in events)
 
 
 # --------------------------------------------------------------------------
@@ -687,569 +506,176 @@ async def test_an_over_long_event_line_is_discarded_and_not_an_abort(
 
 
 async def test_no_result_document_is_builder_crashed_and_retryable(client, config, docker) -> None:
-    """§9.1: "an ``out`` directory without a result document at ``result``
-    is a failed invocation by definition" — and it is the retryable one.
+    """§6.3: "a step that produced no readable result document failed".
 
-    "An infrastructure failure, not a verdict on the context": a limit
-    that aborted the program produces exactly this, and the same
+    Whatever it exited with — and it is the retryable one, because it is
+    an infrastructure failure rather than a verdict on the context: a
+    limit that killed the step produces exactly this, and the same
     invocation may well succeed on a retry.
     """
-    docker.run_program = lambda action, request, on_line: FakeProcess(137)
+    docker.run_program = silent_environment
     async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        frames = await collect(ws, until="invocation.verdict")
+        _, frames = await built(ws, config)
 
-    payload = frames[-1]["payload"]
-    assert payload["status"] == "failure"
-    assert payload["error"]["code"] == "builder.crashed"
-    assert payload["error"]["retryable"] is True
-    assert payload["artifacts"] == []
+    verdict = frames[-1]["payload"]
+    assert verdict["status"] == "failure"
+    assert verdict["error"]["code"] == "builder.crashed"
+    assert verdict["error"]["retryable"] is True
+    assert verdict["artifacts"] == []
+
+
+async def test_a_failure_carries_the_environments_own_message(client, config, docker) -> None:
+    """§6.2's ``message`` is free text for a human, and it travels as such.
+
+    Under a name that says whose sentence it is, bounded and stripped of
+    control characters: it is the one untrusted string in the document
+    and it ends up in a frame this server signs its name under.
+    """
+    docker.run_program = failing_environment
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        _, frames = await built(ws, config)
+
+    error = frames[-1]["payload"]["error"]
+    assert error["code"] == "builder.failed"
+    assert error["retryable"] is False
+    assert error["details"]["environment_message"] == "the build failed"
+    assert error["details"]["status"] == "failure"
+
+
+async def test_unsupported_says_the_environment_and_not_the_build_is_wrong(
+    client, config, docker
+) -> None:
+    """§6.2: ``unsupported`` means *no environment of my kind can do this*.
+
+    "It tells the orchestrator to look for a different environment
+    rather than report a broken build", so it is the one failure of a
+    step that comes back as a statement about the environment — a client
+    reading it goes to another server, or another image, rather than to
+    its own sources.
+    """
+
+    def refusing(request, out, on_line):
+        write_result(
+            request,
+            out,
+            {
+                "spec_generation": buildenvsession.SPEC_GENERATION,
+                "invocation_id": request["invocation_id"],
+                "status": "unsupported",
+                "message": "this environment builds no Matter devices",
+                "artifacts": [],
+            },
+        )
+        return FakeProcess(1)
+
+    docker.run_program = refusing
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        _, frames = await built(ws, config)
+
+    verdict = frames[-1]["payload"]
+    assert verdict["status"] == "unsupported"
+    assert verdict["error"]["code"] == "version.builder-unsatisfiable"
+    assert "Matter" in verdict["error"]["details"]["environment_message"]
+
+
+async def test_exit_zero_with_a_failing_document_is_a_violation(client, config, docker) -> None:
+    """§6.3, and the pessimistic reading of a contradiction.
+
+    "Exit 0 when you wrote a result document with ``status: success``,
+    and non-zero otherwise." Where the two disagree the step failed
+    either way; carrying the violation separately is what lets a client
+    say that the *environment* misbehaved rather than the build.
+    """
+
+    def contradictory(request, out, on_line):
+        write_result(
+            request,
+            out,
+            {
+                "spec_generation": buildenvsession.SPEC_GENERATION,
+                "invocation_id": request["invocation_id"],
+                "status": "failure",
+                "message": "no",
+                "artifacts": [],
+            },
+        )
+        return FakeProcess(0)
+
+    docker.run_program = contradictory
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        _, frames = await built(ws, config)
+
+    verdict = frames[-1]["payload"]
+    assert verdict["status"] == "failure"
+    assert verdict["environment_violation"]
 
 
 async def test_a_declared_artifact_that_does_not_re_hash_is_not_served(
     client, config, docker
 ) -> None:
-    """§9.3: "re-hash every artifact from the bytes on disk".
+    """What a client is offered is what was measured, not what was declared.
 
-    Declared values are advisory. An artifact whose bytes disagree with
-    its declaration fails §5.3's sixth condition, so the whole
-    invocation is a failure — a build that declared four artifacts and
-    produced three is not a build that delivers three.
+    The artifacts are hashed where they actually are, by the side that
+    will hand them over — so a name in the result document that no file
+    answers to is a failed step rather than a delivery with a hole in it.
     """
 
-    def program(action, request, on_line):
-        (Path(request["out"]) / "firmware.hex").write_bytes(b"actual")
+    def lying(request, out, on_line):
         write_result(
             request,
+            out,
             {
-                "result": 1,
+                "spec_generation": buildenvsession.SPEC_GENERATION,
+                "invocation_id": request["invocation_id"],
                 "status": "success",
-                "action": "build",
-                "session": request["session"],
-                "reason": None,
-                "error": None,
-                "context": manifest_id(request),
-                "layers": {},
-                "artifacts": [
-                    {
-                        "root": "out",
-                        "path": "firmware.hex",
-                        "role": "firmware",
-                        "hashes": {"sha256": hashlib.sha256(b"declared").hexdigest()},
-                    }
-                ],
+                "message": "",
+                "artifacts": ["firmware.bin"],
             },
         )
-        emit(request, "invocation.finished", 1, status="success")
         return FakeProcess(0)
 
-    docker.run_program = program
+    docker.run_program = lying
     async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        frames = await collect(ws, until="invocation.verdict")
+        _, frames = await built(ws, config)
 
-    payload = frames[-1]["payload"]
-    assert payload["status"] == "failure"
-    assert payload["artifacts"] == []
+    verdict = frames[-1]["payload"]
+    assert verdict["status"] == "failure"
+    assert verdict["artifacts"] == []
 
 
-async def test_an_artifact_outside_out_is_skipped_rather_than_resolved(
-    client, config, docker
-) -> None:
-    """§9.3: normalize, contain strictly, and skip an unknown ``root``.
+async def test_an_artifact_outside_out_is_never_resolved(client, config, docker, state) -> None:
+    """A declared name that leaves ``out`` is refused rather than followed.
 
-    Both halves in one program: a path that climbs out of ``out`` and an
-    entry whose ``root`` this version does not know. "A consumer that
-    sees a ``root`` it does not know MUST skip that artifact and MUST
-    NOT resolve it against ``out``."
+    ``out`` is the whole of what a step may deliver, and a symlink out of
+    it is the shape an escape takes: a client that asked for
+    ``firmware.bin`` would be handed the bytes of a host file the step
+    never produced.
     """
 
-    def program(action, request, on_line):
+    def escaping(request, out, on_line):
+        outside = out.parent / "outside"
+        outside.write_bytes(b"a host file\n")
+        (out / "firmware.bin").symlink_to(outside)
         write_result(
             request,
+            out,
             {
-                "result": 1,
+                "spec_generation": buildenvsession.SPEC_GENERATION,
+                "invocation_id": request["invocation_id"],
                 "status": "success",
-                "action": "build",
-                "session": request["session"],
-                "reason": None,
-                "error": None,
-                "context": manifest_id(request),
-                "layers": {},
-                "artifacts": [
-                    {
-                        "root": "out",
-                        "path": "../../escape",
-                        "role": "firmware",
-                        "hashes": {"sha256": "0" * 64},
-                    },
-                    {
-                        "root": "work",
-                        "path": "elsewhere.bin",
-                        "role": "firmware",
-                        "hashes": {"sha256": "0" * 64},
-                    },
-                ],
+                "message": "",
+                "artifacts": ["firmware.bin"],
             },
         )
-        emit(request, "invocation.finished", 1, status="success")
         return FakeProcess(0)
 
-    docker.run_program = program
+    docker.run_program = escaping
     async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        frames = await collect(ws, until="invocation.verdict")
-
-    payload = frames[-1]["payload"]
-    assert payload["artifacts"] == []
-    # A successful build that declares nothing servable has produced
-    # nothing the backend may serve, and an absent list is an empty
-    # delivery rather than a permissive one.
-    assert payload["status"] == "failure"
-
-
-async def test_exit_zero_with_a_failing_document_is_a_contract_violation(
-    client, config, docker
-) -> None:
-    """§5.3: the pessimistic reading wins **and** a violation is raised.
-
-    The violation is carried to the client rather than only logged,
-    because it is a statement about the *image* that the operator of the
-    client is often the one who can act on — it names a container that
-    contradicts itself.
-    """
-
-    def program(action, request, on_line):
-        write_result(
-            request,
-            {
-                "result": 1,
-                "status": "failure",
-                "action": action,
-                "session": request["session"],
-                "reason": "error.build.failed",
-                "error": {"retryable": True, "message": "the linker said no", "details": {}},
-            },
-        )
-        emit(request, "invocation.finished", 1, status="failure")
-        return FakeProcess(0)
-
-    docker.run_program = program
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        frames = await collect(ws, until="invocation.verdict")
-
-    payload = frames[-1]["payload"]
-    assert payload["status"] == "failure"
-    assert "exited 0" in payload["contract_violation"]
-    # The program's own promise is carried as information and is never
-    # the envelope's `retryable`: that value is the server's, "derived
-    # from the server's own registry precisely so the promise cannot be
-    # forged".
-    assert payload["error"]["retryable"] is False
-    assert payload["error"]["details"]["reason"] == "error.build.failed"
-
-
-async def test_an_unknown_status_is_read_as_failure(client, config, docker) -> None:
-    """§5.4: "Consumers MUST treat unknown values as ``failure``"."""
-
-    def program(action, request, on_line):
-        write_result(
-            request,
-            {
-                "result": 1,
-                "status": "mostly-fine",
-                "action": action,
-                "session": request["session"],
-            },
-        )
-        emit(request, "invocation.finished", 1, status="mostly-fine")
-        return FakeProcess(1)
-
-    docker.run_program = program
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        frames = await collect(ws, until="invocation.verdict")
-
-    assert frames[-1]["payload"]["status"] == "failure"
-
-
-@pytest.mark.parametrize("reason", ["error.patch.incomplete", "error.work.foreign"])
-async def test_an_interrupted_patch_application_poisons_the_session(
-    client, config, docker, state, reason
-) -> None:
-    """§6.2 and §6.3: both are terminal for the session, in one sentence.
-
-    "The backend MUST refuse every further working action in that
-    session. The client's remedy is a **new session** — a new container,
-    hence pristine trees." ``session.poisoned`` is that refusal on the
-    wire, and ``get-artifact`` and ``close-session`` stay permitted.
-
-    Parametrized over both because only one of them was ever exercised:
-    the reason table and the backend's poisoning set were two
-    independent literals, and the set could lose ``error.work.foreign``
-    with the suite green. It is derived from the table now, and this is
-    the test that says the derivation is the right one.
-    """
-
-    def program(action, request, on_line):
-        write_result(
-            request,
-            {
-                "result": 1,
-                "status": "failure",
-                "action": action,
-                "session": request["session"],
-                "reason": reason,
-                "error": {"retryable": False, "message": "zephyr half patched", "details": {}},
-            },
-        )
-        emit(request, "invocation.finished", 1, status="failure")
-        return FakeProcess(1)
-
-    docker.run_program = program
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config, **{"patches/zephyr/0001.patch": PATCH})
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        frames = await collect(ws, until="invocation.verdict")
-        again = await call(ws, "build", {"session_id": session_id}, frame_id="b2")
-
-    assert frames[-1]["payload"]["error"]["code"] == "session.poisoned"
-    assert again["error"]["code"] == "session.poisoned"
-
-
-async def test_a_verify_mismatch_fails_the_invocation_without_poisoning(
-    client, config, docker
-) -> None:
-    """An integrity mismatch is a failed invocation and a live session.
-
-    The distinction is §6.2's: a session poisons when an interrupted
-    patch application leaves trees no future build may trust, and a
-    ``verify`` never touches a tree. Poisoning here would kill a session
-    for having been checked — and the obvious next move after a mismatch
-    is to look at what else the session holds, not to lose it.
-    """
-
-    def program(action, request, on_line):
-        write_result(
-            request,
-            {
-                "result": 1,
-                "status": "failure",
-                "action": "verify",
-                "session": request["session"],
-                "reason": "error.context.mismatch",
-                "error": {
-                    "retryable": False,
-                    "message": "model/device-model.json",
-                    "details": {"paths": ["model/device-model.json"]},
-                },
-            },
-        )
-        emit(request, "invocation.finished", 1, status="failure")
-        return FakeProcess(1)
-
-    docker.run_program = program
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        frames = await collect(ws, until="invocation.verdict")
-        attached = await call(ws, "attach-session", {"session_id": session_id}, frame_id="a")
-
-    assert frames[-1]["payload"]["error"]["code"] == "context.integrity-mismatch"
-    assert attached["type"] == "result"
-
-
-def _declaring(*entries: tuple[str, str, bytes], hashes=None):
-    """A program that writes *entries* into ``out`` and declares them.
-
-    Each entry is ``(path, role, payload)``. *hashes* replaces the
-    declared digest of one path, which is how the two §7.2 cases that
-    turn on the verified-versus-declared distinction are stated.
-    """
-
-    def program(action, request, on_line):
-        out = Path(request["out"])
-        declared = []
-        for name, role, payload in entries:
-            (out / name).write_bytes(payload)
-            digest = (hashes or {}).get(name) or hashlib.sha256(payload).hexdigest()
-            declared.append(
-                {"root": "out", "path": name, "role": role, "hashes": {"sha256": digest}}
-            )
-        write_result(
-            request,
-            {
-                "result": 1,
-                "status": "success",
-                "action": "build",
-                "session": request["session"],
-                "reason": None,
-                "error": None,
-                "context": manifest_id(request),
-                "layers": {},
-                "artifacts": declared,
-            },
-        )
-        emit(request, "invocation.finished", 1, status="success")
-        return FakeProcess(0)
-
-    return program
-
-
-REPORT = json.dumps(BUILD_REPORT).encode()
-
-
-async def test_a_build_that_delivers_no_report_is_not_a_successful_build(
-    client, config, docker
-) -> None:
-    """§7.2: "exactly one artifact with role ``report``".
-
-    "The program is forbidden to sign and the client therefore has to: a
-    build whose parameters the client cannot read produces an image
-    nobody can sign." So a delivery without one is not a delivery, even
-    though the firmware itself verified.
-    """
-    docker.run_program = _declaring(("firmware.hex", "firmware", b":00\n"))
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        frames = await collect(ws, until="invocation.verdict")
-
-    payload = frames[-1]["payload"]
-    assert payload["status"] == "failure"
-    assert any("role report" in problem for problem in payload["error"]["details"]["problems"])
-
-
-async def test_a_build_with_two_reports_is_not_a_successful_build_either(
-    client, config, docker
-) -> None:
-    """ "**Exactly** one", because the client that signs detached has to
-    know which report describes the image it is signing."""
-    docker.run_program = _declaring(
-        ("firmware.hex", "firmware", b":00\n"),
-        ("build-report.json", "report", REPORT),
-        ("second-report.json", "report", REPORT + b" "),
-    )
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        frames = await collect(ws, until="invocation.verdict")
-
-    payload = frames[-1]["payload"]
-    assert payload["status"] == "failure"
-    assert any("2 artifacts with role report" in p for p in payload["error"]["details"]["problems"])
-
-
-async def test_a_build_with_no_firmware_at_all_is_not_a_successful_build(
-    client, config, docker
-) -> None:
-    """The other half of §7.2's minimum: "the unsigned image with role
-    ``firmware``". A report about an image nobody received is not a
-    delivery."""
-    docker.run_program = _declaring(("build-report.json", "report", REPORT))
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        frames = await collect(ws, until="invocation.verdict")
-
-    payload = frames[-1]["payload"]
-    assert payload["status"] == "failure"
-    assert any("role firmware" in problem for problem in payload["error"]["details"]["problems"])
-
-
-async def test_the_delivery_rule_is_measured_on_what_verified_and_not_on_what_was_declared(
-    client, config, docker
-) -> None:
-    """The distinction the rule spends a paragraph defending.
-
-    A build that *declares* a report and delivers one whose bytes do not
-    re-hash has produced an image nobody can sign, exactly as surely as
-    one that never declared it — the backend serves the intersection of
-    declared and verified (§9.3), and the client receives the
-    intersection. Measured on the declaration this case answers
-    "success"; it is the only case that tells the two readings apart.
-    """
-    docker.run_program = _declaring(
-        ("firmware.hex", "firmware", b":00\n"),
-        ("build-report.json", "report", REPORT),
-        hashes={"build-report.json": hashlib.sha256(b"a different report").hexdigest()},
-    )
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        frames = await collect(ws, until="invocation.verdict")
-
-    payload = frames[-1]["payload"]
-    assert payload["status"] == "failure"
-    assert [entry["path"] for entry in payload["artifacts"]] == ["firmware.hex"]
-    problems = payload["error"]["details"]["problems"]
-    assert any("role report" in problem for problem in problems), problems
-
-
-async def test_a_declared_artifact_this_server_cannot_resolve_fails_the_build(
-    client, config, docker
-) -> None:
-    """§9.3: a hash in the wrong rendering "is a **mismatch**, not a value
-    to fold" — and a mismatch fails §5.3's sixth condition.
-
-    Dropping the entry instead reported ``status: success`` with the
-    artifact absent from the delivery and no error anywhere, which is
-    the one failure a client has no way to notice: it asked for a build,
-    it was told the build succeeded, and the file it needs is simply not
-    in the list.
-    """
-    payload = b"\x00\x01\x02\x03"
-    docker.run_program = _declaring(
-        ("firmware.hex", "firmware", b":00\n"),
-        ("build-report.json", "report", REPORT),
-        ("firmware.bin", "firmware", payload),
-        hashes={"firmware.bin": hashlib.sha256(payload).hexdigest().upper()},
-    )
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        frames = await collect(ws, until="invocation.verdict")
-
-    finished = frames[-1]["payload"]
-    assert finished["status"] == "failure"
-    assert [entry["path"] for entry in finished["artifacts"]] == [
-        "firmware.hex",
-        "build-report.json",
-    ]
-    assert any(
-        "64 lowercase hex" in problem for problem in finished["error"]["details"]["problems"]
-    )
-
-
-async def test_a_build_that_reports_no_layers_for_a_patched_context_is_not_successful(
-    client, config, docker
-) -> None:
-    """§5.4's ``layers`` row, compared against what the backend derived.
-
-    "MUST, on success, **for every patched layer**", and "the backend
-    compares the block against what it expects to have been applied".
-    Checked as "is it a dict", a build on a context carrying
-    ``patches/zephyr/`` that answered ``layers: {}`` was fully
-    successful — a build that either did not apply those patches or did
-    not say so, and the row exists so that the two cannot be told apart
-    by omission.
-    """
-
-    def program(action, request, on_line):
-        write_result(
-            request,
-            {
-                "result": 1,
-                "status": "success",
-                "action": "build",
-                "session": request["session"],
-                "reason": None,
-                "error": None,
-                "context": manifest_id(request),
-                "layers": {},
-                "artifacts": [],
-            },
-        )
-        emit(request, "invocation.finished", 1, status="success")
-        return FakeProcess(0)
-
-    docker.run_program = program
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config, **{"patches/zephyr/0001-fix.patch": PATCH})
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        frames = await collect(ws, until="invocation.verdict")
-
-    payload = frames[-1]["payload"]
-    assert payload["status"] == "failure"
-    assert any(
-        'no layers entry for "zephyr"' in problem
-        for problem in payload["error"]["details"]["problems"]
-    )
-
-
-# --------------------------------------------------------------------------
-# The shared cache (§10)
-# --------------------------------------------------------------------------
-
-
-@pytest.fixture
-def cached(config, tmp_path):
-    return replace(config, ccache_dir=tmp_path / "ccache")
-
-
-async def test_the_shared_cache_is_offered_read_only_and_keyed_by_program_id(
-    aiohttp_client, cached, docker
-) -> None:
-    """§10: "Shared backends MUST offer a shared cache read-only for
-    untrusted work; cache warming is a deliberate operator invocation
-    with a writable cache and trusted contexts only."
-
-    A build server serves untrusted contexts by definition and has no
-    warming verb, so read-only here has no option to change it — and the
-    store is one subdirectory per ``program.id``, which is §10's own
-    recommendation "so that two foreign images cannot corrupt each
-    other's store". The whole path was dead in this suite: no test set
-    ``ccache_dir``, so a silently inverted ``read_only`` would have been
-    a cross-tenant write nobody noticed.
-    """
-    from mcuhome.buildserver.app import ServerState, create_app
-
-    # The store's per-program subdirectory is the operator's to create,
-    # and it has to be there before the session starts. Nothing creates
-    # it: it is offered read-only, so an empty one behaves exactly like
-    # no mount, and a backend that made it would be claiming a cache
-    # nobody warmed.
-    store = cached.ccache_dir / "org.mcuhome.build-container"
-    store.mkdir(parents=True, exist_ok=True)
-
-    state = ServerState(cached)
-    client = await aiohttp_client(create_app(state))
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, cached)
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.verdict")
-
-    started = next(argv for argv in docker.calls if "--detach" in argv)
-    assert f"{store}:{containerpaths.CCACHE_SHARED}:ro" in _volumes(started)
-    # Mounted, never stated: an image configures ccache itself (§10.1),
-    # so the request document carries no cache at all — and the writable
-    # half is absent, which is what keeps a shared store read-only for
-    # work this server does not trust.
-    assert "ccache" not in docker.invocations[-1].request
-    assert not any(str(containerpaths.CCACHE_LOCAL) in v for v in _volumes(started))
-
-
-async def test_a_program_id_that_is_not_a_path_segment_gets_no_cache_at_all(
-    aiohttp_client, cached, docker
-) -> None:
-    """§7.1.1 makes ``program.id`` opaque — "a backend compares it for
-    equality and does nothing else with it".
-
-    So an identity that is not a usable directory name gets no cache
-    rather than a sanitized one: a third-party program may call itself
-    anything, and a backend that repaired the name would be inventing an
-    identity the program never claimed — and pointing two of them at one
-    store.
-    """
-    from mcuhome.buildserver.app import ServerState, create_app
-
-    docker.program["id"] = "../escape"
-    state = ServerState(cached)
-    client = await aiohttp_client(create_app(state))
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, cached)
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.verdict")
-
-    assert "ccache" not in docker.invocations[-1].request
-    started = next(argv for argv in docker.calls if "--detach" in argv)
-    assert not any("ccache" in volume for volume in _volumes(started))
+        _, frames = await built(ws, config)
+
+    verdict = frames[-1]["payload"]
+    assert verdict["status"] == "failure"
+    assert verdict["artifacts"] == []
 
 
 # --------------------------------------------------------------------------
@@ -1258,20 +684,16 @@ async def test_a_program_id_that_is_not_a_path_segment_gets_no_cache_at_all(
 
 
 async def test_get_artifact_announces_an_archive_and_streams_it(client, config) -> None:
-    """E45: the mirror of the upload, and the bytes are a ``tar.zst``.
+    """The mirror of the upload, and the bytes are a ``tar.zst``.
 
     The result frame **is** the announcement — size, SHA-256 and what is
     in the archive — and the BINARY frames follow it. There is no
     acknowledgement behind them for the reason the upload needs one and
     this does not: the receiving side is the client, and it knows the
-    transfer is complete when it has taken the announced number of
-    bytes.
+    transfer is complete when it has taken the announced number of bytes.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.verdict")
-
+        session_id, _ = await built(ws, config)
         await ws.send_json(
             {
                 "id": "g",
@@ -1292,11 +714,6 @@ async def test_get_artifact_announces_an_archive_and_streams_it(client, config) 
     announced = announcement["payload"]["archive"]
     assert hashlib.sha256(archive).hexdigest() == announced["sha256"]
     assert len(archive) == announced["size"]
-    assert [entry["path"] for entry in announcement["payload"]["artifacts"]] == [
-        "firmware.hex",
-        "firmware.bin",
-        "build-report.json",
-    ]
 
     import io
     import tarfile
@@ -1309,11 +726,9 @@ async def test_get_artifact_announces_an_archive_and_streams_it(client, config) 
 
 
 async def test_get_artifact_with_a_path_holds_exactly_that_one(client, config) -> None:
-    """ "With ``path``, the archive holds exactly that declared artifact"."""
+    """With ``path``, the archive holds exactly that declared artifact."""
     async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.verdict")
+        session_id, _ = await built(ws, config)
         await ws.send_json(
             {
                 "id": "g",
@@ -1338,14 +753,11 @@ async def test_get_artifact_with_a_path_holds_exactly_that_one(client, config) -
 async def test_a_path_that_is_not_a_declared_artifact_is_typed(client, config) -> None:
     """``artifact.unknown``, with the paths the invocation did declare.
 
-    The refusal for an unknown path was named nowhere and is this
-    server's own: the invocation exists and answered, so the statement
-    is about the artifact rather than about the invocation.
+    The invocation exists and answered, so the statement is about the
+    artifact rather than about the invocation.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.verdict")
+        session_id, _ = await built(ws, config)
         frame = await call(
             ws,
             "get-artifact",
@@ -1374,241 +786,49 @@ async def test_get_artifact_of_an_unknown_invocation_reuses_the_invocation_code(
     assert frame["error"]["code"] == "invocation.unknown"
 
 
-async def test_the_programs_own_retryable_travels_as_the_programs_and_not_as_the_envelopes(
-    client, config, docker
+async def test_a_download_that_no_longer_matches_what_was_verified_is_refused(
+    client, config, state
 ) -> None:
-    """§5.4.1, both halves of it.
+    """The artifacts are re-measured at delivery, not trusted from the step.
 
-    ``error.retryable`` is "the program's promise about its own failure,
-    and about nothing else", and a backend "MUST NOT relay it as the
-    session protocol's ``retryable``". Carrying it under a name that
-    says whose promise it is costs nothing and is the only way a client
-    sees the program's opinion at all — and it was documented as
-    happening while being dropped on the floor.
+    A session's tree stays writable between the end of a step and the
+    download, so a check made once and trusted afterwards is a check that
+    can be walked around — and what would be delivered is a file's bytes
+    under a name somebody else verified.
     """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, _ = await built(ws, config)
 
-    def program(action, request, on_line):
-        write_result(
-            request,
-            {
-                "result": 1,
-                "status": "failure",
-                "action": action,
-                "session": request["session"],
-                "reason": "error.build.failed",
-                "error": {"retryable": True, "message": "flaky linker", "details": {"tries": 3}},
-            },
+        record = state.backend.record(session_id, "inv-1")
+        outside = state.config.context_root / "outside"
+        outside.write_bytes(b"a host file outside out/\n")
+        (record.out / "firmware.hex").unlink()
+        (record.out / "firmware.hex").symlink_to(outside)
+
+        frame = await call(
+            ws,
+            "get-artifact",
+            {"session_id": session_id, "invocation_id": "inv-1", "path": "firmware.hex"},
+            frame_id="g",
         )
-        emit(request, "invocation.finished", 1, status="failure")
-        return FakeProcess(1)
 
-    docker.run_program = program
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        frames = await collect(ws, until="invocation.verdict")
-
-    error = frames[-1]["payload"]["error"]
-    assert error["details"]["container_retryable"] is True
-    assert error["details"]["container_details"] == {"tries": 3}
-    assert error["retryable"] is False, "the envelope's promise is this server's"
-
-
-async def test_a_runtime_that_dies_between_send_context_and_build_is_typed(
-    client, config, docker, state
-) -> None:
-    """The pre-start refusal at *container start*, which had no test.
-
-    ``send-context`` has already described the image and cached the
-    answer, so nothing refuses ahead of the ``docker run`` — and a
-    daemon that went away in between is ``builder.runtime-unavailable``,
-    retryable, with the session untouched and usable afterwards.
-    """
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        docker.version_status = 1
-        frame = await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        docker.version_status = 0
-        again = await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.verdict")
-
-    assert frame["error"]["code"] == "builder.runtime-unavailable"
-    assert frame["error"]["retryable"] is True
-    assert again["type"] == "result", "the session survived the refusal"
-
-
-async def test_the_verdict_frame_is_sent_and_never_offered(client, config, docker, monkeypatch):
-    """E46's one frame with no second way to be learned.
-
-    ``_publish`` says it plainly — "the ``invocation.verdict`` frame is
-    sent instead, because it is the one frame a client is waiting on and
-    there is no second way to learn it" — and the distinction between
-    the two enqueue paths was asserted nowhere, so the completion frame
-    could be made droppable with the suite green. The log and the
-    program's events are offered, for the reason the same docstring
-    gives: both survive a gap — the program's own ``invocation.finished``
-    among them, since it is a line in the events file ``attach-session``
-    replays from.
-    """
-    from mcuhome.buildserver.ws import Connection
-
-    offered: list[dict] = []
-    sent: list[dict] = []
-    real_offer, real_send = Connection.offer, Connection.send
-
-    def offer(self, frame):
-        offered.append(frame)
-        return real_offer(self, frame)
-
-    async def send(self, frame):
-        sent.append(frame)
-        return await real_send(self, frame)
-
-    monkeypatch.setattr(Connection, "offer", offer)
-    monkeypatch.setattr(Connection, "send", send)
-
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.verdict")
-
-    def verdict(frames):
-        return [frame for frame in frames if frame.get("event") == "invocation.verdict"]
-
-    assert len(verdict(sent)) == 1
-    assert verdict(offered) == []
-    assert any(frame.get("type") == "log" for frame in offered)
-    assert any(frame.get("event") == "artifact.collected" for frame in offered)
-    # And the program's own §8 announcement is on the droppable side of
-    # the same run (E58): same invocation, two frames, told apart by
-    # name rather than by the absence of a field.
-    assert any(frame.get("event") == "invocation.finished" for frame in offered)
-
-
-async def test_the_per_invocation_directory_is_prepared_the_way_9_1_asks(
-    client, config, docker, state
-) -> None:
-    """§9.1's preparation list, on disk, after the invocation finished.
-
-    "An empty ``out``, an empty ``tmp``, the events file" — the events
-    file created by the *backend* so that "not created yet" and "no
-    events yet" are not the same thing for a reader, and the directory
-    itself ``0o700`` for the same reason the session root is: everything
-    under it is one client's.
-
-    The program here emits **no events at all**, which is a conforming
-    program (§8 requires none) and the only one that can see the
-    difference: with an emitting program the file exists because the
-    program made it, and the backend's own duty is invisible.
-    """
-
-    def silent(action, request, on_line):
-        write_result(
-            request,
-            {
-                "result": 1,
-                "status": "success",
-                "action": action,
-                "session": request["session"],
-                "reason": None,
-                "error": None,
-                "context": manifest_id(request),
-            },
-        )
-        return FakeProcess(0)
-
-    docker.run_program = silent
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.verdict")
-        directory = state.sessions.require(session_id).paths.invocation("inv-1")
-
-    assert (directory / "events.ndjson").exists()
-    assert (directory / "tmp").is_dir()
-    assert list((directory / "tmp").iterdir()) == []
-    assert directory.stat().st_mode & 0o077 == 0
-    assert (directory / "out").stat().st_mode & 0o077 == 0
-
-
-# --------------------------------------------------------------------------
-# attach-session, cancel, close-session
-# --------------------------------------------------------------------------
-
-
-async def test_nothing_filesystem_heavy_runs_on_the_event_loop(
-    client, config, docker, monkeypatch
-) -> None:
-    """E45's archive and E48's SDK, off the loop.
-
-    ``acquire_sdk`` hashes a multi-gigabyte package, streams a full zstd
-    decompression to disk and untars it; ``build_archive`` tars and
-    compresses a build's artifacts and then re-reads the spool. Both sat
-    on the event loop, in the path of commands that promise to answer
-    immediately — and the endpoint's thirty-second heartbeat means a
-    long enough stall drops *unrelated* clients' connections.
-
-    Re-hashing the artifacts is no longer on this list because it is no
-    longer this server's: §9.3's egress check happens inside the
-    orchestrator, in the same worker thread as the build itself. What
-    stays here is the second one, at download time — the session tree is
-    writable between the end of an invocation and ``get-artifact``.
-    """
-    from mcuhome.buildserver import artifacts
-
-    threads: dict[str, threading.Thread] = {}
-
-    def record(name, function):
-        def wrapper(*arguments, **keywords):
-            threads[name] = threading.current_thread()
-            return function(*arguments, **keywords)
-
-        return wrapper
-
-    from mcuhome.workbench import orchestrator
-
-    # The SDK is acquired by the orchestrator now, inside the call that
-    # materializes the environment — which is the call this server makes
-    # off the loop. Instrumenting it there rather than here is the same
-    # assertion about the same bytes: hashing a multi-gigabyte package,
-    # streaming a zstd decompression to disk and untarring it.
-    monkeypatch.setattr(orchestrator, "acquire_sdk", record("sdk", orchestrator.acquire_sdk))
-    monkeypatch.setattr(artifacts, "build_archive", record("archive", artifacts.build_archive))
-
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.verdict")
-        await ws.send_json(
-            {
-                "id": "g",
-                "type": "get-artifact",
-                "payload": {"session_id": session_id, "invocation_id": "inv-1"},
-            }
-        )
-        while True:
-            frame = await ws.receive_json(timeout=15)
-            if frame.get("id") == "g":
-                break
-
-    assert set(threads) == {"sdk", "archive"}
-    for name, thread in threads.items():
-        assert thread is not threading.main_thread(), f"{name} ran on the event loop"
+    assert frame["type"] == "error"
+    assert frame["error"]["code"] == "artifact.integrity-mismatch"
+    assert frame["error"]["retryable"] is False
+    assert frame["error"]["details"]["path"] == "firmware.hex"
 
 
 async def test_one_download_at_a_time_per_connection_and_never_one_spool(
     client, config, monkeypatch
 ) -> None:
-    """Two ``get-artifact`` commands on one connection, and neither
-    corrupts the other.
+    """Two ``get-artifact`` commands on one connection, and neither corrupts
+    the other.
 
-    Nothing enforced either half. Every command runs as its own task, so
-    two downloads interleaved their BINARY frames — which carry no id,
-    so a client cannot sort them — and the spool was named by invocation
-    id alone, so two deliveries of one invocation wrote the same file and
-    the first to finish unlinked it while the second was still streaming
-    it. The announced size and hash and the delivered bytes then came
-    from different archives.
+    Every command runs as its own task, so two downloads would interleave
+    their BINARY frames — which carry no id, so a client cannot sort them
+    — and a spool named by invocation id alone would have two deliveries
+    of one invocation write the same file, the first to finish unlinking
+    it while the second was still streaming it.
     """
     from mcuhome.buildserver import artifacts
     from mcuhome.buildserver import sessions as session_module
@@ -1632,9 +852,7 @@ async def test_one_download_at_a_time_per_connection_and_never_one_spool(
     monkeypatch.setattr(session_module.artifacts, "build_archive", slow)
 
     async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.verdict")
+        session_id, _ = await built(ws, config)
         for frame_id in ("g1", "g2"):
             await ws.send_json(
                 {
@@ -1667,40 +885,99 @@ async def test_one_download_at_a_time_per_connection_and_never_one_spool(
         assert hashlib.sha256(received[key]).hexdigest() == frame["payload"]["archive"]["sha256"]
 
 
-async def test_a_download_that_no_longer_matches_what_was_verified_is_refused(
-    client, config, state
+# --------------------------------------------------------------------------
+# Off the event loop
+# --------------------------------------------------------------------------
+
+
+async def test_nothing_filesystem_heavy_runs_on_the_event_loop(
+    client, config, docker, monkeypatch
 ) -> None:
-    """The blocker, over the wire: the session tree stays writable, so
-    §9.3 is enforced again at delivery.
+    """The SDK and the artifact archive, both off the loop.
 
-    The container of a session outlives every invocation in it, and its
-    tree is mounted writable — so a later invocation can replace an
-    earlier one's artifact with a link to a host file, and a
-    ``get-artifact`` that trusted the earlier check would pack that
-    file's bytes under the declared name.
+    ``acquire_sdk`` hashes a package, streams a full zstd decompression
+    to disk and untars it; ``build_archive`` tars and compresses a
+    build's artifacts and then re-reads the spool. Either on the event
+    loop stalls every other session, every other connection and the
+    WebSocket heartbeat — which drops unrelated clients after thirty
+    seconds.
     """
+    from mcuhome.buildserver import artifacts, backend
+
+    threads: dict[str, threading.Thread] = {}
+
+    def record(name, function):
+        def wrapper(*arguments, **keywords):
+            threads[name] = threading.current_thread()
+            return function(*arguments, **keywords)
+
+        return wrapper
+
+    monkeypatch.setattr(
+        backend.packagefetch, "acquire_sdk", record("sdk", backend.packagefetch.acquire_sdk)
+    )
+    monkeypatch.setattr(artifacts, "build_archive", record("archive", artifacts.build_archive))
+
     async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.verdict")
-
-        out = state.sessions.require(session_id).paths.invocation("inv-1") / "out"
-        outside = state.config.context_root / "outside"
-        outside.write_bytes(b"a host file outside out/\n")
-        (out / "firmware.hex").unlink()
-        (out / "firmware.hex").symlink_to(outside)
-
-        frame = await call(
-            ws,
-            "get-artifact",
-            {"session_id": session_id, "invocation_id": "inv-1", "path": "firmware.hex"},
-            frame_id="g",
+        session_id, _ = await built(ws, config)
+        await ws.send_json(
+            {
+                "id": "g",
+                "type": "get-artifact",
+                "payload": {"session_id": session_id, "invocation_id": "inv-1"},
+            }
         )
+        while True:
+            frame = await ws.receive_json(timeout=15)
+            if frame.get("id") == "g":
+                break
 
-    assert frame["type"] == "error"
-    assert frame["error"]["code"] == "artifact.integrity-mismatch"
-    assert frame["error"]["retryable"] is False
-    assert frame["error"]["details"]["path"] == "firmware.hex"
+    assert set(threads) == {"sdk", "archive"}
+    for name, thread in threads.items():
+        assert thread is not threading.main_thread(), f"{name} ran on the event loop"
+
+
+async def test_the_verdict_frame_is_sent_and_never_offered(client, config, monkeypatch):
+    """The one frame with no second way to be learned.
+
+    The log is offered — dropping the oldest line rather than applying
+    backpressure through the log reader and from there into the compiler
+    — and it carries a counter that makes a gap visible. The verdict is
+    this server's own judgement, a client is waiting for exactly it, and
+    a drop would lose it for good.
+    """
+    from mcuhome.buildserver.ws import Connection
+
+    offered: list[dict] = []
+    sent: list[dict] = []
+    real_offer, real_send = Connection.offer, Connection.send
+
+    def offer(self, frame):
+        offered.append(frame)
+        return real_offer(self, frame)
+
+    async def send(self, frame):
+        sent.append(frame)
+        return await real_send(self, frame)
+
+    monkeypatch.setattr(Connection, "offer", offer)
+    monkeypatch.setattr(Connection, "send", send)
+
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        await built(ws, config)
+
+    def verdict(frames):
+        return [frame for frame in frames if frame.get("event") == "invocation.verdict"]
+
+    assert len(verdict(sent)) == 1
+    assert verdict(offered) == []
+    assert any(frame.get("type") == "log" for frame in offered)
+    assert any(frame.get("event") == "invocation.started" for frame in offered)
+
+
+# --------------------------------------------------------------------------
+# attach-session, cancel, close-session
+# --------------------------------------------------------------------------
 
 
 async def test_attach_session_replays_before_it_joins_the_live_stream(
@@ -1708,11 +985,11 @@ async def test_attach_session_replays_before_it_joins_the_live_stream(
 ) -> None:
     """The boundary is a boundary, and the ordering is what makes it one.
 
-    "Every event frame it sees before the answer is history, and
-    everything after it is live" — which fails the moment the connection
-    joins the audience *before* the replay: every ``await`` in the
-    replay loop is a turn for the supervisor relaying an invocation that
-    is still running, so live frames land among the replayed ones and an
+    Every event frame a client sees before the verb's answer is history
+    and everything after it is live — which fails the moment the
+    connection joins the audience *before* the replay: every ``await`` in
+    the replay loop is a turn for the supervisor of an invocation that is
+    still running, so live frames land among the replayed ones and an
     event the reader has not reached yet is delivered twice.
 
     Asserted on the order of the two operations rather than on a race,
@@ -1739,25 +1016,17 @@ async def test_attach_session_replays_before_it_joins_the_live_stream(
     monkeypatch.setattr(Connection, "send", send)
 
     async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.verdict")
+        session_id, _ = await built(ws, config)
         timeline.clear()
         answer = await call(
             ws,
             "attach-session",
-            {"session_id": session_id, "invocation_id": "inv-1", "from_seq": 3},
+            {"session_id": session_id, "invocation_id": "inv-1", "from_seq": 1},
             frame_id="a",
         )
 
-    assert answer["payload"]["replayed"] == 4
-    assert timeline == [
-        ("event", 3),
-        ("event", 4),
-        ("event", 5),
-        ("event", 6),
-        ("attach", ("inv-1", 6)),
-    ]
+    assert answer["payload"]["replayed"] == 2
+    assert timeline == [("event", 1), ("event", 2), ("attach", ("inv-1", 2))]
 
 
 def test_an_event_already_replayed_is_not_relayed_to_that_connection_again(
@@ -1765,10 +1034,9 @@ def test_an_event_already_replayed_is_not_relayed_to_that_connection_again(
 ) -> None:
     """The other half of the boundary: history is not repeated as news.
 
-    Joining after the replay closes the interleaving; the boundary
-    closes the duplicate. An event the backend's own reader had not
-    reached yet, and this connection already has from the file, is not
-    delivered to it a second time — while it still reaches every other
+    Joining after the replay closes the interleaving; the boundary closes
+    the duplicate. An event this connection already has from the file is
+    not delivered to it a second time, while it still reaches every other
     connection, which never saw it.
     """
     from mcuhome.buildserver import protocol
@@ -1783,7 +1051,12 @@ def test_an_event_already_replayed_is_not_relayed_to_that_connection_again(
 
     backend = SessionBackend(config, docker=object())
     record = InvocationRecord(
-        id="inv-1", session_id="s-1", action="build", directory=tmp_path, context_id="x"
+        id="inv-1",
+        session_id="s-1",
+        action="build",
+        directory=tmp_path,
+        context_id="x",
+        out=tmp_path / "out",
     )
     replayed, fresh = Fake(), Fake()
     backend.attach("s-1", replayed, boundary=("inv-1", 6))
@@ -1791,26 +1064,24 @@ def test_an_event_already_replayed_is_not_relayed_to_that_connection_again(
 
     for seq in (5, 6, 7):
         backend._publish(
-            record, protocol.event_frame("build.image.started", {"seq": seq}), drop_when_full=True
+            record, protocol.event_frame("invocation.started", {"seq": seq}), drop_when_full=True
         )
 
     assert [frame["payload"]["seq"] for frame in replayed.frames] == [7]
     assert [frame["payload"]["seq"] for frame in fresh.frames] == [5, 6, 7]
 
 
-async def test_attach_session_replays_events_from_a_stated_seq(client, config) -> None:
-    """E46: the NDJSON file on disk **is** the replay buffer.
+async def test_attach_session_replays_the_verdict_a_lost_socket_missed(client, config) -> None:
+    """The NDJSON file on disk **is** the replay buffer.
 
-    "It stays on disk until close-session and IS the replay buffer:
-    attach-session replays from a client-stated seq by reading the
-    file." No in-memory ring, so there is nothing a long reconnect can
-    find already evicted — and the replayed frames go out before the
-    verb's own answer, which is what makes the boundary readable.
+    It stays there for the life of the session, so a client whose socket
+    died during a build reconnects, asks for the invocation it started,
+    and is handed the verdict it missed. No in-memory ring behind it,
+    which means there is nothing a long reconnect can find already
+    evicted.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.verdict")
+        session_id, _ = await built(ws, config)
 
         await ws.send_json(
             {
@@ -1819,7 +1090,7 @@ async def test_attach_session_replays_events_from_a_stated_seq(client, config) -
                 "payload": {
                     "session_id": session_id,
                     "invocation_id": "inv-1",
-                    "from_seq": 3,
+                    "from_seq": 2,
                 },
             }
         )
@@ -1831,61 +1102,63 @@ async def test_attach_session_replays_events_from_a_stated_seq(client, config) -
                 break
             replayed.append(frame)
 
-    # The conforming program emits seq 1..6; from 3 that is four events.
-    assert answer["payload"]["replayed"] == 4
-    assert [entry["payload"]["seq"] for entry in replayed] == [3, 4, 5, 6]
-    assert all(entry["payload"]["invocation_id"] == "inv-1" for entry in replayed)
+    assert answer["payload"]["replayed"] == 1
+    assert [entry["event"] for entry in replayed] == ["invocation.verdict"]
+    assert replayed[0]["payload"]["status"] == "success"
 
 
-async def test_cancel_creates_the_sentinel_file_the_request_named(
-    client, config, docker, state
-) -> None:
-    """§8: "the **existence** of that file means stop".
-
-    A cooperative sentinel rather than a signal, because killing a
-    ``docker exec`` client does not kill the process inside the
-    container — and because the same mechanism works unchanged wherever
-    a program is started without one.
-    """
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        await collect(ws, until="invocation.verdict")
-        session = state.sessions.require(session_id)
-        session.invocations["inv-1"] = sessions.INVOCATION_RUNNING
-        await call(ws, "cancel", {"session_id": session_id, "invocation_id": "inv-1"}, frame_id="c")
-        sentinel = session.paths.invocation("inv-1") / "cancel"
-
-    assert sentinel.exists()
-    assert docker.invocations[-1].request["cancel"] == str(
-        containerpaths.invocation("inv-1") / "cancel"
-    )
-    assert docker.host(docker.invocations[-1].request["cancel"]) == sentinel
-
-
-async def test_the_liveness_ladder_starts_with_the_sentinel_and_then_signals(
+async def test_cancel_raises_the_stop_sentinel_of_the_running_step(
     aiohttp_client, config, docker
 ) -> None:
-    """The ladder of §8, with a grace of zero so it runs in a test.
+    """Generation 3 defines no cooperative cancellation, so a stop is a signal.
 
-    The sentinel is first because it is the only rung that lets the
-    program write a result document — ``status: "cancelled"``, with
-    ``reason`` and ``error`` both null, because nothing was diagnosed.
-    SIGTERM follows at ``cancel_grace_seconds``, and it is worth saying
-    plainly that it does **not** reach the process inside the container:
-    killing a ``docker exec`` client never has, which is exactly why the
-    contract has a cooperative sentinel at all.
+    The sentinel is the orchestrating side's own file and is never named
+    in a request document: it is only how the decision to send a signal
+    reaches the supervising loop. What actually ends a build is that
+    signal and, behind it, the container going away — a signal to the
+    client that started the container never reached anything.
+    """
+    state, client = await _building(aiohttp_client, config, docker)
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, _ = await locked(ws, state.config)
+        await call(ws, "build", {"session_id": session_id}, frame_id="b")
+        await _started(docker)
+        record = state.backend.record(session_id, "inv-1")
+        answer = await call(
+            ws, "cancel", {"session_id": session_id, "invocation_id": "inv-1"}, frame_id="c"
+        )
+        assert answer["payload"]["cancelled"] is True
+        assert record.step.cancel.exists()
+        frames = await collect(ws, until="invocation.verdict")
+        await call(ws, "close-session", {"session_id": session_id}, frame_id="x")
+
+    assert record.cancelled is True
+    verdict = frames[-1]["payload"]
+    # A stopped step writes no result document, and saying so as a plain
+    # failure would hide that the failure was asked for.
+    assert verdict["status"] == "cancelled"
+    assert verdict["error"] is None
+
+
+async def test_the_liveness_ladder_signals_a_step_that_will_not_stop(
+    aiohttp_client, config, docker
+) -> None:
+    """The rungs, with a grace of zero so the ladder runs in a test.
+
+    The sentinel first, SIGTERM after the grace period, SIGKILL after
+    that. What is asserted is the ladder's shape and never its clock:
+    sixty seconds is the right number for a deployment and the wrong one
+    for a test.
     """
     from mcuhome.buildserver.app import ServerState, create_app
 
     processes: list[FakeProcess] = []
 
-    def program(action, request, on_line):
-        process = FakeProcess(0, hang=True)
-        processes.append(process)
-        return process
+    def hanging(request, out, on_line):
+        processes.append(FakeProcess(0, hang=True))
+        return processes[-1]
 
-    docker.run_program = program
+    docker.run_program = hanging
     state = ServerState(
         replace(config, cancel_grace_seconds=0, allowed_patch_layers=sessions.PATCH_LAYERS)
     )
@@ -1893,115 +1166,71 @@ async def test_the_liveness_ladder_starts_with_the_sentinel_and_then_signals(
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, state.config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
+        await _started(docker)
         await call(ws, "cancel", {"session_id": session_id, "invocation_id": "inv-1"}, frame_id="c")
         frames = await collect(ws, until="invocation.verdict")
 
     assert processes[0].terminated is True
-    # No result document was ever written, so the invocation is the
-    # infrastructure failure rather than a verdict on the context.
-    assert frames[-1]["payload"]["error"]["code"] == "builder.crashed"
+    assert frames[-1]["payload"]["status"] == "cancelled"
 
 
-async def test_the_deadline_is_enforced_by_this_server(aiohttp_client, config, docker) -> None:
-    """§9.1: ``limits.deadline_seconds`` is advisory to the program and
-    "enforcement is the backend's".
+async def test_the_deadline_is_enforced_from_outside(aiohttp_client, config, docker) -> None:
+    """§11: "whatever budget the orchestrator has set, it may enforce hard".
 
-    A program that honours it stops itself and says
-    ``error.deadline.exceeded``; one that does not gets the same ladder
-    a cancel gets, starting with the sentinel it agreed to poll.
+    A step that runs past the operator's deadline is stopped by the same
+    ladder a cancel walks — the environment is told nothing and needs to
+    be told nothing, because the enforcement is what §11 already
+    promises.
     """
     from mcuhome.buildserver.app import ServerState, create_app
 
     processes: list[FakeProcess] = []
-    docker.run_program = lambda action, request, on_line: (
-        processes.append(FakeProcess(0, hang=True)) or processes[-1]
-    )
+
+    def hanging(request, out, on_line):
+        processes.append(FakeProcess(0, hang=True))
+        return processes[-1]
+
+    docker.run_program = hanging
     state = ServerState(replace(config, build_deadline_seconds=0, cancel_grace_seconds=0))
     client = await aiohttp_client(create_app(state))
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, state.config)
-        answer = await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.verdict")
-        sentinel = (
-            state.sessions.require(session_id).paths.invocation(answer["payload"]["invocation_id"])
-            / "cancel"
-        )
+        await call(ws, "build", {"session_id": session_id}, frame_id="b")
+        frames = await collect(ws, until="invocation.verdict")
 
-    assert sentinel.exists()
     assert processes[0].terminated is True
+    assert frames[-1]["payload"]["status"] == "failure"
 
 
-async def test_a_client_that_ignores_sigterm_is_killed(
+async def test_a_step_that_ignores_sigterm_is_killed(
     aiohttp_client, config, docker, monkeypatch
 ) -> None:
     """The last rung, and the shortest.
 
-    By the time it is reached the program has ignored a sentinel it
-    agreed to poll and a signal it agreed to handle. What actually reaps
-    a program that ignored both is the container going away at
-    ``close-session`` — one session is one container, so there is always
+    By the time it is reached the step has ignored a signal it was
+    expected to handle. What reaps one that ignores this too is the
+    container going away when the session is released — there is always
     that hammer behind this one.
     """
-    from mcuhome.workbench import orchestrator
-
     from mcuhome.buildserver.app import ServerState, create_app
 
-    # The ladder is the orchestrator's since the server stopped driving
-    # invocations itself, so its last rung is the one to shorten.
-    monkeypatch.setattr(orchestrator, "_KILL_AFTER_SECONDS", 0.0)
+    monkeypatch.setattr(buildprocess, "_KILL_AFTER_SECONDS", 0.0)
     processes: list[FakeProcess] = []
 
-    def program(action, request, on_line):
+    def stubborn(request, out, on_line):
         processes.append(FakeProcess(0, hang=True, ignores_terminate=True))
         return processes[-1]
 
-    docker.run_program = program
+    docker.run_program = stubborn
     state = ServerState(replace(config, build_deadline_seconds=0, cancel_grace_seconds=0))
     client = await aiohttp_client(create_app(state))
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, state.config)
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
+        await call(ws, "build", {"session_id": session_id}, frame_id="b")
         await collect(ws, until="invocation.verdict")
 
     assert processes[0].terminated is True
     assert processes[0].killed is True
-
-
-async def test_a_describe_that_writes_no_result_disqualifies_the_image(
-    client, config, docker
-) -> None:
-    """§7.1: ``describe`` "doubles as the first conformance test: a
-    program that cannot answer ``describe`` cannot be trusted with a
-    build"."""
-    docker.program = None
-    docker.describe_exit = 66
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id = await open_session(ws)
-        frame = await send_archive(
-            ws, "send-context", session_id, buildable_context("a" * 63 + "0")
-        )
-
-    assert frame["error"]["code"] == "version.builder-unavailable"
-
-
-async def test_an_action_describe_does_not_announce_is_never_invoked(
-    client, config, docker
-) -> None:
-    """§7.1.1: "A backend MUST NOT invoke an action absent from the list."
-
-    The image would answer ``unsupported.action`` legibly, which is
-    precisely why there is no reason to make it: the refusal is already
-    knowable, and making it costs a container start.
-    """
-    docker.program["actions"] = ["describe", "build"]
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        frame = await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-
-    error = frame["error"]
-    assert error["code"] == "version.builder-unavailable"
-    assert error["details"]["actions"] == ["build", "describe"]
-    assert not any(argv[-2:-1] == ["verify"] for argv in docker.calls)
 
 
 async def test_a_reaped_session_tells_whoever_is_waiting(client, config, state) -> None:
@@ -2009,18 +1238,15 @@ async def test_a_reaped_session_tells_whoever_is_waiting(client, config, state) 
 
     A client waits for exactly one frame — the verdict of the invocation
     it started — and the socket stays open when a session is reaped, so
-    no connection loss ends that wait either. This server used to drop
-    the audience silently; measured once at 56 minutes of a client
-    waiting for a build whose container had long since been removed.
+    no connection loss ends that wait either. Measured once at 56 minutes
+    of a client waiting for a build whose container had long since been
+    removed.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.verdict")
+        session_id, _ = await built(ws, config)
         # An invocation this server has not judged is what the sweep
         # finds when it takes a session away mid-build.
-        record = state.backend._records[(session_id, "inv-1")]
-        record.outcome = None
+        state.backend.record(session_id, "inv-1").outcome = None
 
         await state.backend.release(session_id, reaped="idle timeout")
         frames = await collect(ws, until="invocation.verdict")
@@ -2041,63 +1267,49 @@ async def test_a_closed_session_announces_nothing(client, config, state) -> None
     spelling of its own verb's answer.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.verdict")
-        state.backend._records[(session_id, "inv-1")].outcome = None
+        session_id, _ = await built(ws, config)
+        state.backend.record(session_id, "inv-1").outcome = None
 
         await state.backend.release(session_id)
         answer = await call(ws, "capabilities", {}, frame_id="c")
 
-    # The next thing on the socket is the answer to the next command,
-    # not a verdict nobody asked for.
     assert answer["id"] == "c"
 
 
-async def test_close_session_reaps_the_container(client, config, docker) -> None:
-    """One session is one container, and the container goes with it."""
+async def test_close_session_reaps_the_containers_of_the_session(client, config, docker) -> None:
+    """One session's steps are one session's containers, and they go with it.
+
+    ``--rm`` already removed the ones that finished; the sweep is for a
+    step that was stopped, and it is best effort because a failed
+    teardown must not replace the build's own verdict.
+    """
     async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.verdict")
+        session_id, _ = await built(ws, config)
         await call(ws, "close-session", {"session_id": session_id}, frame_id="x")
 
     assert docker.removed == docker.containers
     assert docker.removed
 
 
-async def test_close_session_kills_the_container_before_it_deletes_the_tree(
+async def test_close_session_stops_the_step_before_it_deletes_the_tree(
     aiohttp_client, config, docker, monkeypatch
 ) -> None:
-    """The order is the guarantee, and it was the other way round twice.
+    """The order is the guarantee.
 
-    E39 makes close an implicit cancel, and the cancel is best-effort:
-    the sentinel is set for a program that happens to be between polls,
-    the container is removed ``--force`` — which is the actual kill,
-    since killing a ``docker exec`` client never reached the process
-    inside — and only then is the tree deleted. Deleting first pulls the
-    mount source out from under a program that is still running in it,
-    and it also made the sentinel meaningless: it existed for the few
-    microseconds between two statements.
+    Close is an implicit cancel: the stop signal is raised for a step
+    that is still running, the container is removed — which is the actual
+    kill, since the build runs inside it — and only then is the tree
+    deleted. Deleting first pulls the mount source out from under a step
+    that is still running in it.
 
-    The second half is the one this test grew: the container being gone
-    is not the invocation being over. The supervisor runs on a worker
-    thread, and closing used to return while that thread was still
-    walking its ladder — so the tree went away underneath it, and the
-    suite met the consequence as a run that passed every test and then
-    would not exit. So the drive task is asserted done here, at the
-    moment the verb has answered.
-
-    The grace is zero for the same reason it is zero in the ladder's own
-    tests: sixty seconds is the right number for a deployment and the
-    wrong one for a test, and what is asserted is the ladder's shape and
-    never its clock.
+    The second half is the one that made a whole suite hang: the
+    container being gone is not the invocation being over. The supervisor
+    runs on a worker thread, and closing used to return while that thread
+    was still walking its ladder.
     """
-    from mcuhome.workbench import orchestrator
-
     from mcuhome.buildserver.app import ServerState, create_app
 
-    docker.run_program = lambda action, request, on_line: FakeProcess(0, hang=True)
+    docker.run_program = hanging_environment
     state = ServerState(replace(config, cancel_grace_seconds=0))
     client = await aiohttp_client(create_app(state))
     async with client.ws_connect("/ws", headers=auth()) as ws:
@@ -2106,94 +1318,70 @@ async def test_close_session_kills_the_container_before_it_deletes_the_tree(
         session = state.sessions.require(session_id)
         paths = session.paths
         record = state.backend.record(session_id, "inv-1")
-        # The program is registered from the worker thread that
-        # supervises it, so "it is running" is something to wait for
-        # rather than to assume. A close that overtook the registration
-        # removed a container with nothing in the list to kill, and the
-        # invocation then sat out the whole cancel grace — which is the
-        # race that made this test take five minutes and not five
-        # milliseconds.
         await _started(docker)
+        seen = _watch_rm(monkeypatch, docker, paths, record)
 
-        seen: list[tuple[str, bool, bool]] = []
-        real_answer = docker.answer
-
-        def recording(argv, on_line=None):
-            if argv[1] == "rm":
-                sentinel = paths.invocation("inv-1") / "cancel"
-                seen.append(("rm", paths.root.exists(), sentinel.exists()))
-            return real_answer(argv, on_line)
-
-        # The container is the orchestrator's, so the removal goes
-        # through its seam and not through this server's own.
-        monkeypatch.setattr(orchestrator, "_run_command", recording)
         await call(ws, "close-session", {"session_id": session_id}, frame_id="x")
         assert record.drive.done(), "close-session answered while the supervisor was still up"
 
-    assert seen == [("rm", True, True)], "the tree was still there and the signal was set"
+    assert seen and all(entry == ("rm", True, True) for entry in seen), (
+        "the tree was still there and the signal was set at every removal"
+    )
     assert not paths.root.exists(), "and the tree is gone once the container is"
 
 
 async def _started(docker, *, timeout: float = 10.0) -> None:
-    """Wait until the fake has a running program, and fail if it never does."""
+    """Wait until the fake has a running step, and fail if it never does."""
     deadline = time.monotonic() + timeout
     while not docker.running:
-        assert time.monotonic() < deadline, "the invocation never started a program"
+        assert time.monotonic() < deadline, "the invocation never started a step"
         await asyncio.sleep(0.01)
 
 
-def _watch_rm(
-    monkeypatch, docker, paths, invocation_id: str = "inv-1"
-) -> list[tuple[str, bool, bool]]:
+def _watch_rm(monkeypatch, docker, paths, record) -> list[tuple[str, bool, bool]]:
     """Record what was still on disk when the container was removed.
 
-    The container is the orchestrator's, so the removal goes through its
-    seam and not through this server's own. Each entry is
-    ``(command, the session tree is there, the cancel sentinel is set)``
-    — the two facts every ordering test here is about.
+    Each entry is ``(command, the session tree is there, the stop signal
+    was raised)`` — the two facts every ordering test here is about.
     """
     seen: list[tuple[str, bool, bool]] = []
     real_answer = docker.answer
 
     def recording(argv, on_line=None):
         if argv[1] == "rm":
-            seen.append(
-                ("rm", paths.root.exists(), (paths.invocation(invocation_id) / "cancel").exists())
-            )
+            step = record.step
+            seen.append(("rm", paths.root.exists(), step is not None and step.cancel.exists()))
         return real_answer(argv, on_line)
 
-    from mcuhome.workbench import orchestrator
-
-    monkeypatch.setattr(orchestrator, "_run_command", recording)
+    monkeypatch.setattr(containerbuild, "run_command", recording)
     return seen
 
 
 async def _building(aiohttp_client, config, docker, **overrides):
-    """A server with one session whose invocation hangs. Returns the lot.
+    """A server with one session whose step hangs. Returns the lot.
 
-    The grace is zero because the ladder is walked in full here and
-    sixty seconds is a deployment's number, not a test's; the program
-    hangs because an invocation that has already finished cannot
-    demonstrate anything about the order a release does things in.
+    The grace is zero because the ladder is walked in full here and sixty
+    seconds is a deployment's number, not a test's; the step hangs
+    because an invocation that has already finished cannot demonstrate
+    anything about the order a release does things in.
     """
     from mcuhome.buildserver.app import ServerState, create_app
 
-    docker.run_program = lambda action, request, on_line: FakeProcess(0, hang=True)
+    docker.run_program = hanging_environment
     state = ServerState(replace(config, cancel_grace_seconds=0, **overrides))
     client = await aiohttp_client(create_app(state))
     return state, client
 
 
-async def test_the_sweep_stops_the_container_before_it_deletes_the_tree(
+async def test_the_sweep_stops_the_step_before_it_deletes_the_tree(
     aiohttp_client, config, docker, monkeypatch
 ) -> None:
-    """The reaper had the order this task took out of close-session.
+    """The reaper walks the same four steps a close does.
 
-    ``reap()`` deleted the directory itself and the loop removed the
-    container afterwards — so a session whose hard TTL ran out under a
-    running build lost its tree while the supervisor was still reading
-    it, which is the one state neither half can recover from. The sweep
-    now marks the session and ``release_session`` walks the four steps.
+    A session whose hard TTL runs out under a running build must not lose
+    its tree while the supervisor is still reading it, which is the one
+    state neither half can recover from. The sweep marks the session and
+    the release does the work.
     """
     state, client = await _building(aiohttp_client, config, docker)
     async with client.ws_connect("/ws", headers=auth()) as ws:
@@ -2203,10 +1391,8 @@ async def test_the_sweep_stops_the_container_before_it_deletes_the_tree(
         paths = session.paths
         record = state.backend.record(session_id, "inv-1")
         await _started(docker)
-        seen = _watch_rm(monkeypatch, docker, paths)
+        seen = _watch_rm(monkeypatch, docker, paths, record)
 
-        # The hard TTL is the half that bounds a session which is
-        # working, so this is the sweep taking a build away.
         session.expires_at = time.time() - 1
         assert state.sessions.reap() == (session_id,)
         assert paths.root.exists(), "the sweep marks it and does not delete under the build"
@@ -2214,66 +1400,22 @@ async def test_the_sweep_stops_the_container_before_it_deletes_the_tree(
 
         assert await sessions.release_pending(state) == ()
 
-    assert seen == [("rm", True, True)], "the tree was still there and the signal was set"
+    assert seen and all(entry == ("rm", True, True) for entry in seen), (
+        "the tree was still there and the signal was set at every removal"
+    )
     assert record.drive.done(), "and the supervisor was waited for"
     assert not paths.root.exists()
-
-
-async def test_a_handover_stops_the_container_before_it_deletes_the_tree(
-    aiohttp_client, config, docker, monkeypatch
-) -> None:
-    """Admission takes an unattended session away, container first.
-
-    A handover only ever takes a session with nothing in flight, so
-    there is no supervisor to wait for here — but there is a container,
-    and its mounts are the tree admission used to delete before anything
-    removed it. ``open-session`` drains what admission marked and the
-    release is what deletes the directory.
-    """
-    from mcuhome.buildserver.app import ServerState, create_app
-
-    state = ServerState(replace(config, max_sessions=1, reconnect_grace_seconds=0))
-    client = await aiohttp_client(create_app(state))
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        abandoned, _ = await locked(ws, state.config)
-        # A finished invocation, so the session has a container the way a
-        # real one does — and nothing running, which is what makes it
-        # eligible at all.
-        await call(ws, "verify", {"session_id": abandoned}, frame_id="v")
-        await collect(ws, until="invocation.verdict")
-        session = state.sessions.find(abandoned)
-        paths = session.paths
-        seen = _watch_rm(monkeypatch, docker, paths)
-
-    # The client is gone and the session has been quiet since before the
-    # grace, so the next one to dial in has the better claim.
-    session.touch(now=time.time() - 60.0)
-    session.disconnected_since = time.time() - 60.0
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        await call(
-            ws,
-            "open-session",
-            {"protocol_version": sessions.SESSION_PROTOCOL_VERSION},
-            frame_id="o2",
-        )
-
-    assert session.reaped == sessions.GONE_HANDOVER
-    assert seen == [("rm", True, False)], "the container went first, with the tree still there"
-    assert not paths.root.exists()
-    assert state.sessions.pending_releases() == ()
 
 
 async def test_a_lease_that_runs_out_inside_a_verb_reaches_the_sweep(
     aiohttp_client, config, docker, monkeypatch
 ) -> None:
-    """The path that never released anything at all.
+    """A refusal cannot stop to remove a container.
 
-    A lease noticed by ``require`` closed the session, deleted its tree
-    and stopped there: nothing ever removed the container or waited for
-    what was running in it, so both lived until the process did. The
-    session is marked instead, the client still gets its immediate
-    ``session.expired``, and the sweep does the release in the order
-    that holds.
+    A lease noticed inside a verb answers the client immediately and
+    marks the session; the sweep then does the release in the order that
+    holds. Doing it inside the refusal would delete a tree a supervisor
+    is still reading.
     """
     state, client = await _building(aiohttp_client, config, docker)
     async with client.ws_connect("/ws", headers=auth()) as ws:
@@ -2283,7 +1425,7 @@ async def test_a_lease_that_runs_out_inside_a_verb_reaches_the_sweep(
         paths = session.paths
         record = state.backend.record(session_id, "inv-1")
         await _started(docker)
-        seen = _watch_rm(monkeypatch, docker, paths)
+        seen = _watch_rm(monkeypatch, docker, paths, record)
 
         session.expires_at = time.time() - 1
         refused = await call(ws, "get-artifact", {"session_id": session_id}, frame_id="g")
@@ -2293,22 +1435,20 @@ async def test_a_lease_that_runs_out_inside_a_verb_reaches_the_sweep(
 
         assert await sessions.release_pending(state) == ()
 
-    assert seen == [("rm", True, True)]
+    assert seen and all(entry == ("rm", True, True) for entry in seen)
     assert record.drive.done()
     assert not paths.root.exists()
 
 
-async def test_shutdown_stops_the_containers_before_the_trees_go(
+async def test_shutdown_stops_the_steps_before_the_trees_go(
     aiohttp_client, config, docker, monkeypatch
 ) -> None:
     """Process exit, in the one order that protects anything.
 
-    Shutdown deleted every directory first and released the build
-    environments afterwards, which protected nothing and made exit wait
-    for a ladder per session on top. The release comes first now, under
-    one budget for the whole loop, and the trees go afterwards —
-    including the tree of a session that did not release, because a
-    stopping process is the last thing that could ever name it.
+    The release comes first, under one budget for the whole loop, and the
+    trees go afterwards — including the tree of a session that did not
+    release, because a stopping process is the last thing that could ever
+    name it.
     """
     state, client = await _building(aiohttp_client, config, docker)
     async with client.ws_connect("/ws", headers=auth()) as ws:
@@ -2318,13 +1458,15 @@ async def test_shutdown_stops_the_containers_before_the_trees_go(
         paths = session.paths
         record = state.backend.record(session_id, "inv-1")
         await _started(docker)
-        seen = _watch_rm(monkeypatch, docker, paths)
+        seen = _watch_rm(monkeypatch, docker, paths, record)
 
     # The real thing: closing the test client runs the application's own
     # cleanup, which is where the order lives.
     await client.close()
 
-    assert seen == [("rm", True, True)], "the tree was still there and the signal was set"
+    assert seen and all(entry == ("rm", True, True) for entry in seen), (
+        "the tree was still there and the signal was set at every removal"
+    )
     assert record.drive.done(), "and the supervisor was waited for"
     assert not paths.root.exists()
 
@@ -2337,8 +1479,6 @@ async def test_shutdown_is_bounded_for_every_session_together(
     A stopping server is expected to be gone: waiting the full ladder
     once per session would make exit take longer than a service manager
     waits before it sends SIGKILL, which is a bound that buys nothing.
-    The budget is spent as a whole, what is left over is logged, and the
-    directories go regardless.
     """
     monkeypatch.setattr(sessions, "SHUTDOWN_RELEASE_SECONDS", 0.0)
     state, client = await _building(aiohttp_client, config, docker)
@@ -2358,9 +1498,6 @@ async def test_shutdown_is_bounded_for_every_session_together(
         state.sessions.shutdown()
         assert not paths.root.exists(), "the trees go even for a session that did not release"
 
-        # And the supervisor still ends, because the container went
-        # before the budget did: the wait is what was skipped, not the
-        # kill.
         await asyncio.wait_for(record.drive, timeout=10)
 
 
@@ -2369,33 +1506,20 @@ async def test_close_session_refuses_when_the_supervisor_outlives_the_ladder(
 ) -> None:
     """The wait is bounded, and running out of it is an answer.
 
-    The ladder ends in a rung that gives up, so a supervisor that is
-    still there afterwards is not a slow build — it is a defect on this
-    side. Two things then must not happen: the verb must not delete the
-    session's files underneath the thread that is still reading them,
-    and it must not answer ``result`` as though it had. So the directory
-    stays, and the client is told.
-
-    The code is the pre-registry ``internal_error``: no code in the
-    typed registry means "this server could not stop its own build", and
-    minting one is a protocol decision rather than an implementation
-    choice.
-
-    And the refusal leaves the session in a state the **sweep** can
-    finish, which is the second half of the test: nothing was
-    forgotten, so the next tick walks the same steps and this time gets
-    to the end of them. The sweep and not a second ``close-session``,
-    because the retry cannot depend on a client sending one.
+    The ladder ends in a rung that gives up, so a supervisor still there
+    afterwards is not a slow build — it is a defect on this side. Two
+    things then must not happen: the verb must not delete the session's
+    files underneath the thread that is still reading them, and it must
+    not answer ``result`` as though it had. And the refusal leaves the
+    session in a state the **sweep** can finish, because the retry cannot
+    depend on a client sending a second close.
     """
     from mcuhome.buildserver import backend
     from mcuhome.buildserver.app import ServerState, create_app
 
-    # The ladder as this test has it: nothing at all the first time
-    # round, so the wait runs out while the supervisor is still between
-    # two polls, and the real one afterwards.
     waited = [0.0]
     monkeypatch.setattr(backend, "_ladder_seconds", lambda config: waited[0])
-    docker.run_program = lambda action, request, on_line: FakeProcess(0, hang=True)
+    docker.run_program = hanging_environment
     state = ServerState(config)
     client = await aiohttp_client(create_app(state))
     async with client.ws_connect("/ws", headers=auth()) as ws:
@@ -2409,10 +1533,6 @@ async def test_close_session_refuses_when_the_supervisor_outlives_the_ladder(
         assert refused["error"]["code"] == "internal_error"
         assert paths.root.exists(), "the tree stayed, which is the whole point of refusing"
 
-        # The container is gone, so the supervisor ends on its next poll
-        # and the sweep's retry finds nothing left to wait for. This is
-        # what a reaper tick does with the list, called here directly so
-        # that the test does not have to wait one out.
         waited[0] = 30.0
         assert state.sessions.pending_releases() == (session_id,)
         assert await sessions.release_pending(state) == ()
@@ -2423,22 +1543,70 @@ async def test_close_session_refuses_when_the_supervisor_outlives_the_ladder(
 
 
 async def test_one_invocation_at_a_time_per_session(client, config, docker) -> None:
-    """§9.1: never two invocations against the same ``work``.
+    """§3: steps of a session run strictly one after another.
 
-    "The program cannot check the first, so it is stated as a backend
-    duty." Pre-registry, like the context verbs' own guard: no
-    registered code means "this session is already doing work", and
-    inventing one is a protocol decision.
+    The environment cannot check it, so it is a backend duty.
+    Pre-registry, like the context verbs' own guard: no registered code
+    means "this session is already doing work", and inventing one is a
+    protocol decision.
     """
-    docker.run_program = lambda action, request, on_line: FakeProcess(0, hang=True)
+    docker.run_program = hanging_environment
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         await call(ws, "build", {"session_id": session_id}, frame_id="b")
         second = await call(ws, "build", {"session_id": session_id}, frame_id="b2")
         await call(ws, "close-session", {"session_id": session_id}, frame_id="x")
 
-    assert second["error"]["code"] == "bad_request"
+    assert second["type"] == "error", second
+    assert second["error"]["code"] == "bad_request", second
     assert "one invocation at a time" in second["error"]["message"].lower()
+
+
+# --------------------------------------------------------------------------
+# verify, which this server answers itself
+# --------------------------------------------------------------------------
+
+
+async def test_verify_is_answered_without_starting_anything(client, config, docker) -> None:
+    """Verifying a context is not an action, and cannot be one.
+
+    The orchestrator creates the context, hashes it and delivers it; the
+    environment is forbidden to modify it. There is nothing an
+    environment could confirm that this side does not already know from
+    its own bytes — so the verb is answered here, from the measurement
+    made before every working invocation, and no container starts.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, context_id = await locked(ws, config)
+        answer = await call(ws, "verify", {"session_id": session_id}, frame_id="v")
+        frames = await collect(ws, until="invocation.verdict")
+
+    assert answer["payload"]["action"] == "verify"
+    verdict = frames[-1]["payload"]
+    assert verdict["status"] == "success"
+    assert verdict["context"] == context_id
+    assert verdict["artifacts"] == []
+    assert not any(argv[1:2] == ["run"] for argv in docker.calls)
+
+
+async def test_a_context_that_moved_fails_verify_without_poisoning_the_session(
+    client, config, state
+) -> None:
+    """A mismatch is a failed invocation and not a dead session.
+
+    Nothing was applied to any tree — a step of this profile builds in a
+    container that is thrown away — so a client that fixes its context is
+    fixing something this session never acted on.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, _ = await locked(ws, config, **{"model/device-model.json": MODEL})
+        paths = state.sessions.require(session_id).paths
+        (paths.context / "model/device-model.json").write_bytes(b"{}")
+        frame = await call(ws, "verify", {"session_id": session_id}, frame_id="v")
+        attached = await call(ws, "attach-session", {"session_id": session_id}, frame_id="a")
+
+    assert frame["error"]["code"] == "context.integrity-mismatch"
+    assert attached["type"] == "result", "and the session is still usable"
 
 
 # --------------------------------------------------------------------------
@@ -2447,12 +1615,12 @@ async def test_one_invocation_at_a_time_per_session(client, config, docker) -> N
 
 
 async def test_a_pin_no_source_holds_is_sdk_unavailable(client, config) -> None:
-    """E48: the pin is looked up, and "not here" is a final answer.
+    """The pin is looked up in two tiers, and "not here" is a final answer.
 
-    The source list is searched in a fixed order and nothing is fetched
-    from the url in the context — that value is a hint (ADR 0019 §8), and
-    a backend that followed it would let a client point this server's
-    fetcher wherever it liked.
+    The operator's own directories first and MCUHome's package registry
+    behind them — and the url in a context is a hint that is never
+    fetched either way: a server that followed it would let a client
+    point its fetcher wherever it liked.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         sha256 = write_sdk_package(config.sdk_sources[0], "9.9.9")
@@ -2464,22 +1632,20 @@ async def test_a_pin_no_source_holds_is_sdk_unavailable(client, config) -> None:
     error = frame["error"]
     assert error["code"] == "sdk.unavailable"
     assert error["retryable"] is False
-    assert error["details"]["version"] == "2.4.0"
     # The client keeps what it can act on and no operator host path: the
-    # searched source directories are filesystem layout and stay off the
-    # wire (they are logged server-side instead).
+    # searched directories are this machine's layout and stay off the
+    # wire.
     assert "sources" not in error["details"]
-    assert "found" not in error["details"]
     assert str(config.sdk_sources[0]) not in str(frame)
 
 
 async def test_a_package_with_the_right_name_and_wrong_bytes_is_refused(client, config) -> None:
-    """§9.1: the content of ``trees.sdk`` matches the pinned hash.
+    """The name only makes a candidate findable; the hash makes it the package.
 
-    The name only makes a candidate findable. A file named for the right
-    version whose bytes hash to something else is either a corrupted
-    mirror or a package somebody replaced, and both are answers an
-    operator has to see rather than a fallback this server can make.
+    A file named for the right version whose bytes hash to something else
+    is either a corrupted mirror or a package somebody replaced, and both
+    are answers an operator has to see rather than a fallback this server
+    can make.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
@@ -2487,287 +1653,139 @@ async def test_a_package_with_the_right_name_and_wrong_bytes_is_refused(client, 
         await send_archive(ws, "send-context", session_id, buildable_context(sha256))
         await call(ws, "lock-context", {"session_id": session_id}, frame_id="l")
         (config.sdk_sources[0] / "mcuhome-sdk-2.4.0.tar.zst").write_bytes(b"not the package")
-        frame = await call(ws, "verify", {"session_id": session_id}, frame_id="v")
+        frame = await call(ws, "build", {"session_id": session_id}, frame_id="b")
 
     assert frame["error"]["code"] == "sdk.unavailable"
     assert frame["error"]["details"]["sha256"] == sha256
 
 
-async def test_the_sdk_is_unpacked_per_session_and_mounted_where_describe_asked(
+async def test_the_sdk_is_unpacked_per_session_and_mounted_read_only(
     client, config, docker, state
 ) -> None:
-    """``sdk`` reports ``path: null``, so the backend chooses — and it
-    chooses inside the session's own directory, which is what makes a
-    patched SDK a writable view without an overlay.
+    """§4: ``sdk`` is the orchestrator's to place, and the step may not write it.
+
+    Per session rather than shared, because a session's directory is what
+    goes away with the session — and read-only to the kernel, which is
+    stronger than a promise the environment is asked to keep.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config)
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.verdict")
+        session_id, _ = await built(ws, config)
         paths = state.sessions.require(session_id).paths
 
     assert (paths.sdk / "mcuhome/__init__.py").read_bytes() == b"# the SDK\n"
-    assert docker.invocations[-1].request["trees"]["sdk"]["path"] == str(containerpaths.SDK)
-    assert docker.invocations[-1].request["trees"]["sdk"]["writable"] is False
-    started = next(argv for argv in docker.calls if "--detach" in argv)
-    assert f"{paths.sdk}:{containerpaths.SDK}:ro" in _volumes(started)
+    assert f"{paths.sdk}:/mcuhome/sdk:ro" in _volumes(docker.step)
 
 
-async def test_the_pinned_image_is_invoked_by_digest_and_not_by_tag(client, config, docker) -> None:
-    """A tag can be made to point at other bytes; a digest cannot.
-
-    The inventory reads a tag off ``docker image ls`` because that is what
-    ``ls`` reports, and everything after it names the image the one way
-    that cannot move underneath the session. Under a client-side pin this
-    matters twice over: the tag the context carries is documentation, and
-    the digest is what its identity was computed from — so a container
-    started by tag could be other bytes than the ones the manifest
-    attributes the firmware to.
-    """
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config, **{"model/device-model.json": MODEL})
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
-        await collect(ws, until="invocation.verdict")
-
-    started = next(
-        argv for argv in docker.calls if argv[:2] == ["docker", "run"] and "--detach" in argv
-    )
-    # Every spelling of the image in that argv carries the digest, and
-    # none is a bare tag: a container started by tag alone could be other
-    # bytes than the ones the manifest attributes the firmware to.
-    named = [argument for argument in started if argument.startswith(IMAGE)]
-    assert named
-    assert all(IMAGE_DIGEST in argument for argument in named)
-
-
-async def test_describe_is_asked_once_per_image_digest(client, config, docker) -> None:
-    """Cached per digest for the life of the process, because that is
-    what it is a property of: an image is identified by its digest, and
-    a digest names bytes that do not change.
-    """
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        await locked(ws, config)
-        await open_session(ws)
-        sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
-        second = await open_session(ws)
-        await send_archive(ws, "send-context", second, buildable_context(sha256))
-
-    describes = [argv for argv in docker.calls if argv[-2:-1] == ["describe"]]
-    assert len(describes) == 1
-
-
-@pytest.mark.parametrize(
-    ("what", "change", "fragment"),
-    [
-        ("a contract version this server does not implement", {"contract": 2}, "contract version"),
-        ("a request format this server does not write", {"request": [2]}, "request format"),
-        ("a result format this server does not read", {"result": [2]}, "result format"),
-        ("no trees block at all", {"trees": None}, "program.trees"),
-        ("no id", {"id": None}, "program.id"),
-    ],
-)
-async def test_every_pre_invocation_conformance_gate_disqualifies_an_image(
-    client, config, docker, what: str, change: dict, fragment: str
-) -> None:
-    """§7.1.1's four gates, each on its own — "the first conformance test".
-
-    "A backend that does not implement the value it finds here MUST NOT
-    invoke a working action on this program — everything else in the
-    result document is described by a specification the backend does not
-    have." The same holds of a request format the program cannot parse,
-    a result format it does not write, and a ``program`` block missing a
-    field §7.1.1 makes mandatory.
-
-    All four were unobserved: each could be disabled individually with
-    the suite green, because the only lever any test pulled on the
-    describe answer was the action list. The label cross-check passed
-    through a *different* branch and kept firing, which is what made the
-    gap invisible.
-    """
-    for name, value in change.items():
-        if value is None:
-            del docker.program[name]
-        else:
-            docker.program[name] = value
-
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id = await open_session(ws)
-        frame = await send_archive(
-            ws, "send-context", session_id, buildable_context("a" * 63 + "0")
-        )
-
-    error = frame["error"]
-    assert error["code"] == "version.builder-unavailable", what
-    assert error["retryable"] is False
-    assert fragment in error["details"]["problem"], (what, error["details"]["problem"])
-    # And no working action was ever attempted against it.
-    assert not any(argv[-2:-1] in (["verify"], ["build"]) for argv in docker.calls)
-
-
-async def test_a_label_that_contradicts_describe_disqualifies_the_image(
-    client, config, docker
-) -> None:
-    """§2.1: "a backend MUST NOT rely on a label ``describe`` contradicts".
-
-    §7.1.1 goes further for the one label with a counterpart in the
-    block: where ``program.contract`` and the contract label disagree,
-    "``describe`` is authoritative and the disagreement is a contract
-    violation against the image".
-    """
-    docker.images[IMAGE_REFERENCE]["Config"]["Labels"][CONTRACT_LABEL] = "2"
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id = await open_session(ws)
-        frame = await send_archive(
-            ws, "send-context", session_id, buildable_context("a" * 63 + "0")
-        )
-
-    error = frame["error"]
-    assert error["code"] == "version.builder-unavailable"
-    assert CONTRACT_LABEL in error["details"]["problem"]
-
-
-async def test_an_image_missing_a_coupling_label_does_not_qualify(client, config, docker) -> None:
-    """§2.1.1: "absence is never read as compatible".
-
-    "An image that does not say what it builds against has not made the
-    declaration the constraint is written against."
-
-    Since E61 that has teeth earlier and a different code: the label is
-    what a context's Zephyr line is matched against, so an image without
-    one is not a candidate at all and this host ends up serving no line —
-    ``version.builder-unsatisfiable``, with an empty ``available`` list
-    saying exactly that. Under the digest-pinned format the same image
-    was selected by digest first and only then failed the describe gate,
-    which is why the refusal used to be the other code.
-    """
-    del docker.images[IMAGE_REFERENCE]["Config"]["Labels"][ZEPHYR_LABEL]
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id = await open_session(ws)
-        frame = await send_archive(
-            ws, "send-context", session_id, buildable_context("a" * 63 + "0")
-        )
-
-    # Format 3: the image is found by digest but doesn't have required labels
-    assert frame["error"]["code"] == "version.builder-unavailable"
-
-
-def _extra_image(docker, tag: str, *, release: str, digest: str, identity: str) -> str:
-    """Put one more conforming build container on the fake host."""
-    reference = f"{IMAGE}:{tag}"
-    docker.images[reference] = {
-        "Id": "sha256:" + identity * 64,
-        "RepoTags": [reference],
-        "RepoDigests": [f"{IMAGE}@sha256:{digest * 64}"],
-        "Config": {"Labels": {**IMAGE_LABELS, "org.mcuhome.zephyr": release}},
-    }
-    docker.images[f"{IMAGE}@sha256:{digest * 64}"] = docker.images[reference]
-    docker.listed = [*docker.listed, reference]
-    return reference
-
-
-async def test_an_image_pulled_after_the_lock_does_not_take_over_the_session(
+async def test_the_image_is_chosen_once_and_the_session_keeps_it(
     client, config, docker, state
 ) -> None:
-    """One session, one build environment — the manifest is not a guess.
+    """One session, one build environment.
 
-    ``send-context`` chooses the image and ``lock-context`` writes it
-    into ``manifest.yaml``, where §3.2 makes it "the record of which
-    build environment answered this context's requirement … the
-    requirement says what was needed, this says what actually ran". An
-    operator pulling a newer release of the same line into a running
-    server is routine, and if the first ``build`` re-ran the selection it
-    would win — ``max`` by release — and the artifacts would come out of
-    an image the manifest does not name, with nothing able to notice: the
-    recorded resolution is outside the ID by design and outside the
-    per-invocation re-check's pin list.
-
-    So the assertion is in two halves: the container starts from the
-    image the manifest records, and the inventory is never even asked
-    again. The second half is what makes the first one a rule rather than
-    a coincidence of this fake's ordering.
+    ``send-context`` chooses the image and the session holds it; a
+    registry that starts publishing a newer revision mid-session must not
+    take over, because the artifacts would then come out of an image the
+    session was never answered with.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config, **{"model/device-model.json": MODEL})
-        listings = len([argv for argv in docker.calls if argv[1:3] == ["image", "ls"]])
-        newer = _extra_image(docker, "zephyr-4.4.2-r1", release="4.4.2", digest="e", identity="d")
-        await call(ws, "verify", {"session_id": session_id}, frame_id="v")
+        asked = len(state.backend._images.asked) if state.backend._images else 0
+        del asked
+        await call(ws, "build", {"session_id": session_id}, frame_id="b")
         await collect(ws, until="invocation.verdict")
         context = state.sessions.require(session_id).paths.context
 
-    started = next(
-        argv for argv in docker.calls if argv[:2] == ["docker", "run"] and "--detach" in argv
-    )
-    named = [argument for argument in started if argument.startswith(IMAGE)]
-    assert named and all(IMAGE_DIGEST in argument for argument in named), (
-        "the image the manifest names"
-    )
-    assert newer not in started and f"{IMAGE}@sha256:{'e' * 64}" not in started
+    assert IMAGE_RUNNABLE in docker.step
     recorded = YAML(typ="safe", pure=True).load((context / "manifest.yaml").read_text())
+    # The manifest records the packages, never the delivery: an image is
+    # one delivery of a set, and two builds of one context on two hosts
+    # may legitimately use different ones.
     assert recorded["build_environment"] == ENVIRONMENT.to_dict(url=False)
-    after = len([argv for argv in docker.calls if argv[1:3] == ["image", "ls"]])
-    assert after == listings, "no second selection: the choice was made at send-context"
 
 
 async def test_an_image_that_went_away_after_the_lock_is_a_typed_refusal(
     client, config, docker
 ) -> None:
-    """The other half of holding the choice: it can be gone, not swapped.
+    """The choice can be lost, and it is never silently swapped.
 
     An operator may remove an image while a session sits locked. Another
-    image of the same line then serves the requirement — and substituting
-    it is exactly what must not happen, because ``manifest.yaml`` has
-    already been answered and names the one that went. So the refusal is
-    typed and names the missing image: ``version.builder-unavailable``,
-    whose registry entry is "the image is not on this host", and which is
-    not the retryable ``builder.runtime-unavailable`` because this server
-    pulls nothing and "gone" is a final answer.
+    image declaring the same packages would serve the same requirement —
+    and substituting it is what must not happen without saying so, because
+    the session was answered with these bytes.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id, _ = await locked(ws, config, **{"model/device-model.json": MODEL})
-        _extra_image(docker, "zephyr-4.4.2-r1", release="4.4.2", digest="e", identity="d")
-        # Removed the way docker removes an image: every name it had
-        # goes with it, and it stops being listed.
-        for name in [key for key in docker.images if key.startswith(f"{IMAGE}:zephyr-4.4.0")]:
-            del docker.images[name]
-        docker.images.pop(IMAGE_REFERENCE, None)
-        docker.images.pop(IMAGE_REFERENCE_FORMAT3, None)
-        docker.listed = [name for name in docker.listed if "zephyr-4.4.0" not in name]
+        session_id, _ = await locked(ws, config)
+        docker.present = set()
         frame = await call(ws, "build", {"session_id": session_id}, frame_id="b")
 
     error = frame["error"]
     assert error["code"] == "version.builder-unavailable"
     assert error["retryable"] is False
-    # The pin as the context spells it, tag included: it is what the
-    # client wrote and what its manifest records, so it is what an
-    # operator will go looking for.
-    assert error["details"]["environment"] == IMAGE_REFERENCE_FORMAT3
     assert error["details"]["digest"] == IMAGE_DIGEST
-    detached = [
-        argv for argv in docker.calls if argv[:2] == ["docker", "run"] and "--detach" in argv
-    ]
-    assert detached == [], "no container was started in the substitute either"
+    assert not any(argv[1:2] == ["run"] for argv in docker.calls)
 
 
-async def test_capabilities_lists_the_local_build_container_inventory(client) -> None:
-    """ADR 0019 §2: "tag + digest + contract labels", pre-session and cheap.
+async def test_an_image_whose_generation_this_server_does_not_speak_is_refused(
+    client, config, registry
+) -> None:
+    """§12: the side that notices refuses.
 
-    Nothing here starts a container: a client asking what this server
-    has is not yet asking any image to prove it, and ``describe`` costs
-    a container start.
+    "The orchestrator does not start an environment whose generation it
+    does not implement" — the label is read before anything is started,
+    which is exactly why it is a label.
+    """
+    registry.labels_ = environment_labels(generation="4")
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+        frame = await send_archive(ws, "send-context", session_id, buildable_context(sha256))
+
+    assert frame["error"]["code"] == "version.builder-unavailable"
+    assert "generation" in frame["error"]["message"]
+
+
+async def test_an_environment_that_does_not_accept_this_context_is_refused(
+    client, config, registry
+) -> None:
+    """§9.1: the constraint is checked before every step, on this side.
+
+    "When the check fails you are not started at all and never see the
+    context" — so an environment that accepts only contexts from another
+    tool is refused at the moment the context arrives, not minutes into a
+    build.
+    """
+    registry.labels_ = environment_labels(constraint="custom-tool:~=1.0")
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+        context = buildable_context(sha256, **{"build-context.json": BUILD_CONTEXT_BYTES})
+        frame = await send_archive(ws, "send-context", session_id, context)
+
+    assert frame["error"]["code"] == "version.builder-unavailable"
+    assert "does not accept" in frame["error"]["message"]
+
+
+async def test_capabilities_lists_the_environments_this_host_has(client) -> None:
+    """Pre-session and cheap: what is here, with what it declares.
+
+    Nothing starts a container — a client asking what this server has is
+    not yet asking any image to prove it — and the allowlist beside it is
+    the half a client can act on before it uploads anything.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         frame = await call(ws, "capabilities")
 
     containers = frame["payload"]["containers"]
     assert len(containers) == 1
-    assert containers[0]["digest"] == "sha256:" + "b" * 64
-    assert containers[0]["labels"][CONTRACT_LABEL] == "1"
+    assert containers[0]["digest"] == IMAGE_DIGEST
+    assert containers[0]["labels"]["org.mcuhome.build-environment.spec-generation"] == "3"
+    assert frame["payload"]["environments"]["allowed"] == [IMAGE]
 
 
 async def test_capabilities_answers_an_empty_inventory_when_docker_is_down(client, docker) -> None:
-    """The question is which images this server can serve, and "none" is
-    a fact rather than an error. The refusal for a missing runtime
-    belongs to the verb that actually needs a container.
+    """The question is which environments this host has, and "none" is a fact.
+
+    The refusal for a missing runtime belongs to the verb that actually
+    needs a container, where it can be acted on.
     """
     docker.version_status = None
     async with client.ws_connect("/ws", headers=auth()) as ws:
@@ -2775,6 +1793,27 @@ async def test_capabilities_answers_an_empty_inventory_when_docker_is_down(clien
 
     assert frame["type"] == "result"
     assert frame["payload"]["containers"] == []
+
+
+async def test_a_runtime_that_dies_between_send_context_and_build_is_typed(
+    client, config, docker
+) -> None:
+    """The pre-start refusal at the moment a step would start.
+
+    A daemon that went away in between is ``builder.runtime-unavailable``,
+    retryable, with the session untouched and usable afterwards.
+    """
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id, _ = await locked(ws, config)
+        docker.version_status = 1
+        frame = await call(ws, "build", {"session_id": session_id}, frame_id="b")
+        docker.version_status = 0
+        again = await call(ws, "verify", {"session_id": session_id}, frame_id="v")
+        await collect(ws, until="invocation.verdict")
+
+    assert frame["error"]["code"] == "builder.runtime-unavailable"
+    assert frame["error"]["retryable"] is True
+    assert again["type"] == "result", "the session survived the refusal"
 
 
 # --------------------------------------------------------------------------
@@ -2785,34 +1824,29 @@ async def test_capabilities_answers_an_empty_inventory_when_docker_is_down(clien
 async def test_the_locked_context_is_re_measured_before_every_invocation(
     client, config, state
 ) -> None:
-    """The product owner's decision: contexts are small, so check them.
+    """Contexts are small, so they are checked rather than trusted.
 
-    What the re-check buys is the one thing the freeze cannot — the
+    What the re-check buys is the one thing the freeze cannot: the
     manifest and the files are compared *now*, so an invocation is never
-    attributed to an identity that moved after it was answered. It does
-    not poison: nothing was applied to any tree.
+    attributed to an identity that moved after it was answered.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config, **{"model/device-model.json": MODEL})
         paths = state.sessions.require(session_id).paths
         (paths.context / "model/device-model.json").write_bytes(b"{}")
         frame = await call(ws, "build", {"session_id": session_id}, frame_id="b")
-        attached = await call(ws, "attach-session", {"session_id": session_id}, frame_id="a")
 
     error = frame["error"]
     assert error["code"] == "context.integrity-mismatch"
     assert error["details"]["paths"] == ["model/device-model.json"]
-    assert attached["type"] == "result"
 
 
 async def test_a_rewritten_pin_is_caught_by_the_same_re_measurement(client, config, state) -> None:
-    """§9.1's cross-check against "the header the session was admitted on".
+    """A manifest that changed after it was written is what the check catches.
 
-    ADR 0018's amendment states the duty normatively because
-    ``verify_context`` cannot establish it: a self-consistently forged
-    manifest verifies clean. This server wrote the manifest itself, so
-    what the check catches is a manifest that changed after it was
-    written — which is exactly the gap the duty names.
+    A self-consistently forged manifest verifies clean, so the comparison
+    that matters is against the pins the session was admitted on — which
+    this server holds and the file cannot move.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
@@ -2820,85 +1854,99 @@ async def test_a_rewritten_pin_is_caught_by_the_same_re_measurement(client, conf
         manifest.write_text(
             manifest.read_text().replace("nrf7002dk/nrf5340/cpuapp", "nrf5340dk/nrf5340/cpuapp")
         )
-        frame = await call(ws, "verify", {"session_id": session_id}, frame_id="v")
+        frame = await call(ws, "build", {"session_id": session_id}, frame_id="b")
 
     assert frame["error"]["code"] == "context.integrity-mismatch"
     assert "target.board" in frame["error"]["details"]["paths"]
 
 
 async def test_a_rewritten_context_format_version_is_caught_too(client, config, state) -> None:
-    """``manifest.yaml``'s own format version is read back and compared.
+    """The manifest's own format version is read back and compared.
 
     It is the last value in the document that nothing else measures: not
-    an input of the ID, and not in the integrity list, because
-    ``manifest.yaml`` carries that list and cannot be in it.
-    ``context.yaml`` gets a hard version gate on every read and the
-    session can only have been admitted on one number, so a manifest
-    stating another is by construction a manifest that changed after it
-    was written.
-
-    Without the comparison the rewrite travelled all the way into the
-    build container and came back as ``unsupported.context`` — mapped to
-    ``version.context-format-unsupported``, whose own advice is "the
-    client's move is a different container". The operator would be told
-    the image was wrong.
+    an input of the identity, and not in the integrity list, because the
+    manifest carries that list and cannot be in it.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id, _ = await locked(ws, config)
         manifest = state.sessions.require(session_id).paths.context / "manifest.yaml"
         assert "context: 4" in manifest.read_text()
         manifest.write_text(manifest.read_text().replace("context: 4", "context: 2"))
-        frame = await call(ws, "verify", {"session_id": session_id}, frame_id="v")
+        frame = await call(ws, "build", {"session_id": session_id}, frame_id="b")
 
     assert frame["error"]["code"] == "context.integrity-mismatch"
     assert "context" in frame["error"]["details"]["paths"]
 
 
-async def test_a_static_description_replaces_the_probe(client, config, docker, state) -> None:
-    """§2.2.1: read the file where present, invoke describe otherwise.
-
-    The static path exists for the image whose program body arrives with
-    a mounted tree — undiscoverable before the mount point is known,
-    and the mount point is what discovery would have supplied. The fake
-    answers the `cat` with a describe result document, and the assertion
-    is that NO describe container ran: the file replaced the probe, it
-    did not precede it.
-    """
-    import json as _json
-
-    docker.static_description = _json.dumps(
-        {"result": 1, "status": "success", "action": "describe", "program": docker.program}
-    )
-    async with client.ws_connect("/ws", headers=auth()) as ws:
-        session_id = await open_session(ws)
-        await send_archive(ws, "send-context", session_id, base_context())
-    assert docker.static_reads == ["/mcuhome/describe.json"]
-    describe_runs = [
-        call
-        for call in docker.calls
-        if call[1:2] == ["run"] and "--rm" in call and call[-2:-1] != ["cat"]
-    ]
-    assert describe_runs == [], "the file replaced the probe"
-
-
-async def test_an_unreadable_static_description_falls_back_to_describe(
-    client, config, docker
+async def test_a_container_image_this_server_cannot_read_is_refused_at_the_frame(
+    client, config
 ) -> None:
-    """Half-readable must not be a third behaviour (§2.2.1).
+    """A pin that is not a reference never becomes a search.
 
-    "There is no new failure mode in either direction, because the
-    fallback is the thing that was already mandatory" — broken JSON in
-    the file lands on exactly the probe path an image without the file
-    gets, and the session proceeds.
+    It is answered at the layer that did not understand it: the typed
+    codes describe what a *session* did, and a value that is not a
+    reference at all has not got that far. A client that sent one gets
+    the parser's own sentence back, which is what says which character
+    is wrong.
     """
-    docker.static_description = "{not json"
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
-        frame = await send_archive(ws, "send-context", session_id, base_context())
-    assert frame["payload"]["container"]["contract"] == 1
-    describe_runs = [
-        call
-        for call in docker.calls
-        if call[1:2] == ["run"] and "--rm" in call and call[-2:-1] != ["cat"]
+        sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+        frame = await send_archive(
+            ws,
+            "send-context",
+            session_id,
+            buildable_context(sha256),
+            container_image=":not a tag",
+        )
+
+    assert frame["type"] == "error"
+    assert frame["error"]["code"] == "bad_request"
+    assert "container_image" in frame["error"]["message"]
+
+
+async def test_a_fetch_that_fails_is_retryable_and_says_so(client, config, docker) -> None:
+    """No network, a registry wanting a login, a digest nothing answers to.
+
+    All of them come back, which is what ``retryable`` promises — and the
+    reason itself was already on the client's screen, because the pull's
+    own output was relayed while it happened.
+    """
+    docker.present = set()  # nothing on this host, and nothing pullable
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+        frame = await send_archive(ws, "send-context", session_id, buildable_context(sha256))
+
+    error = frame["error"]
+    assert error["code"] == "version.builder-unfetchable"
+    assert error["retryable"] is True
+    assert error["details"]["digest"] == IMAGE_DIGEST
+    assert docker.pulls == [IMAGE_RUNNABLE]
+
+
+async def test_the_result_document_is_not_reported_as_a_leftover(
+    client, config, docker, caplog
+) -> None:
+    """A step's result document lives in ``out`` and is not an artifact.
+
+    §6.2 puts it there and this side reads it; a server that counted it
+    among the files a step "forgot to declare" would say something is
+    wrong after every successful build. What the count is for is the
+    difference between a build that produced nothing and one that
+    produced something it did not declare.
+    """
+
+    def leaves_a_file(request, out, on_line):
+        (out / "zephyr.elf").write_bytes(b"diagnostic material\n")
+        return conforming_environment(request, out, on_line)
+
+    docker.run_program = leaves_a_file
+    with caplog.at_level("INFO"):
+        async with client.ws_connect("/ws", headers=auth()) as ws:
+            await built(ws, config)
+
+    noted = [
+        record.getMessage() for record in caplog.records if "undeclared" in record.getMessage()
     ]
-    assert len(describe_runs) == 1, "the fallback probe ran"
+    assert noted == ["invocation inv-1: 1 undeclared file(s) left in out"], noted

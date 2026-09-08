@@ -20,9 +20,9 @@ from pathlib import Path
 
 import pytest
 import zstandard
+from mcuhome.model.artifacts import Artifact
 
 from mcuhome.buildserver import artifacts
-from mcuhome.buildserver.abi import Artifact
 from mcuhome.buildserver.errors import SessionError
 
 

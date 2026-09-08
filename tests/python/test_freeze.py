@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import time
 
 import pytest
@@ -34,6 +35,7 @@ from tests.python.conftest import (
     BUILD_CONTEXT_BYTES,
     CONTEXT_YAML,
     ENVIRONMENT,
+    ENVIRONMENT_VERSION,
     TOOLS_PACKAGE,
     TOOLS_SHA256,
     WORKSPACE_PACKAGE,
@@ -42,8 +44,8 @@ from tests.python.conftest import (
     auth,
     base_context,
     call,
-    context_yaml,
     device_model,
+    environment_labels,
     make_archive,
     send_archive,
 )
@@ -69,7 +71,7 @@ def read_manifest(path) -> dict:
 # --------------------------------------------------------------------------
 
 
-async def test_the_lock_answers_the_context_id_and_nothing_else(client) -> None:
+async def test_the_lock_answers_the_context_id_and_nothing_else(client, package_source) -> None:
     """E37, frozen by the product owner against the richer alternative.
 
     The request carries ``session_id`` and nothing else, the response
@@ -91,7 +93,7 @@ async def test_the_lock_answers_the_context_id_and_nothing_else(client) -> None:
     assert len(frame["payload"]["context_id"]) == len("sha256:") + 64
 
 
-async def test_the_id_is_the_models_rule_over_the_bytes_received(client) -> None:
+async def test_the_id_is_the_models_rule_over_the_bytes_received(client, package_source) -> None:
     """The value, computed a second time from the other side of the wire.
 
     The test hashes the bytes it sent and runs ``mcuhome-model``'s
@@ -122,7 +124,7 @@ async def test_the_id_is_the_models_rule_over_the_bytes_received(client) -> None
     assert frame["payload"]["context_id"] == expected
 
 
-async def test_an_extension_changes_the_identity(client) -> None:
+async def test_an_extension_changes_the_identity(client, package_source) -> None:
     """The ID is hashed once, at the lock — over the *effective* context.
 
     ADR 0018's amendment moved the hash from "re-hashed at build time"
@@ -148,7 +150,7 @@ async def test_an_extension_changes_the_identity(client) -> None:
     assert first["payload"]["context_id"] != second["payload"]["context_id"]
 
 
-async def test_an_empty_context_has_an_identity_and_may_be_locked(client) -> None:
+async def test_an_empty_context_has_an_identity_and_may_be_locked(client, package_source) -> None:
     """ "A context that was sent but is empty may be locked" (ADR 0019).
 
     It has a well-defined ID — the ``files`` list is simply empty and
@@ -172,8 +174,62 @@ async def test_an_empty_context_has_an_identity_and_may_be_locked(client) -> Non
     assert frame["payload"]["context_id"] == expected
 
 
+def _context_yaml_pinning_tools(version: str, sha256: str) -> bytes:
+    """``context.yaml`` naming *one* different bytes for the tools package.
+
+    Built rather than routed through :func:`context_yaml`, which only
+    moves the tools *hash* and keeps its version fixed at
+    :data:`ENVIRONMENT_VERSION` — this test needs the version to move
+    too, because a resolvable environment needs a package index entry of
+    its own for whichever version it names.
+    """
+    return f"""\
+context: 4
+created: 2026-08-09T10:00:00Z
+mcuhome:
+  constraint: ^2.3.6
+  version: 2.4.0
+  package:
+    url: https://packages.mcuhome.org/mcuhome-sdk-2.4.0.tar.zst
+    sha256: {SDK_SHA256}
+build_environment:
+  workspace:
+    name: {WORKSPACE_PACKAGE}
+    version: {ENVIRONMENT_VERSION}
+    sha256: {WORKSPACE_SHA256}
+  tools:
+    name: {TOOLS_PACKAGE}
+    version: {version}
+    sha256: {sha256}
+target:
+  board: {BOARD}
+""".encode()
+
+
+def _publish_tools_version(directory, version: str, sha256: str) -> None:
+    """Add one more version of the tools package to the operator's index.
+
+    :func:`~tests.python.conftest.write_package_index` only ever
+    publishes :data:`ENVIRONMENT_VERSION`, and a pin naming another
+    version resolves against nothing until this adds it — a package
+    index entry is what a family pin needs before the labels are even
+    read.
+    """
+    index_path = directory / "index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    filename = f"{TOOLS_PACKAGE}-{version}.tar.zst"
+    payload = f"{TOOLS_PACKAGE} {version}\n".encode()
+    (directory / filename).write_bytes(payload)
+    index["packages"][TOOLS_PACKAGE][version] = {
+        "file": filename,
+        "sha256": sha256,
+        "size": len(payload),
+    }
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+
+
 async def test_two_contexts_differing_only_in_their_environment_get_two_identities(
-    client,
+    client, package_source, registry
 ) -> None:
     """What replaced the model-versus-context cross-check, and why it is better.
 
@@ -189,17 +245,30 @@ async def test_two_contexts_differing_only_in_their_environment_get_two_identiti
     two contexts and nothing has to be cross-checked to make it so. This
     is that property, measured on this server: the same bytes, one pin
     changed, two identities.
+
+    Each pin has to resolve to a real image or the lock is never reached
+    at all, so a second, resolvable tools package is published for the
+    second pin — a candidate is found by its labels, and a context whose
+    environment nothing declares would be refused before it ever got the
+    chance to disagree on an ID.
     """
-    other_tools_sha256 = "d" * 64
+    other_version, other_sha256 = "2.4.1", "d" * 64
+    _publish_tools_version(package_source, other_version, other_sha256)
 
     identities = []
-    for tools_sha256 in (TOOLS_SHA256, other_tools_sha256):
+    for version, tools_sha256 in (
+        (ENVIRONMENT_VERSION, TOOLS_SHA256),
+        (other_version, other_sha256),
+    ):
+        registry.labels_ = environment_labels(tools=f"{version}@sha256:{tools_sha256}")
         async with client.ws_connect("/ws", headers=auth()) as ws:
             session_id = await open_session(ws)
             frame = await send_and_lock(
                 ws,
                 session_id,
-                base_context(**{"context.yaml": context_yaml(tools_sha256=tools_sha256)}),
+                base_context(
+                    **{"context.yaml": _context_yaml_pinning_tools(version, tools_sha256)}
+                ),
             )
             identities.append(frame)
 
@@ -208,7 +277,7 @@ async def test_two_contexts_differing_only_in_their_environment_get_two_identiti
     assert first != second
 
 
-async def test_a_model_stating_the_required_line_locks_normally(client) -> None:
+async def test_a_model_stating_the_required_line_locks_normally(client, package_source) -> None:
     """The other side of the check, so it cannot be a blanket refusal.
 
     A readable model agreeing with ``context.yaml`` is the ordinary case
@@ -235,7 +304,9 @@ async def test_a_model_stating_the_required_line_locks_normally(client) -> None:
 # --------------------------------------------------------------------------
 
 
-async def test_the_manifest_repeats_the_pins_and_adds_the_list_and_the_id(client, state) -> None:
+async def test_the_manifest_repeats_the_pins_and_adds_the_list_and_the_id(
+    client, state, package_source
+) -> None:
     """ "It repeats rather than refers, so the lock result is readable on
     its own: the document that carries an identity carries the inputs
     that identity was computed from" (ADR 0018's amendment).
@@ -273,7 +344,7 @@ async def test_the_manifest_repeats_the_pins_and_adds_the_list_and_the_id(client
     assert manifest["id"] == frame["payload"]["context_id"]
 
 
-async def test_the_manifest_carries_no_created_timestamp(client, state) -> None:
+async def test_the_manifest_carries_no_created_timestamp(client, state, package_source) -> None:
     """ "The one field that does not travel is ``created``."
 
     It dates the *request* and lives in ``context.yaml`` alone; the
@@ -293,7 +364,9 @@ async def test_the_manifest_carries_no_created_timestamp(client, state) -> None:
     assert "created" not in read_manifest(paths.context / "manifest.yaml")
 
 
-async def test_no_hash_in_the_manifest_is_wrapped_across_two_lines(client, state) -> None:
+async def test_no_hash_in_the_manifest_is_wrapped_across_two_lines(
+    client, state, package_source
+) -> None:
     """A ``sha256:`` digest is 71 characters and the emitter would fold it.
 
     Legal YAML, and still the wrong thing to write: ``manifest.yaml`` is
@@ -320,7 +393,9 @@ async def test_no_hash_in_the_manifest_is_wrapped_across_two_lines(client, state
     assert all(len(line) < 200 for line in text.splitlines()), "no runaway line either"
 
 
-async def test_neither_context_document_is_in_the_integrity_list(client, state) -> None:
+async def test_neither_context_document_is_in_the_integrity_list(
+    client, state, package_source
+) -> None:
     """Both exclusions, and they have different reasons.
 
     ``manifest.yaml`` is structural — it is the document that carries
@@ -355,7 +430,9 @@ async def test_neither_context_document_is_in_the_integrity_list(client, state) 
     assert "manifest.yaml" not in listed
 
 
-async def test_a_patch_is_an_ordinary_entry_of_the_list(aiohttp_client, config) -> None:
+async def test_a_patch_is_an_ordinary_entry_of_the_list(
+    aiohttp_client, config, package_source
+) -> None:
     """ "There is no patch list in the manifest" (contract §3.1).
 
     A patch's layer is its subfolder and its order is its filename, so
@@ -386,7 +463,9 @@ async def test_a_patch_is_an_ordinary_entry_of_the_list(aiohttp_client, config) 
 # --------------------------------------------------------------------------
 
 
-async def test_a_context_yaml_that_changed_after_acceptance_is_refused(client, state) -> None:
+async def test_a_context_yaml_that_changed_after_acceptance_is_refused(
+    client, state, package_source
+) -> None:
     """Defence in depth on top of the extension refusal.
 
     The pins are two of the three hashed inputs and the document that
@@ -410,17 +489,19 @@ async def test_a_context_yaml_that_changed_after_acceptance_is_refused(client, s
     assert frame["error"]["details"]["paths"] == ["context.yaml"]
 
 
-async def test_the_lock_is_one_way_and_unlocks_the_working_commands(client) -> None:
+async def test_the_lock_is_one_way_and_unlocks_the_working_commands(client, package_source) -> None:
     """Both halves of the boundary, over a context that really exists.
 
     After the lock every writing command is refused — a second
     ``lock-context`` as much as another patch — and ``verify`` and
-    ``build`` stop answering ``context.not-locked``. What they answer
-    instead is now the *next* thing that is missing rather than a
-    missing backend: this session's SDK pin names a package no source
-    directory holds, so both reach ``sdk.unavailable``. Reaching a
-    refusal from inside the working path is what proves the gate opened
-    rather than merely stopped complaining.
+    ``build`` stop answering ``context.not-locked``. ``verify`` answers
+    from this server's own measurement of the locked context and starts
+    no container, so it succeeds the moment the gate opens. ``build`` is
+    the one that needs a build environment: this session's SDK pin names
+    a package no source directory holds, so it reaches
+    ``sdk.unavailable`` — the *next* thing missing rather than the gate
+    itself, which is what proves the gate opened rather than merely
+    stopped complaining.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
@@ -429,9 +510,10 @@ async def test_the_lock_is_one_way_and_unlocks_the_working_commands(client) -> N
         for index, verb in enumerate(("send-context", "extend-context", "lock-context")):
             frame = await call(ws, verb, {"session_id": session_id}, frame_id=f"w{index}")
             assert frame["error"]["code"] == "context.locked", verb
-        for index, verb in enumerate(("verify", "build")):
-            frame = await call(ws, verb, {"session_id": session_id}, frame_id=f"r{index}")
-            assert frame["error"]["code"] == "sdk.unavailable", verb
+        verified = await call(ws, "verify", {"session_id": session_id}, frame_id="verify")
+        assert verified["type"] == "result", verified
+        built = await call(ws, "build", {"session_id": session_id}, frame_id="build")
+        assert built["error"]["code"] == "sdk.unavailable", built
 
 
 # --------------------------------------------------------------------------
@@ -439,7 +521,7 @@ async def test_the_lock_is_one_way_and_unlocks_the_working_commands(client) -> N
 # --------------------------------------------------------------------------
 
 
-async def test_close_session_destroys_the_context(client, state) -> None:
+async def test_close_session_destroys_the_context(client, state, package_source) -> None:
     """ "The per-session directory — the context and every artifact in it
     — is deleted at ``close-session``" (ADR 0019's amendment).
 
@@ -626,7 +708,9 @@ def test_the_model_keeps_both_context_documents_out_of_the_hash() -> None:
 # --------------------------------------------------------------------------
 
 
-async def test_a_lock_cannot_slip_between_an_extension_and_its_bytes(client, state) -> None:
+async def test_a_lock_cannot_slip_between_an_extension_and_its_bytes(
+    client, state, package_source
+) -> None:
     """The freeze takes the same in-flight guard the uploads take.
 
     Every command runs as its own task and the reader keeps taking TEXT
@@ -982,7 +1066,7 @@ def test_admission_is_the_operators_and_reaches_the_manager(tmp_path) -> None:
 
 
 async def test_the_server_sweeps_without_anybody_asking(
-    aiohttp_client, config, monkeypatch
+    aiohttp_client, config, monkeypatch, package_source
 ) -> None:
     """The task, not just the method: a sweep nobody runs is not a sweep.
 
@@ -1010,7 +1094,9 @@ async def test_the_server_sweeps_without_anybody_asking(
     assert state.sessions.open_count == 0
 
 
-async def test_a_stopping_server_takes_the_directories_with_it(aiohttp_client, config) -> None:
+async def test_a_stopping_server_takes_the_directories_with_it(
+    aiohttp_client, config, package_source
+) -> None:
     """A stopping server's sessions are over by definition.
 
     They are in-memory records bound to this process, so nothing that

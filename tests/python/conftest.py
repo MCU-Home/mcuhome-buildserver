@@ -3,35 +3,40 @@
 """Shared fixtures.
 
 **Nothing here fakes a build environment, and that is the point.** The
-build server is an orchestrator and is never itself the build
-environment (build-container-contract.md §1.2), so there is no build to
-stand in for: what this suite exercises is the transport, the bearer
-token, the session protocol and the *backend* — the argv it composes,
-the documents it writes, and what it makes of the documents that come
-back.
+build server is an orchestrator and never the build environment itself,
+so there is no build to stand in for: what this suite exercises is the
+transport, the bearer token, the session protocol and the *backend* — the
+argv it composes, the documents it writes, and what it makes of the
+documents that come back.
 
-**Docker is stubbed at the seam and never runs**, which is a hard rule
-of this suite rather than a convenience. :class:`FakeDocker` replaces
-:func:`mcuhome.buildserver.container.run_docker` and
-:func:`~mcuhome.buildserver.container.spawn_docker`, the two impure
-functions everything else in that module goes through, and it is
-installed by an **autouse** fixture: a test that forgot to ask for it
-would otherwise start a real container on the machine running the
-suite, which is exactly the failure mode the reference implementation
-warns about ("a test that thinks it stubbed docker out but did not is a
-test that starts a real build").
+**The container runtime is stubbed at every seam and never runs**, which
+is a hard rule of this suite rather than a convenience.
+:class:`FakeDocker` replaces this server's own discovery seam
+(:func:`mcuhome.buildserver.container.run_docker`) *and* both halves of
+the workbench container profile's seam
+(:func:`mcuhome.workbench.buildprocess.run_command` and
+:func:`~mcuhome.workbench.buildprocess.spawn_process`, as
+:mod:`mcuhome.workbench.containerbuild` resolves them). It is installed
+by an **autouse** fixture: a test that forgot to ask for it would
+otherwise start a real container on the machine running the suite, which
+is exactly the failure mode this guards against.
 
-The fake is a *conforming program* by default — it answers ``describe``
-with a complete ``program`` block, writes real files into ``out``,
-declares them with the hashes they actually have and emits the events
-contract §8 seeds its registry with. Tests that want a non-conforming
-one say so by replacing one attribute, which keeps every test that does
-not care about the container from having to know what one looks like.
+**And so is the registry.** Choosing a build environment is the one step
+that talks to a network — an image is found by its labels, which live in
+a registry — so :class:`ScriptedRegistry` answers those questions too,
+and the packages a context pins are resolved out of a local index this
+suite writes. A test that reached ghcr.io would depend on what is
+published there today.
+
+The fake is a *conforming environment* by default: it reads the request
+document through the mounts the composed ``docker run`` was given, writes
+real files into ``out``, and answers with the result document the build
+environment specification §6.2 defines. Tests that want a
+non-conforming one replace one attribute.
 """
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import io
 import json
@@ -44,10 +49,10 @@ from typing import Any
 
 import pytest
 import zstandard
-from mcuhome.model.buildimage import CONTRACT_LABEL, TOOLCHAIN_LABEL, ZEPHYR_LABEL
+from mcuhome.model.buildenvironment import LABEL_PREFIX
+from mcuhome.model.buildimage import ENVIRONMENT_IMAGE_REPOSITORY
 from mcuhome.model.context import EnvironmentPin, PackagePin
-from mcuhome.workbench import orchestrator
-from ruamel.yaml import YAML
+from mcuhome.workbench import buildenvsession, containerbuild, ociregistry
 
 from mcuhome.buildserver import container
 from mcuhome.buildserver.app import ServerState, create_app
@@ -55,17 +60,10 @@ from mcuhome.buildserver.config import Config
 
 TOKEN = "test-token-000000000000000000000000"
 
-#: The Zephyr line and revision the build image has — spelled in its label.
-#: One image this host has. Nothing pins it any more — a context pins packages.
-ZEPHYR_LINE = "4.4"
-IMAGE_REVISION = "r10"
-IMAGE_REFERENCE_FORMAT3 = (
-    f"ghcr.io/mcu-home/build-container:zephyr-4.4.0-{IMAGE_REVISION}@sha256:{'b' * 64}"
-)
 #: The build environment a context pins under format 4: two packages,
 #: each a ``(name, version, sha256)`` triple. The tools entry is the
-#: **family**, which is the ordinary pin — it resolves per platform, and
-#: its hash covers every platform's package.
+#: **family**, which is the ordinary pin — it resolves per platform
+#: through an index, and its hash covers every platform's package.
 WORKSPACE_PACKAGE = "mcuhome-build-workspace"
 TOOLS_PACKAGE = "mcuhome-build-tools"
 ENVIRONMENT_VERSION = "2.4.0"
@@ -80,6 +78,63 @@ ENVIRONMENT = EnvironmentPin(
     ),
     tools=PackagePin(name=TOOLS_PACKAGE, version=ENVIRONMENT_VERSION, sha256=TOOLS_SHA256),
 )
+
+#: The image that delivers that package set, as this suite's registry
+#: publishes it: MCUHome's own repository, one tag, one digest. The tag
+#: is a location and the digest is the identity — what a build runs and
+#: what a verdict records is the digest.
+IMAGE = ENVIRONMENT_IMAGE_REPOSITORY
+IMAGE_TAG = f"{ENVIRONMENT_VERSION}-r1"
+IMAGE_DIGEST = "sha256:" + "b" * 64
+IMAGE_REFERENCE = f"{IMAGE}:{IMAGE_TAG}@{IMAGE_DIGEST}"
+#: How the runtime is addressed for those bytes, and how a verdict
+#: names them: by digest, never by the tag they were found under.
+IMAGE_RUNNABLE = f"{IMAGE}@{IMAGE_DIGEST}"
+
+#: The Zephyr release the image declares, and the generator constraint it
+#: accepts contexts under (build environment specification §5).
+ZEPHYR_VERSION = "4.4.0"
+GENERATOR_CONSTRAINT = "mcuhome-workbench:"
+
+#: The Zephyr line the device model in a context states. It is the
+#: model's own field and not a pin: what a build runs is decided by the
+#: packages the context names.
+ZEPHYR_LINE = "4.4"
+
+
+def environment_labels(
+    *,
+    zephyr: str = ZEPHYR_VERSION,
+    generation: str = "3",
+    constraint: str = GENERATOR_CONSTRAINT,
+    workspace: str | None = None,
+    tools: str | None = None,
+) -> dict[str, str]:
+    """The labels an image delivering this suite's package set carries.
+
+    Specification §5.2: an image mirrors every member of the declaration
+    as a label, and every ``packages.`` member carries a hash because an
+    image is a delivery of exact bytes. *workspace* and *tools* replace a
+    member outright, which is how a test states the near miss — the same
+    packages under other bytes, which is a different environment.
+    """
+    labels = {
+        f"{LABEL_PREFIX}spec-generation": generation,
+        f"{LABEL_PREFIX}zephyr.version": zephyr,
+        f"{LABEL_PREFIX}build-context.generator-constraint": constraint,
+        f"{LABEL_PREFIX}packages.{WORKSPACE_PACKAGE}": (
+            workspace
+            if workspace is not None
+            else f"{ENVIRONMENT_VERSION}@sha256:{WORKSPACE_SHA256}"
+        ),
+        f"{LABEL_PREFIX}packages.{TOOLS_PACKAGE}": (
+            tools if tools is not None else f"{ENVIRONMENT_VERSION}@sha256:{TOOLS_SHA256}"
+        ),
+    }
+    return {name: value for name, value in labels.items() if value}
+
+
+IMAGE_LABELS = environment_labels()
 
 CONTEXT_YAML = f"""\
 context: 4
@@ -113,10 +168,11 @@ def config(tmp_path: Path) -> Config:
     a server nobody deploys. Tests that want to see a cap fire build
     their own :class:`Config` with that one number lowered.
 
-    ``sdk_sources`` names a directory that starts out empty, which is
-    the honest default: a server with no SDK package configured refuses
-    a working action with ``sdk.unavailable``, and a test that wants a
-    build puts a package there with :func:`write_sdk_package`.
+    ``sdk_sources`` names the package directory :func:`package_source`
+    fills: the SDK archive a context pins, and the index that says what
+    the two environment packages are. A server with nothing in it
+    refuses a build with ``sdk.unavailable``, which is the honest
+    default and what the tests of that refusal use.
     """
     return Config(
         host="127.0.0.1",
@@ -128,57 +184,21 @@ def config(tmp_path: Path) -> Config:
     )
 
 
-#: The image this server matches for the pinned ``build_environment``, and the
-#: labels contract §2.1 requires of it. Spelled here so that a test that
-#: changes one can see what a conforming image looks like beside it —
-#: the ``org.mcuhome.build-environment.zephyr.version`` label above all,
-#: kept because the image inventory and the allowlist are still tested.
-IMAGE = "ghcr.io/mcu-home/build-container"
-IMAGE_DIGEST = "sha256:" + "b" * 64
-IMAGE_REFERENCE = f"{IMAGE}@{IMAGE_DIGEST}"
-IMAGE_LABELS = {
-    CONTRACT_LABEL: "1",
-    ZEPHYR_LABEL: "4.4.0",
-    TOOLCHAIN_LABEL: "zephyr-sdk-1.0.1",
-}
-
-#: A conforming ``describe`` ``program`` block: every field §7.1.1 makes
-#: mandatory, ``trees`` included. ``sdk`` reports ``path: null`` — "this
-#: tree is not in my image; put it wherever you like and name it in
-#: ``trees``" — while the three the image carries report where they are,
-#: which is what E47's writable views are asserted at.
-PROGRAM = {
-    "id": "org.mcuhome.build-container",
-    "version": "2.4.0",
-    "contract": 1,
-    "request": [1],
-    "result": [1],
-    "actions": ["describe", "verify", "build"],
-    "trees": {
-        "zephyr": {"path": "/opt/zephyr", "version": "4.4.0"},
-        "chip": {"path": "/opt/connectedhomeip", "version": "v1.5.1.0"},
-        "mcuboot": {"path": "/opt/bootloader/mcuboot"},
-        "sdk": {"path": None},
-    },
-}
-
-
-@dataclass
-class Invocation:
-    """One ``docker exec`` the backend made, as the fake saw it."""
-
-    action: str
-    argv: list[str]
-    request: dict[str, Any]
+# --------------------------------------------------------------------------
+# The container runtime, as this suite has it
+# --------------------------------------------------------------------------
 
 
 class FakeProcess:
-    """A ``docker exec`` that has already finished, or refuses to.
+    """A step that has already finished, or refuses to.
 
-    ``ignores_terminate`` is the rung above SIGTERM: a client that does
-    not go away is the only reason SIGKILL exists, and a process that
-    always died of SIGTERM could never reach it.
+    ``ignores_terminate`` is the rung above SIGTERM: a step that does not
+    go away is the only reason SIGKILL exists, and one that always died
+    of SIGTERM could never reach it.
     """
+
+    output = ""
+    started = True
 
     def __init__(self, code: int, *, hang: bool = False, ignores_terminate: bool = False) -> None:
         self._code = code
@@ -187,9 +207,13 @@ class FakeProcess:
         self.terminated = False
         self.killed = False
 
-    async def wait(self) -> int:
+    def poll(self) -> int | None:
+        """``None`` while the scripted step is still running."""
+        return None if self._hang else self._code
+
+    def wait(self) -> int | None:
         while self._hang:
-            await asyncio.sleep(0.01)
+            time.sleep(0.005)
         return self._code
 
     def terminate(self) -> None:
@@ -203,60 +227,24 @@ class FakeProcess:
         self._hang = False
         self._code = -9
 
-    async def stop(self) -> None:
-        """Teardown's escalation, with the grace collapsed to nothing.
 
-        The real one (:meth:`mcuhome.buildserver.processes.ChildProcess.stop`)
-        asks the process group, waits a bounded moment and kills what is
-        left. The shape a test needs from it is the *ladder* and not the
-        clock: a child that goes away on SIGTERM is never killed, and one
-        that does not always is.
-        """
-        self.terminate()
-        await asyncio.sleep(0)
-        if self._hang:
-            self.kill()
+@dataclass
+class Invocation:
+    """One step this suite's runtime played, as the fake saw it."""
 
-
-class _Driven:
-    """A scripted program, as the orchestrator's spawn seam answers one.
-
-    The orchestrator's handle is **synchronous** — it is driven from a
-    worker thread, where blocking is the point — so this wraps the
-    suite's :class:`FakeProcess` rather than replacing it: the scripted
-    behaviour a test wants (finishes, hangs, ignores SIGTERM) is stated
-    in one place and read by both profiles' seams.
-    """
-
-    output = ""
-
-    def __init__(self, process: FakeProcess) -> None:
-        self._process = process
-
-    def poll(self) -> int | None:
-        """``None`` while the scripted program is still hanging."""
-        return None if self._process._hang else self._process._code
-
-    def wait(self) -> int | None:
-        while self._process._hang:
-            time.sleep(0.005)
-        return self._process._code
-
-    def terminate(self) -> None:
-        self._process.terminate()
-
-    def kill(self) -> None:
-        self._process.kill()
+    action: str
+    argv: list[str]
+    request: dict[str, Any]
 
 
 @dataclass
 class FakeDocker:
-    """Docker as this suite has it: argv in, scripted answers out.
+    """The container runtime as this suite has it: argv in, scripted answers out.
 
-    Every command the backend composes lands in :attr:`calls` verbatim,
-    which is what makes the composed argv assertable — it is the
-    interface between the contract and the runtime, and the only way to
-    check it without running anything.
+    Every command either half of the seam composes lands in :attr:`calls`
+    verbatim, which is what makes the composition assertable — it is the
+    interface between the specification and the runtime, and the only way
+    to check it without running anything.
     """
 
     calls: list[list[str]] = field(default_factory=list)
@@ -269,93 +257,62 @@ class FakeDocker:
     #: "found it, cannot reach the daemon". The two refusals the backend
     #: has to tell apart.
     version_status: int | None = 0
-    #: The ``program`` block ``describe`` answers with, or ``None`` for a
-    #: describe that writes no result document at all.
-    program: dict[str, Any] | None = None
-    describe_exit: int = 0
-    #: What one invocation does. Replaced by tests that want a failure,
-    #: a crash, a hang or a non-conforming answer.
+    #: Which references this host has. ``None`` means "every image this
+    #: fake knows about", which is the ordinary case.
+    present: set[str] | None = None
+    #: What one step does. Replaced by tests that want a failure, a
+    #: crash, a hang or a non-conforming answer.
     run_program: Any = None
-    #: References this host could fetch, mapped to the ``image inspect``
-    #: object a successful pull would leave behind. Empty by default:
-    #: most tests are about an image that is here or one that is not,
-    #: and a fake that fetched anything on request would hide the
-    #: difference.
-    pullable: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: References this host could fetch. Empty by default: most tests are
+    #: about an image that is here or one that is not, and a fake that
+    #: fetched anything on request would hide the difference.
+    pullable: set[str] = field(default_factory=set)
     pulls: list[str] = field(default_factory=list)
-    #: Scripted programs currently running in a container, so that
-    #: removing it can end them — which is what a real ``docker rm
-    #: --force`` does and the whole reason teardown is the ladder's last
-    #: rung.
+    #: Scripted steps currently running in a container, so that removing
+    #: it can end them — which is what a real ``docker rm --force`` does.
     running: list[Any] = field(default_factory=list)
     containers: list[str] = field(default_factory=list)
-    #: ``container target -> host source``, from the mounts of the
-    #: ``docker run`` that created the session's container.
-    mounts: dict[PurePosixPath, Path] = field(default_factory=dict)
     removed: list[str] = field(default_factory=list)
+    #: ``container target -> host source``, from the mounts of the
+    #: ``docker run`` that played the last step.
+    mounts: dict[PurePosixPath, Path] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        image_tag = f"zephyr-4.4.0-{IMAGE_REVISION}"
         inspected = {
             "Id": "sha256:" + "c" * 64,
-            # Both names docker itself reports for one image, because
-            # both are what `Docker._inspect` matches its answer back to:
-            # the tag `image ls` lists and the repo digest a context pins.
-            "RepoTags": [f"{IMAGE}:{image_tag}"],
+            "RepoTags": [f"{IMAGE}:{IMAGE_TAG}"],
             "RepoDigests": [f"{IMAGE}@{IMAGE_DIGEST}"],
             "Config": {"Labels": dict(IMAGE_LABELS)},
         }
-        # The same image under both names docker resolves it by: the
-        # digest a context pins it with, and the tag `image ls` lists.
-        self.images.setdefault(IMAGE_REFERENCE, inspected)
-        self.images.setdefault(f"{IMAGE}:{image_tag}", inspected)
-        # And under the full pinned spelling, which is what docker
-        # actually resolves and what a context carries: tag *and* digest
-        # in one reference.
-        self.images.setdefault(IMAGE_REFERENCE_FORMAT3, inspected)
-        self.listed = self.listed or [f"{IMAGE}:{image_tag}"]
-        #: §2.2.1's static self-description: the default fake image
-        #: carries none, so the backend exercises the invoke-describe
-        #: fallback most tests are about. A test of the static path sets
-        #: this to a describe result document (JSON text).
-        self.static_description: str | None = None
-        self.static_reads: list[str] = []
-        #: Guards :attr:`running` and :attr:`removed`. Two threads reach
-        #: them and they reach them about each other: an invocation
-        #: registers its program from the worker thread supervising it,
-        #: while ``docker rm`` sweeps the same list from whichever
-        #: thread is tearing the session down. Without the lock the two
-        #: race, and the race is not a lost update but a program nobody
-        #: kills — which is what made one test wait out the whole cancel
-        #: grace and the suite hang behind it.
+        for name in (IMAGE_RUNNABLE, f"{IMAGE}:{IMAGE_TAG}", IMAGE_REFERENCE):
+            self.images.setdefault(name, inspected)
+        self.listed = self.listed or [f"{IMAGE}:{IMAGE_TAG}"]
         self._lock = threading.Lock()
-        #: How many invocation supervisors (``Invocation.run``, which is
-        #: what runs on a worker thread of the loop's default executor)
-        #: have been entered and left. Their difference is what
-        #: :func:`no_supervisor_outlives_a_test` asserts away.
+        #: How many step supervisors have been entered and left. Their
+        #: difference is what :func:`no_supervisor_outlives_a_test`
+        #: asserts away.
         self.supervisors_entered = 0
         self.supervisors_left = 0
-        if self.program is None:
-            self.program = json.loads(json.dumps(PROGRAM))
         if self.run_program is None:
-            self.run_program = conforming_program
+            self.run_program = conforming_environment
 
-    # -- the two seam functions ------------------------------------
+    # -- the seams -------------------------------------------------
 
     async def run(self, argv):
-        """The discovery seam: asked from verb handlers, on the loop."""
+        """This server's discovery seam: asked from verb handlers, on the loop."""
         return self.answer(argv)
 
     def answer(self, argv, on_line=None):
-        """The same docker, answered synchronously.
+        """The same runtime, answered synchronously.
 
-        The orchestrator drives a container from a worker thread and its
-        seam is therefore synchronous, while this server's own discovery
-        happens on the event loop and its seam is not. One fake serves
-        both, because they are one docker.
+        The container profile drives a runtime from a worker thread and
+        its seam is therefore synchronous, while this server's own
+        discovery happens on the event loop and its is not. One fake
+        serves both, because they are one runtime.
         """
-        self.calls.append(list(argv))
-        rest = list(argv[1:])
+        argv = list(argv)
+        self.calls.append(argv)
+        rest = argv[1:]
         # A runtime that is not there is not there for every command, not
         # only for `docker version`. Faking it per command would let a
         # test pass against a server that probed once and then assumed.
@@ -364,78 +321,50 @@ class FakeDocker:
         if self.version_status != 0:
             return container.Completed(status=1, output="Cannot connect to the Docker daemon\n")
         if rest[:1] == ["version"]:
-            return container.Completed(status=self.version_status, output="27.0.0\n")
+            return container.Completed(status=self.version_status, output="29.7.2\n")
         if rest[:2] == ["image", "ls"]:
             return container.Completed(status=0, output="\n".join(self.listed) + "\n")
         if rest[:2] == ["image", "inspect"]:
-            references = [item for item in rest[4:]]
-            lines = [
-                json.dumps(self.images[reference])
-                for reference in references
-                if reference in self.images
-            ]
-            status = 0 if len(lines) == len(references) else 1
-            return container.Completed(status=status, output="\n".join(lines))
-        if rest[:1] == ["run"] and rest[-2:-1] == ["cat"]:
-            # §2.2.1's static self-description read. The default fake
-            # image carries none, so the backend falls back to invoking
-            # describe — the path most tests exercise.
-            self.static_reads.append(rest[-1])
-            if self.static_description is None:
-                return container.Completed(status=1, output="")
-            return container.Completed(status=0, output=self.static_description)
-        if rest[:1] == ["run"] and "--rm" in rest:
-            return self._describe(rest)
-        if rest[:1] == ["run"]:
-            identity = f"{len(self.containers):064x}"
-            self.containers.append(identity)
-            # The session's mounts, learned the way the container learns
-            # them. Targets are the same for every session now, so the
-            # only way back to a host file is through this map — which is
-            # exactly the container's own situation.
-            for volume in [rest[i + 1] for i, item in enumerate(rest) if item == "--volume"]:
-                source, target = volume.removesuffix(":ro").split(":")
-                self.mounts[PurePosixPath(target)] = Path(source)
-            return container.Completed(status=0, output=identity + "\n")
+            return self._inspect(rest)
+        if rest[:1] == ["pull"]:
+            return self._pull(rest[-1], on_line)
         if rest[:1] == ["rm"]:
-            # Removing a container ends what was running in it, which is
-            # the whole reason the ladder's last rung is a teardown and
-            # not a signal: killing a `docker exec` client never reached
-            # the process inside. A fake that let a scripted program
-            # outlive its container would make that rung untestable —
-            # and would hang every test that ends a session while a
-            # build is still running, which is most of them.
-            #
-            # The removal is recorded **before** the sweep and under the
-            # lock, so that a program still being started on another
-            # thread finds it: `drive` kills what it registers into a
-            # container that is already gone. Either order of the two
-            # threads therefore ends the program, which is what a real
-            # `docker rm --force` guarantees and what a plain list did
-            # not.
-            with self._lock:
-                self.removed.append(rest[-1])
-                ending = list(self.running)
-                self.running.clear()
-            for process in ending:
-                process.kill()
-            return container.Completed(status=0, output="")
-        raise AssertionError(f"the fake docker was asked something unexpected: {argv}")
+            return self._remove(rest[-1])
+        raise AssertionError(f"the fake runtime was asked something unexpected: {argv}")
 
-    #: The request-document fields that name a directory the program is
-    #: given (§5.2). Everything else that starts with a slash is not a
-    #: path: ``required`` holds JSON pointers, and a ``trees`` entry may
-    #: name a tree that lives in the image and is mounted by nobody.
-    PATH_FIELDS = ("result", "out", "work", "tmp", "context", "events", "cancel")
+    def spawn(self, argv, on_line=None):
+        """The step, which is spawned rather than run.
+
+        It plays the scripted environment synchronously and answers with
+        a handle — the shape a supervisor walks over. The request
+        document is read **through the mounts** the composed ``docker
+        run`` was given: a path no ``--volume`` reaches does not exist
+        inside a real container, and resolving one anyway would let this
+        suite pass over the one defect the layout is about.
+        """
+        argv = list(argv)
+        self.calls.append(argv)
+        assert argv[1] == "run", f"only a step is spawned: {argv}"
+        self.mounts = {}
+        for volume in [argv[i + 1] for i, item in enumerate(argv) if item == "--volume"]:
+            source, target = volume.removesuffix(":ro").rsplit(":", 1)
+            self.mounts[PurePosixPath(target)] = Path(source)
+        identity = argv[argv.index("--name") + 1] if "--name" in argv else f"{len(self.calls):x}"
+        self.containers.append(identity)
+        request = json.loads(self.host(containerbuild.REQUEST_TARGET).read_text("utf-8"))
+        self.invocations.append(
+            Invocation(action=request.get("action", ""), argv=argv, request=request)
+        )
+        process = self.run_program(request, self.host(containerbuild.OUT_TARGET), on_line)
+        with self._lock:
+            self.running.append(process)
+            removed = identity in self.removed
+        if removed:
+            process.kill()
+        return process
 
     def host(self, path: str, *, required: bool = True) -> Path:
-        """*path* as the host spells it, through this container's mounts.
-
-        A path no ``--volume`` reaches does not exist inside a real
-        container, so resolving it anyway would let the suite pass over
-        the one defect this layout is about: a backend naming a directory
-        the container cannot see.
-        """
+        """*path* as the host spells it, through this container's mounts."""
         inside = PurePosixPath(path)
         for target, source in self.mounts.items():
             if inside == target:
@@ -444,60 +373,64 @@ class FakeDocker:
                 return source / inside.relative_to(target)
         if required:
             raise AssertionError(
-                f"{path} is in the request document and no --volume of "
-                f"{sorted(map(str, self.mounts))} mounts it: inside a real container "
-                "that path does not exist"
+                f"{path} is reached by no --volume of {sorted(map(str, self.mounts))}: "
+                "inside a real container that path does not exist"
             )
         return Path(path)
 
-    def host_view(self, document):
-        """The request document as the host can act on it.
+    def _inspect(self, rest: list[str]) -> container.Completed:
+        references = rest[2:]
+        # `docker image inspect --format …` puts the format in front of
+        # the references; the profile's presence check passes none.
+        if references[:1] == ["--format"]:
+            references = references[2:]
+        known = [name for name in references if name in self.images and self._here(name)]
+        lines = [json.dumps(self.images[name]) for name in known]
+        status = 0 if len(known) == len(references) and references else 1
+        return container.Completed(status=status, output="\n".join(lines))
 
-        Every field of :data:`PATH_FIELDS` has to be reachable through a
-        mount; a ``trees`` entry and a shared cache need not be, and are
-        translated only when they are.
+    def _here(self, reference: str) -> bool:
+        return self.present is None or reference in self.present
+
+    def _pull(self, reference: str, on_line) -> container.Completed:
+        """``docker pull <reference>``, as scripted by :attr:`pullable`."""
+        self.pulls.append(reference)
+        relay = on_line if on_line is not None else (lambda _line: None)
+        if reference not in self.pullable:
+            relay(f"Error response from daemon: manifest for {reference} not found")
+            return container.Completed(status=1, output="not found")
+        relay("Status: Downloaded newer image")
+        if self.present is not None:
+            self.present.add(reference)
+        return container.Completed(status=0, output="")
+
+    def _remove(self, identity: str) -> container.Completed:
+        """Removing a container ends what was running in it.
+
+        Which is the whole reason the ladder's last rung is a teardown
+        and not a signal, and what makes it testable at all: a fake that
+        let a scripted step outlive its container would hang every test
+        that ends a session while a build is still running.
         """
-        view = dict(document)
-        for key in self.PATH_FIELDS:
-            if key in view:
-                view[key] = str(self.host(view[key]))
-        if isinstance(view.get("trees"), dict):
-            view["trees"] = {
-                name: {**entry, "path": str(self.host(entry["path"], required=False))}
-                for name, entry in view["trees"].items()
-            }
-        if isinstance(view.get("ccache"), dict):
-            cache = view["ccache"]
-            view["ccache"] = {**cache, "path": str(self.host(cache["path"], required=False))}
-        return view
-
-    def drive(self, argv, on_line=None):
-        """The orchestrator's spawn seam: synchronous, already finished.
-
-        A scripted program runs in the caller's own thread, so the
-        handle it answers with has an exit status from the start and the
-        liveness ladder walks over a process that is done. The tests
-        that are about the ladder script one that is not — in the
-        workbench's own suite, where the ladder lives.
-        """
-        argv = list(argv)
-        self.calls.append(argv)
-        assert argv[1] == "exec", f"only an invocation is spawned: {argv}"
-        request_path = self.host(argv[-1])
-        request = json.loads(request_path.read_text())
-        self.invocations.append(Invocation(action=argv[-2], argv=argv, request=request))
-        process = self.run_program(argv[-2], self.host_view(request), on_line or (lambda _: None))
-        # `docker exec [--user U] <container> <program> <action> <request>`:
-        # the container this program runs in is the fourth from the end,
-        # and it is the only thing that says whether the program is
-        # already over before it was registered.
-        identity = argv[-4]
         with self._lock:
-            self.running.append(process)
-            removed = identity in self.removed
-        if removed:
+            self.removed.append(identity)
+            ending = list(self.running)
+            self.running.clear()
+        for process in ending:
             process.kill()
-        return _Driven(process)
+        return container.Completed(status=0, output="")
+
+    # -- what the suite asserts on -----------------------------------
+
+    @property
+    def step(self) -> list[str]:
+        """The argv of the run that played the last step."""
+        return next(argv for argv in reversed(self.calls) if argv[1:2] == ["run"])
+
+    @property
+    def volumes(self) -> list[str]:
+        """Every ``--volume`` argument of that run."""
+        return [self.step[i + 1] for i, item in enumerate(self.step) if item == "--volume"]
 
     def supervisor_entered(self) -> None:
         with self._lock:
@@ -509,183 +442,62 @@ class FakeDocker:
 
     @property
     def supervising(self) -> int:
-        """How many invocation supervisors are running right now."""
+        """How many step supervisors are running right now."""
         with self._lock:
             return self.supervisors_entered - self.supervisors_left
 
-    async def spawn(self, argv, *, on_line):
-        self.calls.append(list(argv))
-        if argv[1:2] == ["pull"]:
-            return self._pull(argv[-1], on_line)
-        action, request_path = argv[-2], self.host(argv[-1])
-        request = json.loads(request_path.read_text())
-        self.invocations.append(Invocation(action=action, argv=list(argv), request=request))
-        return self.run_program(action, self.host_view(request), on_line)
 
-    def _pull(self, reference: str, on_line) -> FakeProcess:
-        """``docker pull <reference>``, as scripted by :attr:`pullable`.
+class ScriptedRegistry:
+    """A container registry that answers with one image, and counts the asking.
 
-        A pull that succeeds puts the image in :attr:`images` and in
-        :attr:`listed`, which is what makes the second inventory find
-        it — the same two places a real pull would show up in. A pull
-        that is not scripted fails the way an unreachable registry does,
-        with its reason on the log, because that is the case every test
-        of a *missing* image is actually about.
-        """
-        self.pulls.append(reference)
-        inspected = self.pullable.get(reference)
-        if inspected is None:
-            on_line(f"Error response from daemon: manifest for {reference} not found")
-            return FakeProcess(1)
-        on_line(f"{reference.rpartition('@')[2][:12]}: Pulling from somewhere")
-        on_line("Status: Downloaded newer image")
-        tag = inspected["RepoTags"][0]
-        self.images[tag] = inspected
-        self.images[reference] = inspected
-        if tag not in self.listed:
-            self.listed.append(tag)
-        return FakeProcess(0)
+    Choosing an image is the one step of a container build that talks to
+    the network — a registry is asked which tags a repository publishes
+    and what each one's labels say — and a suite whose promise is one
+    second may not.
 
-    # -- the throwaway describe container --------------------------
-
-    def _describe(self, rest: list[str]) -> container.Completed:
-        """``docker run --rm … /mcuhome/run describe <request>``.
-
-        **The request document is read the way a container would have to
-        read it**: only if a ``--volume`` in the composed argv actually
-        makes its path reachable inside the container. The fake used to
-        read it straight off the host filesystem, which made the probe
-        mount invisible to the suite — it could be deleted with every
-        test still green, and a real describe would then find no request
-        document at all.
-        """
-        request = Path(rest[-1])
-        volumes = [rest[index + 1] for index, item in enumerate(rest) if item == "--volume"]
-        targets = [Path(volume.split(":")[1]) for volume in volumes]
-        if not any(target == request or target in request.parents for target in targets):
-            raise AssertionError(
-                f"describe was given {request}, which no --volume of {volumes} mounts: "
-                "inside a real container that path does not exist"
-            )
-        document = json.loads(request.read_text())
-        if self.program is None:
-            return container.Completed(status=self.describe_exit, output="")
-        Path(document["result"]).write_text(
-            json.dumps(
-                {
-                    "result": 1,
-                    "status": "success",
-                    "action": "describe",
-                    "reason": None,
-                    "error": None,
-                    "program": self.program,
-                }
-            )
-        )
-        return container.Completed(status=self.describe_exit, output="")
-
-
-def emit(request: dict[str, Any], name: str, seq: int, **fields: Any) -> None:
-    """Append one contract §8 event to the invocation's events file."""
-    with Path(request["events"]).open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"event": name, "seq": seq, **fields}) + "\n")
-
-
-def write_result(request: dict[str, Any], document: dict[str, Any]) -> None:
-    Path(request["result"]).write_text(json.dumps(document))
-
-
-def manifest_id(request: dict[str, Any]) -> str:
-    """The context id, as a conforming program would compute it.
-
-    Read out of ``manifest.yaml`` rather than recomputed: the fake is
-    standing in for a program that measures the materialized context and
-    arrives at the value the manifest declares, and re-deriving the
-    normative rule in a test fixture is exactly the second
-    implementation ADR 0020 decision 4 exists to prevent.
+    The labels are the whole answer: an image serves a context by
+    declaring exactly the package set it pins (§5.2), so a test moves the
+    *labels* to move the outcome.
     """
-    yaml = YAML(typ="safe", pure=True)
-    data = yaml.load((Path(request["context"]) / "manifest.yaml").read_text())
-    return str(data["id"])
+
+    def __init__(
+        self,
+        *,
+        digest: str = IMAGE_DIGEST,
+        tags: tuple[str, ...] = (IMAGE_TAG,),
+        labels: dict[str, str] | None = None,
+        repositories: dict[str, dict[str, str]] | None = None,
+    ) -> None:
+        self.digest = digest
+        self.tags_ = tags
+        self.labels_ = IMAGE_LABELS if labels is None else labels
+        #: Per-repository labels, for the tests about an allowlist with
+        #: more than one entry in it. A repository not named here answers
+        #: with :attr:`labels_`.
+        self.repositories = repositories or {}
+        self.asked: list[str] = []
+
+    def tags(self, reference):
+        if self.repositories and reference.repository not in self.repositories:
+            from mcuhome.workbench.ociregistry import RegistryError
+
+            raise RegistryError(f"{reference.repository} publishes nothing")
+        return self.tags_
+
+    def facts(self, reference, *, platform=None):
+        del platform  # one architecture is enough for a suite about a protocol
+        self.asked.append(str(reference))
+        labels = self.repositories.get(reference.repository, self.labels_)
+        return ociregistry.ImageFacts(digest=self.digest, labels=dict(labels))
 
 
-def conforming_program(action: str, request: dict[str, Any], on_line) -> FakeProcess:
-    """A build container that does everything contract v1 asks of it."""
-    on_line(f"-- MCUHome {action} starting")
-    emit(request, "invocation.started", 1, action=action)
-    identity = manifest_id(request)
-    emit(request, "context.checked", 2, context=identity)
-    if action == "verify":
-        write_result(
-            request,
-            {
-                "result": 1,
-                "status": "success",
-                "action": "verify",
-                "session": request["session"],
-                "reason": None,
-                "error": None,
-                "context": identity,
-            },
-        )
-        emit(request, "invocation.finished", 3, status="success")
-        return FakeProcess(0)
-
-    out = Path(request["out"])
-    declared = []
-    for name, payload in (
-        ("firmware.hex", b":020000040000FA\n"),
-        ("firmware.bin", b"\x00\x01\x02\x03"),
-        ("build-report.json", json.dumps(BUILD_REPORT).encode()),
-    ):
-        (out / name).write_bytes(payload)
-        declared.append(
-            {
-                "root": "out",
-                "path": name,
-                "role": "report" if name.endswith(".json") else "firmware",
-                "hashes": {"sha256": hashlib.sha256(payload).hexdigest()},
-            }
-        )
-    for index, entry in enumerate(declared, start=3):
-        emit(
-            request,
-            "artifact.collected",
-            index,
-            role=entry["role"],
-            path=entry["path"],
-            size=len(entry["path"]),
-        )
-    on_line("-- build finished")
-    write_result(
-        request,
-        {
-            "result": 1,
-            "status": "success",
-            "action": "build",
-            "session": request["session"],
-            "reason": None,
-            "error": None,
-            "context": identity,
-            # §5.4: an entry "for every patched layer", and no others.
-            # A conforming program reports what it applied, and what it
-            # applied is exactly the set of trees it was handed
-            # writable — §4.1's `writable` is the backend saying "this
-            # is your view to patch in".
-            "layers": {
-                layer: {"patchset": "sha256:" + "e" * 64}
-                for layer, entry in request.get("trees", {}).items()
-                if entry.get("writable")
-            },
-            "artifacts": declared,
-        },
-    )
-    emit(request, "invocation.finished", 6, status="success")
-    return FakeProcess(0)
+# --------------------------------------------------------------------------
+# A conforming build environment
+# --------------------------------------------------------------------------
 
 
-#: The one artifact whose content the contract fixes (§7.2.1), for the
-#: one consumer that needs it: the client that signs detached.
+#: The one artifact whose content the build actions document fixes, for
+#: the one consumer that needs it: the client that signs detached.
 BUILD_REPORT = {
     "report": 1,
     "signing": {
@@ -700,41 +512,148 @@ BUILD_REPORT = {
 }
 
 
+def write_result(request: dict[str, Any], out: Path, document: dict[str, Any]) -> None:
+    """Put one result document where §6.2 says it goes."""
+    name = f"{buildenvsession.RESULT_PREFIX}{request['invocation_id']}"
+    (out / f"{name}{buildenvsession.RESULT_SUFFIX}").write_text(json.dumps(document), "utf-8")
+
+
+def conforming_environment(request: dict[str, Any], out: Path, on_line) -> FakeProcess:
+    """A build environment that does everything the specification asks of it."""
+    relay = on_line if on_line is not None else (lambda _line: None)
+    relay(f"-- MCUHome {request['action']} starting")
+    for name, payload in (
+        ("firmware.hex", b":020000040000FA\n"),
+        ("firmware.bin", b"\x00\x01\x02\x03"),
+        ("build-report.json", json.dumps(BUILD_REPORT).encode()),
+    ):
+        (out / name).write_bytes(payload)
+    relay("-- build finished")
+    write_result(
+        request,
+        out,
+        {
+            "spec_generation": buildenvsession.SPEC_GENERATION,
+            "invocation_id": request["invocation_id"],
+            "status": "success",
+            "message": "",
+            "artifacts": ["build-report.json", "firmware.bin", "firmware.hex"],
+        },
+    )
+    return FakeProcess(0)
+
+
+def failing_environment(request: dict[str, Any], out: Path, on_line) -> FakeProcess:
+    """One that ran and did not produce what it was asked for."""
+    relay = on_line if on_line is not None else (lambda _line: None)
+    relay("-- the compiler said no")
+    write_result(
+        request,
+        out,
+        {
+            "spec_generation": buildenvsession.SPEC_GENERATION,
+            "invocation_id": request["invocation_id"],
+            "status": "failure",
+            "message": "the build failed",
+            "artifacts": [],
+        },
+    )
+    return FakeProcess(1)
+
+
+def silent_environment(request: dict[str, Any], out: Path, on_line) -> FakeProcess:
+    """One that ends without writing a result document at all."""
+    del request, out, on_line
+    return FakeProcess(1)
+
+
+def hanging_environment(request: dict[str, Any], out: Path, on_line) -> FakeProcess:
+    """One that never ends by itself, so a ladder has something to walk."""
+    del request, out, on_line
+    return FakeProcess(0, hang=True)
+
+
 @pytest.fixture(autouse=True)
 def docker(monkeypatch) -> FakeDocker:
-    """Docker, stubbed at **every** seam, for every test in this suite.
+    """The container runtime, stubbed at **every** seam, for every test.
 
-    Four of them, because two different things drive one docker: this
+    Three of them, because two different things drive one runtime: this
     server's own discovery (asynchronous, on the event loop) and the
-    orchestrator's driving of a container (synchronous, in a worker
-    thread). A suite that stubbed only its own would have the
-    orchestrator start real containers — which is exactly the defect
-    this fixture exists against, one layer further down than it used to
-    be.
+    workbench container profile's driving of a step (synchronous, in a
+    worker thread). A suite that stubbed only its own would have the
+    profile start real containers.
     """
     fake = FakeDocker()
     monkeypatch.setattr(container, "run_docker", fake.run)
-    monkeypatch.setattr(container, "spawn_docker", fake.spawn)
-    monkeypatch.setattr(orchestrator, "_run_command", fake.answer)
-    monkeypatch.setattr(orchestrator, "_spawn_command", fake.drive)
+    monkeypatch.setattr(containerbuild, "run_command", fake.answer)
+    monkeypatch.setattr(containerbuild, "spawn_process", _spawner(fake))
 
-    # And a fifth seam, which fakes nothing: `Invocation.run` is what the
-    # backend hands to `asyncio.to_thread`, so entering and leaving it
-    # is exactly "a worker thread of the loop's default executor is
+    # And a fourth seam, which fakes nothing: `Step.run` is what the
+    # backend hands to `asyncio.to_thread`, so entering and leaving it is
+    # exactly "a worker thread of the loop's default executor is
     # supervising a build". Counting it is the only way a test can see
     # that thread at all — a pool thread stays alive between work items,
     # so `threading.enumerate` cannot tell a busy one from an idle one.
-    supervise = orchestrator.Invocation.run
+    supervise = buildenvsession.Step.run
 
-    def counted(invocation, **kwargs):
+    def counted(step, **kwargs):
         fake.supervisor_entered()
         try:
-            return supervise(invocation, **kwargs)
+            return supervise(step, **kwargs)
         finally:
             fake.supervisor_left()
 
-    monkeypatch.setattr(orchestrator.Invocation, "run", counted)
+    monkeypatch.setattr(buildenvsession.Step, "run", counted)
     return fake
+
+
+def _spawner(fake: FakeDocker):
+    """``spawn_process``' keyword shape over the fake's positional one."""
+
+    def spawn(argv, *, env=None, cwd=None, on_line=None):
+        del env, cwd
+        return fake.spawn(argv, on_line)
+
+    return spawn
+
+
+@pytest.fixture(autouse=True)
+def registry(monkeypatch) -> ScriptedRegistry:
+    """No test of this suite reaches a container registry.
+
+    The same safety net as :func:`docker` and for the same reason:
+    resolving a build environment goes over HTTPS, and a test that forgot
+    to stub it would quietly depend on ghcr.io being up and on what is
+    published there today.
+    """
+    scripted = ScriptedRegistry()
+    monkeypatch.setattr(ociregistry.Registry, "tags", scripted.tags)
+    monkeypatch.setattr(ociregistry.Registry, "facts", scripted.facts)
+    return scripted
+
+
+@pytest.fixture(autouse=True)
+def no_package_registry(monkeypatch):
+    """And none reaches the package registry either.
+
+    A build server resolves the packages a context pins out of its
+    operator's own directories first and falls through to
+    ``packages.mcuhome.org`` behind them. Every test that means to
+    succeed writes what it pins into the configured package directory,
+    so the fall-through is the path of a test about **not** finding
+    something — and it answers the way an unreachable registry does,
+    which is what the server's own refusal is built on.
+    """
+
+    from mcuhome.workbench import packageregistry
+
+    def refuse(*_args, **_kwargs):
+        raise packageregistry.PackageRegistryError(
+            "no package registry is reachable from this suite",
+            hint="write what a context pins into the configured package directory",
+        )
+
+    monkeypatch.setattr(packageregistry, "registry_for", refuse)
 
 
 @pytest.fixture(autouse=True)
@@ -768,12 +687,55 @@ def write_sdk_package(directory: Path, version: str, *, entries: dict[str, bytes
     Returns its SHA-256, which is what a context has to pin: the name
     only makes a candidate findable, and the bytes are what make it the
     package.
+
+    The index of the two **environment** packages goes in beside it
+    (:func:`write_package_index`), because a context pins those by name
+    and hash and the tools entry is a family: resolving it to this host's
+    concrete package is what an index is for, and a directory without one
+    would send the resolution to the registry this suite forbids.
     """
     directory.mkdir(parents=True, exist_ok=True)
     archive = make_archive(entries or {"mcuhome/__init__.py": b"# the SDK\n"})
     path = directory / f"mcuhome-sdk-{version}.tar.zst"
     path.write_bytes(archive)
+    write_package_index(directory)
     return hashlib.sha256(archive).hexdigest()
+
+
+def write_package_index(directory: Path) -> None:
+    """The index that says what this suite's environment packages are.
+
+    Only the two environment packages, and deliberately not the SDK: the
+    SDK is found by its conventional filename, and an index that named it
+    would have to state its hash, which every test that writes one picks
+    itself. One document, one job.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    packages = {}
+    for name, digest in ((WORKSPACE_PACKAGE, WORKSPACE_SHA256), (TOOLS_PACKAGE, TOOLS_SHA256)):
+        filename = f"{name}-{ENVIRONMENT_VERSION}.tar.zst"
+        (directory / filename).write_bytes(f"{name} {ENVIRONMENT_VERSION}\n".encode())
+        packages[name] = {
+            ENVIRONMENT_VERSION: {
+                "file": filename,
+                "sha256": digest,
+                "size": len(f"{name} {ENVIRONMENT_VERSION}\n"),
+            }
+        }
+    (directory / "index.json").write_text(json.dumps({"packages": packages}), encoding="utf-8")
+
+
+@pytest.fixture
+def package_source(config: Config) -> Path:
+    """The operator's package directory, with the environment index in it.
+
+    Every test that reaches image selection needs it, because that is
+    where the tools family is resolved to a concrete package. Tests that
+    also need an SDK package add one with :func:`write_sdk_package`.
+    """
+    directory = config.sdk_sources[0]
+    write_package_index(directory)
+    return directory
 
 
 def context_yaml(
@@ -962,30 +924,17 @@ def base_context(**files: bytes) -> bytes:
     )
 
 
-#: Why a test that needs a finished remote build does not run today.
-#:
-#: The server selects a container by the image a build context names, and
-#: a context now names its build environment as **packages** instead. Until
-#: the server runs package-built build environments there is no image for
-#: it to start, so ``send-context`` answers a typed refusal and every verb
-#: behind it is unreachable.
-#:
-#: The tests this skips are not obsolete — they are the acceptance tests of
-#: that work, kept running-ready and counted here so the debt is visible in
-#: every suite run rather than deleted and rediscovered later.
-REMOTE_BUILDS_UNAVAILABLE = (
-    "remote builds unavailable until the server runs package-built build environments"
-)
-
-#: The typed code the refusal comes back under.
+#: The typed code a refusal to serve a context comes back under.
 BUILDER_UNSATISFIABLE = "version.builder-unsatisfiable"
 
+#: And the one an image from a repository this operator does not allow
+#: comes back under.
+ENVIRONMENT_DENIED = "policy.environment-denied"
 
-def refuses_to_select_an_environment(frame: dict) -> bool:
-    """Whether *frame* is the server saying it cannot pick a build environment."""
-    return (
-        frame.get("type") == "error" and frame.get("error", {}).get("code") == BUILDER_UNSATISFIABLE
-    )
+
+def refused_with(frame: dict, code: str) -> bool:
+    """Whether *frame* is this server refusing with *code*."""
+    return frame.get("type") == "error" and frame.get("error", {}).get("code") == code
 
 
 async def send_archive(
@@ -995,7 +944,6 @@ async def send_archive(
     archive: bytes,
     *,
     seen: list | None = None,
-    allow_refusal: bool = False,
     **payload,
 ) -> dict:
     """Announce *archive*, push it as binary frames, return the answer.
@@ -1009,13 +957,6 @@ async def send_archive(
     *seen* collects every frame read on the way, for the tests that are
     about what arrives **while** a verb is still in flight rather than
     about its answer.
-
-    **A refusal to select a build environment skips the calling test**
-    (:data:`REMOTE_BUILDS_UNAVAILABLE`), unless *allow_refusal* says the
-    test is about that refusal. It is done here rather than at each call
-    site because the refusal arrives at exactly one place — the answer to
-    ``send-context`` — and one reason in one place is what makes the skip
-    count mean something.
     """
     frame_id = f"u-{verb}"
     await ws.send_json(
@@ -1036,6 +977,4 @@ async def send_archive(
         if seen is not None:
             seen.append(frame)
         if frame.get("id") == frame_id:
-            if not allow_refusal and refuses_to_select_an_environment(frame):
-                pytest.skip(REMOTE_BUILDS_UNAVAILABLE)
             return frame

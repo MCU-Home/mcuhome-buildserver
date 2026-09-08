@@ -24,25 +24,30 @@ from mcuhome.buildserver.app import ServerState, create_app
 from mcuhome.buildserver.config import Config
 from tests.python.conftest import (
     BUILD_CONTEXT_BYTES,
+    BUILDER_UNSATISFIABLE,
     CONTEXT_YAML,
     ENVIRONMENT,
     ENVIRONMENT_VERSION,
+    GENERATOR_CONSTRAINT,
     IMAGE,
+    IMAGE_DIGEST,
     IMAGE_LABELS,
     IMAGE_REFERENCE,
-    IMAGE_REFERENCE_FORMAT3,
-    REMOTE_BUILDS_UNAVAILABLE,
+    IMAGE_RUNNABLE,
+    IMAGE_TAG,
     TOOLS_PACKAGE,
     TOOLS_SHA256,
     WORKSPACE_PACKAGE,
     WORKSPACE_SHA256,
+    ZEPHYR_VERSION,
     auth,
     base_context,
     call,
     context_yaml,
+    environment_labels,
     make_archive,
     make_archive_from,
-    refuses_to_select_an_environment,
+    refused_with,
     send_archive,
 )
 
@@ -68,7 +73,9 @@ async def serve(aiohttp_client, config: Config, **overrides):
 # --------------------------------------------------------------------------
 
 
-async def test_send_context_accepts_a_base_context_and_answers_its_pins(client) -> None:
+async def test_send_context_accepts_a_base_context_and_answers_its_pins(
+    client, package_source
+) -> None:
     """The happy path, and the shape of the answer.
 
     ADR 0019 §2 spells ``send-context(archive)`` and that one word is the
@@ -98,20 +105,17 @@ async def test_send_context_accepts_a_base_context_and_answers_its_pins(client) 
     assert body["pins"]["target"] == {"board": "nrf7002dk/nrf5340/cpuapp"}
 
 
-async def test_send_context_answers_the_serving_container(client) -> None:
-    """ADR 0019's amendment gives ``send-context`` the container half of
-    the discovery payload — the serving build container's contract
-    version and its command set — because only the context determines
-    it: the requirement arrives with the pins, and ``open-session``
-    therefore cannot answer it truthfully.
+async def test_send_context_answers_the_serving_container(client, package_source) -> None:
+    """``send-context`` carries the container half of the discovery payload
+    because only the context determines it: the requirement arrives with
+    the pins, and ``open-session`` therefore cannot answer it truthfully.
 
-    Since E61 the block is a **resolution**: the context named no image,
-    so ``image``, ``tag`` and ``digest`` are what this server chose for
-    the Zephyr line it was asked for, and they are the same three names
-    ``manifest.yaml`` will carry. The rest comes from ``describe`` rather
-    than from the image labels — ``describe`` is authoritative about what
-    a program can do; the labels are a pre-start hint the backend
-    cross-checks against it and must not rely on where the two disagree.
+    The block is a **resolution**, not an echo: the context names no
+    image at all, only the package set it needs, so what comes back is
+    the image this server found by matching that set against a
+    candidate's ``packages.`` labels (build environment specification
+    §5.2) — its digest, its declaration, and the one action this server
+    ever starts a container for.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
@@ -119,41 +123,42 @@ async def test_send_context_answers_the_serving_container(client) -> None:
 
     assert set(frame["payload"]) == {"session_id", "context", "pins", "container"}
     serving = frame["payload"]["container"]
-    # the serving container is this server's answer, not the context's (reference with digest)
-    # The server normalizes to just repository@digest, the digest is what identifies the image
-    assert serving["build_environment"] == f"ghcr.io/mcu-home/build-container@sha256:{'b' * 64}"
-    assert serving["contract"] == 1
-    assert serving["program"] == "org.mcuhome.build-container"
-    assert serving["actions"] == ["describe", "verify", "build"]
-
-
-async def test_an_image_this_host_lacks_is_fetched(client, docker) -> None:
-    """A missing image is a fetch, not a refusal — the pin decided which bytes.
-
-    The reference is pinned to a digest by the time it reaches the
-    runtime, so exactly one set of bytes answers to it and fetching them
-    settles nothing that was not already settled. What *may* be fetched
-    at all is the allowlist's answer and is not this switch's business.
-    """
-    fetched = {
-        "Id": "sha256:" + "f" * 64,
-        "RepoTags": [f"{IMAGE}:zephyr-4.4.0-r10"],
-        "RepoDigests": [IMAGE_REFERENCE],
-        "Config": {"Labels": dict(IMAGE_LABELS)},
+    # The full explicit form — repository, tag and digest — because the
+    # tag stays as documentation of where the digest was found, even
+    # though what runs and what is recorded is the digest alone.
+    assert serving["build_environment"] == IMAGE_REFERENCE
+    assert serving["digest"] == IMAGE_DIGEST
+    assert serving["spec_generation"] == "3"
+    assert serving["zephyr_version"] == ZEPHYR_VERSION
+    assert serving["generator_constraint"] == GENERATOR_CONSTRAINT
+    assert serving["packages"] == {
+        WORKSPACE_PACKAGE: f"{ENVIRONMENT_VERSION}@sha256:{WORKSPACE_SHA256}",
+        TOOLS_PACKAGE: f"{ENVIRONMENT_VERSION}@sha256:{TOOLS_SHA256}",
     }
+    assert serving["actions"] == ["build"]
+
+
+async def test_an_image_this_host_lacks_is_fetched(client, docker, package_source) -> None:
+    """A missing image is a fetch, not a refusal — the labels already decided which bytes.
+
+    The image was found by a registry read, addressed to the runtime by
+    the digest of the manifest whose labels were just checked, so
+    fetching it settles nothing that was not already settled. What *may*
+    be fetched at all is the allowlist's answer and is not this switch's
+    business.
+    """
     docker.images.clear()
-    docker.listed = []
-    docker.pullable[IMAGE_REFERENCE_FORMAT3] = fetched
+    docker.pullable.add(IMAGE_RUNNABLE)
 
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         frame = await send_archive(ws, "send-context", session_id, base_context())
 
     assert frame["type"] == "result", frame
-    assert docker.pulls == [IMAGE_REFERENCE_FORMAT3]
+    assert docker.pulls == [IMAGE_RUNNABLE]
 
 
-async def test_the_client_watches_the_fetch_happen(client, docker) -> None:
+async def test_the_client_watches_the_fetch_happen(client, docker, package_source) -> None:
     """A 1.3 GB download is not something to do behind a silent command frame.
 
     Docker's own layer counts are the progress report, relayed verbatim
@@ -161,13 +166,7 @@ async def test_the_client_watches_the_fetch_happen(client, docker) -> None:
     flight.
     """
     docker.images.clear()
-    docker.listed = []
-    docker.pullable[IMAGE_REFERENCE_FORMAT3] = {
-        "Id": "sha256:" + "f" * 64,
-        "RepoTags": [f"{IMAGE}:zephyr-4.4.0-r10"],
-        "RepoDigests": [IMAGE_REFERENCE],
-        "Config": {"Labels": dict(IMAGE_LABELS)},
-    }
+    docker.pullable.add(IMAGE_RUNNABLE)
     frames: list[dict] = []
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
@@ -180,78 +179,81 @@ async def test_the_client_watches_the_fetch_happen(client, docker) -> None:
     assert answer["type"] == "result", answer
 
 
-async def test_a_fetch_that_fails_is_retryable_and_says_so(client, docker) -> None:
-    """No network, a registry wanting a login, a digest nothing answers to.
+async def test_a_locally_present_image_under_another_digest_still_needs_fetching(
+    client, docker, package_source
+) -> None:
+    """Presence is checked by digest, never by the tag a candidate was found under.
 
-    All of them come back, which is what ``retryable`` promises — and
-    the reason itself was already on the client's screen, because the
-    pull's own output was relayed while it happened.
+    A host that happens to hold some other build of the same repository
+    and tag has not thereby got the bytes the labels just proved to be
+    the wanted set — an image is matched by digest alone, and the
+    runtime is asked about exactly that digest.
     """
     docker.images.clear()
-    docker.listed = []
+    docker.images[f"{IMAGE}:{IMAGE_TAG}"] = {
+        "Id": "sha256:" + "d" * 64,
+        "RepoTags": [f"{IMAGE}:{IMAGE_TAG}"],
+        "RepoDigests": [f"{IMAGE}@sha256:{'e' * 64}"],
+        "Config": {"Labels": dict(IMAGE_LABELS)},
+    }
+    docker.pullable.add(IMAGE_RUNNABLE)
+
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         frame = await send_archive(ws, "send-context", session_id, base_context())
 
-    error = frame["error"]
-    assert error["code"] == "version.builder-unfetchable"
-    assert error["retryable"] is True
-    assert error["details"]["required"] == IMAGE_REFERENCE_FORMAT3
+    assert frame["type"] == "result", frame
+    assert docker.pulls == [IMAGE_RUNNABLE]
 
 
 async def test_a_server_that_does_not_fetch_refuses_without_trying(
-    aiohttp_client, config, docker
+    aiohttp_client, config, docker, package_source
 ) -> None:
     """``--no-auto-pull``: the images here are placed by an operator.
 
     Not retryable, because nothing about waiting changes an operator's
-    standing decision — and the refusal names what this host *does*
-    have, so the answer is actionable rather than only negative.
+    standing decision — and the refusal names the environment that was
+    found and not fetched, so the answer is actionable rather than only
+    negative.
     """
     docker.images.clear()
-    docker.listed = []
     client, _state = await serve(aiohttp_client, config, auto_pull=False)
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         frame = await send_archive(ws, "send-context", session_id, base_context())
 
     error = frame["error"]
-    assert error["code"] == "version.builder-unsatisfiable"
+    assert error["code"] == BUILDER_UNSATISFIABLE
     assert error["retryable"] is False
-    assert error["details"]["required"] == IMAGE_REFERENCE_FORMAT3
-    assert error["details"]["available"] == []
+    assert error["details"]["environment"] == IMAGE_REFERENCE
+    assert error["details"]["digest"] == IMAGE_DIGEST
     assert docker.pulls == []
 
 
-async def test_another_release_of_the_same_repository_is_not_a_substitute(
-    aiohttp_client, config, docker
+async def test_a_registry_with_no_matching_image_is_refused(
+    client, registry, package_source
 ) -> None:
-    """The digest is the identity, so a neighbouring release does not answer for it.
+    """No candidate anywhere declares the package set this context pins.
 
-    The refusal names both sides: the reference the client pinned, and
-    what this host actually has — which is the useful pair, because a
-    client can act on the second.
+    The labels are the whole match: an image built from the same
+    versions but other bytes is a different environment and is never a
+    fallback, so a repository that publishes only that near miss is the
+    same refusal as a repository with nothing in it at all. The
+    ``problem`` detail is what tells this refusal apart from one caused
+    by the packages themselves being unresolvable — the labels, and
+    nothing about the operator's package directory, are what is under
+    test here.
     """
-    other_digest = "sha256:" + "e" * 64
-    other_reference = f"{IMAGE}:zephyr-4.4.2-r1"
-    docker.images.clear()
-    docker.images[other_reference] = {
-        "Id": "sha256:" + "d" * 64,
-        "RepoTags": [other_reference],
-        "RepoDigests": [f"{IMAGE}@{other_digest}"],
-        "Config": {"Labels": dict(IMAGE_LABELS)},
-    }
-    docker.listed = [other_reference]
+    registry.labels_ = environment_labels(workspace=f"9.9.9@sha256:{'1' * 64}")
 
-    client, _state = await serve(aiohttp_client, config, auto_pull=False)
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         frame = await send_archive(ws, "send-context", session_id, base_context())
 
-    error = frame["error"]
-    assert error["code"] == "version.builder-unsatisfiable"
-    assert error["details"]["required"] == IMAGE_REFERENCE_FORMAT3
-    assert error["details"]["available"] == [other_reference]
+    assert refused_with(frame, BUILDER_UNSATISFIABLE)
+    assert frame["error"]["details"]["required"] == ENVIRONMENT.described()
+    assert frame["error"]["details"]["allowed"] == [IMAGE]
+    assert "declares" in frame["error"]["details"]["problem"], frame["error"]["details"]
 
 
 async def test_a_container_runtime_that_is_down_is_retryable(client, docker) -> None:
@@ -273,7 +275,9 @@ async def test_a_container_runtime_that_is_down_is_retryable(client, docker) -> 
     assert error["retryable"] is True
 
 
-async def test_the_context_lands_in_a_directory_the_server_owns(client, state) -> None:
+async def test_the_context_lands_in_a_directory_the_server_owns(
+    client, state, package_source
+) -> None:
     """ "Into a per-session directory the server owns" (decision 8).
 
     Named by session id under the configured context root, and not
@@ -294,7 +298,9 @@ async def test_the_context_lands_in_a_directory_the_server_owns(client, state) -
     assert paths.root.stat().st_mode & 0o077 == 0
 
 
-async def test_a_second_base_context_is_refused_rather_than_replacing_the_pins(client) -> None:
+async def test_a_second_base_context_is_refused_rather_than_replacing_the_pins(
+    client, package_source
+) -> None:
     """E43: ``context.exists``, and the message says which verb was meant.
 
     Not ``context.locked`` — nothing is frozen yet — and not a silent
@@ -587,7 +593,7 @@ def _decompressed(archive: bytes) -> int:
     ["compressed size", "cumulative decompressed size", "entry count", "disk quota"],
 )
 async def test_every_budget_counts_across_the_base_context_and_its_extensions(
-    aiohttp_client, config, budget
+    aiohttp_client, config, budget, package_source
 ) -> None:
     """E44: cumulative, because ``extend-context`` is repeatable.
 
@@ -710,7 +716,9 @@ async def test_unsafe_entries_are_refused_by_shape(client, what, archive_entries
     assert frame["error"]["code"] == "context.unsafe-entry", what
 
 
-async def test_a_refused_upload_leaves_the_session_exactly_as_it_was(client, state) -> None:
+async def test_a_refused_upload_leaves_the_session_exactly_as_it_was(
+    client, state, package_source
+) -> None:
     """Bytes discarded, directory gone, session standing.
 
     A context is one artifact and half of one has no meaning, so a
@@ -735,7 +743,7 @@ async def test_a_refused_upload_leaves_the_session_exactly_as_it_was(client, sta
     assert accepted["type"] == "result"
 
 
-async def test_the_archives_own_mode_bits_are_discarded(client, state) -> None:
+async def test_the_archives_own_mode_bits_are_discarded(client, state, package_source) -> None:
     """A mode is not context content.
 
     Nothing in the format or the contract reads one, so honouring it
@@ -789,7 +797,9 @@ async def test_a_denied_patch_layer_fails_the_whole_send(client, state) -> None:
     assert session.context_state == sessions.CONTEXT_NONE
 
 
-async def test_an_allowed_layer_passes_and_the_patch_lands(aiohttp_client, config) -> None:
+async def test_an_allowed_layer_passes_and_the_patch_lands(
+    aiohttp_client, config, package_source
+) -> None:
     """The other half of the same rule, so "denied" is not just "broken"."""
     client, state = await serve(aiohttp_client, config, allowed_patch_layers=("zephyr",))
     archive = base_context(**{"patches/zephyr/0001-fix.patch": PATCH})
@@ -803,7 +813,9 @@ async def test_an_allowed_layer_passes_and_the_patch_lands(aiohttp_client, confi
     assert (paths.context / "patches/zephyr/0001-fix.patch").read_bytes() == PATCH
 
 
-async def test_mcuboot_is_a_layer_an_operator_can_allow(aiohttp_client, config) -> None:
+async def test_mcuboot_is_a_layer_an_operator_can_allow(
+    aiohttp_client, config, package_source
+) -> None:
     """Contract §1.1 names four layers and this server knew three.
 
     ``mcuboot`` is a layer because every device build is ``west build
@@ -819,7 +831,7 @@ async def test_mcuboot_is_a_layer_an_operator_can_allow(aiohttp_client, config) 
 
 
 async def test_a_third_party_layer_needs_its_x_prefix_and_the_config(
-    aiohttp_client, config
+    aiohttp_client, config, package_source
 ) -> None:
     """ "Third-party layer names MUST carry an ``x-`` prefix" (§1.1).
 
@@ -968,6 +980,32 @@ async def test_a_context_yaml_the_format_does_not_describe_is_refused(
     assert frame["error"]["code"] == "bad_request", what
 
 
+async def test_a_developer_context_is_refused_before_its_pins_are_read(client) -> None:
+    """``build_environment: developer`` names no package a build server could deliver.
+
+    A developer build compiles a workspace somebody maintains themselves
+    — a checkout, that checkout's own manifest repository as the SDK, and
+    whatever tools are on that person's own machine — so none of the
+    three was ever published and the context carries no name, version or
+    hash for any of them. The empty ``mcuhome.version`` and
+    ``mcuhome.package.sha256`` that travel alongside the word are that
+    statement, and the refusal fires on the word itself, before either
+    empty field is ever read as a pin: reading them one at a time would
+    report an empty version string, which is true and explains nothing
+    about what is actually wrong.
+    """
+    document = context_yaml(sdk_sha256="''", version="''", build_environment="developer")
+    archive = make_archive({"context.yaml": document})
+    async with client.ws_connect("/ws", headers=auth()) as ws:
+        session_id = await open_session(ws)
+        frame = await send_archive(ws, "send-context", session_id, archive)
+
+    assert refused_with(frame, BUILDER_UNSATISFIABLE)
+    message = frame["error"]["message"]
+    assert message.startswith("A developer build cannot be built remotely.")
+    assert any(line.startswith("Fix:") for line in message.splitlines())
+
+
 async def test_an_oversize_context_yaml_is_an_ingress_refusal(client) -> None:
     """A pin document is a few hundred bytes; a cap of its own says so.
 
@@ -985,7 +1023,9 @@ async def test_an_oversize_context_yaml_is_an_ingress_refusal(client) -> None:
     assert frame["error"]["details"]["limit"] == 64 * 1024, "the default, which the README states"
 
 
-async def test_the_context_yaml_bound_is_the_operators_number(aiohttp_client, config) -> None:
+async def test_the_context_yaml_bound_is_the_operators_number(
+    aiohttp_client, config, package_source
+) -> None:
     """The sixth cap is configuration like the other six.
 
     It was a constant in the module that enforces it, attributed to a
@@ -1013,7 +1053,7 @@ async def test_the_context_yaml_bound_is_the_operators_number(aiohttp_client, co
 
 
 async def test_the_context_format_is_the_one_the_session_was_admitted_on(
-    aiohttp_client, config, monkeypatch
+    aiohttp_client, config, monkeypatch, package_source
 ) -> None:
     """ "The format is negotiated at open-session and not re-negotiated here."
 
@@ -1072,7 +1112,7 @@ async def test_the_context_format_is_the_one_the_session_was_admitted_on(
 # --------------------------------------------------------------------------
 
 
-async def test_extend_context_adds_and_overwrites_by_path(client, state) -> None:
+async def test_extend_context_adds_and_overwrites_by_path(client, state, package_source) -> None:
     """ "Per-layer replace semantics (add / overwrite / remove)."
 
     Replace means by path: an extension names files, and a file it names
@@ -1099,7 +1139,9 @@ async def test_extend_context_adds_and_overwrites_by_path(client, state) -> None
     assert (paths.context / "keys/signing.pub").read_bytes() == b"key"
 
 
-async def test_extend_context_removes_and_says_how_many_existed(client, state) -> None:
+async def test_extend_context_removes_and_says_how_many_existed(
+    client, state, package_source
+) -> None:
     """Removing something that is not there is not an error.
 
     The client asked for a state and that state holds — the rule
@@ -1129,7 +1171,9 @@ async def test_extend_context_removes_and_says_how_many_existed(client, state) -
     assert not (paths.context / "keys").exists(), "an emptied directory goes with its last file"
 
 
-async def test_an_extension_that_removes_and_adds_the_same_path_keeps_the_new_one(client, state):
+async def test_an_extension_that_removes_and_adds_the_same_path_keeps_the_new_one(
+    client, state, package_source
+):
     """Order within one call: removals first, then the archive.
 
     Settled nowhere, determined here. The archive is the positive
@@ -1156,7 +1200,7 @@ async def test_an_extension_that_removes_and_adds_the_same_path_keeps_the_new_on
 
 
 @pytest.mark.parametrize("how", ["archive", "remove"])
-async def test_an_extension_may_not_touch_context_yaml(client, how) -> None:
+async def test_an_extension_may_not_touch_context_yaml(client, how, package_source) -> None:
     """``context.pins-immutable``, in both directions.
 
     ADR 0018 requires "an attempt is a typed error" and names this code;
@@ -1184,7 +1228,9 @@ async def test_an_extension_may_not_touch_context_yaml(client, how) -> None:
 
 
 @pytest.mark.parametrize("how", ["archive", "remove"])
-async def test_an_extension_may_not_touch_the_generator_declaration(client, how) -> None:
+async def test_an_extension_may_not_touch_the_generator_declaration(
+    client, how, package_source
+) -> None:
     """Same code as ``context.yaml``, and for the same reason.
 
     The generator declaration is what the build environment's constraint
@@ -1213,7 +1259,7 @@ async def test_an_extension_may_not_touch_the_generator_declaration(client, how)
     assert frame["error"]["code"] == "context.pins-immutable"
 
 
-async def test_an_extension_that_changes_nothing_is_refused(client) -> None:
+async def test_an_extension_that_changes_nothing_is_refused(client, package_source) -> None:
     """A client that sent it meant something.
 
     Both halves are optional and at least one is required, so "nothing
@@ -1227,7 +1273,9 @@ async def test_an_extension_that_changes_nothing_is_refused(client) -> None:
     assert frame["error"]["code"] == "bad_request"
 
 
-async def test_a_refused_extension_leaves_the_context_byte_for_byte(client, state) -> None:
+async def test_a_refused_extension_leaves_the_context_byte_for_byte(
+    client, state, package_source
+) -> None:
     """Nothing is applied until everything is accepted.
 
     The archive is unpacked into a staging directory beside the context
@@ -1258,7 +1306,9 @@ async def test_a_refused_extension_leaves_the_context_byte_for_byte(client, stat
     assert not paths.spool.exists()
 
 
-async def test_the_upload_spool_is_deleted_before_the_verb_answers(client, state) -> None:
+async def test_the_upload_spool_is_deleted_before_the_verb_answers(
+    client, state, package_source
+) -> None:
     """The spooled tar is transient, and the ledger relies on it.
 
     The per-session disk quota deliberately does not meter the spool —
@@ -1285,7 +1335,7 @@ async def test_the_upload_spool_is_deleted_before_the_verb_answers(client, state
         assert not paths.spool.exists(), "after extend-context"
 
 
-async def test_a_refused_extension_gives_the_disk_meter_back(client, state) -> None:
+async def test_a_refused_extension_gives_the_disk_meter_back(client, state, package_source) -> None:
     """The staged bytes were charged and are being thrown away.
 
     The meter moves in three places — an unpack charges, a removal
@@ -1353,7 +1403,9 @@ async def test_extend_context_before_a_base_context_is_refused(client) -> None:
     assert frame["error"]["code"] == "context.missing"
 
 
-async def test_an_extension_re_runs_policy_over_the_files_present(aiohttp_client, config) -> None:
+async def test_an_extension_re_runs_policy_over_the_files_present(
+    aiohttp_client, config, package_source
+) -> None:
     """ "After every extension the server re-derives the patch-layer set
     from the files *actually present* and re-runs policy."
 
@@ -1378,7 +1430,7 @@ async def test_an_extension_re_runs_policy_over_the_files_present(aiohttp_client
     assert not (paths.context / "patches/chip").exists()
 
 
-async def test_two_uploads_cannot_run_on_one_connection_at_once(client) -> None:
+async def test_two_uploads_cannot_run_on_one_connection_at_once(client, package_source) -> None:
     """Binary frames carry no id, so they belong to the upload that runs.
 
     One at a time per connection is the wire's own shape rather than a
@@ -1417,12 +1469,10 @@ async def test_two_uploads_cannot_run_on_one_connection_at_once(client) -> None:
     # either way, and it is what this test is named after.
     assert refused["type"] == "error"
     assert "already in progress on this connection" in refused["error"]["message"]
-    if refuses_to_select_an_environment(accepted):
-        pytest.skip(REMOTE_BUILDS_UNAVAILABLE)
     assert accepted["type"] == "result", accepted
 
 
-async def test_two_context_commands_on_one_session_do_not_race(client) -> None:
+async def test_two_context_commands_on_one_session_do_not_race(client, package_source) -> None:
     """One context command at a time, per session.
 
     They share one directory, one ledger and one spool file. Two at once
@@ -1458,8 +1508,6 @@ async def test_two_context_commands_on_one_session_do_not_race(client) -> None:
     # The rule itself — one context command at a time — holds either way,
     # and it is what this test is named after.
     assert "already running in session" in refused["error"]["message"]
-    if refuses_to_select_an_environment(accepted):
-        pytest.skip(REMOTE_BUILDS_UNAVAILABLE)
     assert accepted["type"] == "result", accepted
 
 
@@ -1476,7 +1524,9 @@ async def test_two_context_commands_on_one_session_do_not_race(client) -> None:
         ("outside the whitelisted subtrees", "evil.sh"),
     ],
 )
-async def test_a_removal_path_is_validated_like_an_archive_entry(client, state, what, path) -> None:
+async def test_a_removal_path_is_validated_like_an_archive_entry(
+    client, state, what, path, package_source
+) -> None:
     """``_apply_removals`` unlinks whatever it is handed, so the guard is
     everything: ``target = context / path`` followed by ``target.unlink()``
     turns an unchecked string into arbitrary file deletion.
@@ -1545,7 +1595,7 @@ async def test_one_archive_may_not_claim_a_path_as_both_kinds(client, state, wha
 
 
 async def test_an_extension_may_not_put_a_file_where_the_context_has_a_directory(
-    client, state
+    client, state, package_source
 ) -> None:
     """The same collision across the two halves of one context.
 
@@ -1600,7 +1650,9 @@ def test_the_merge_never_re_parents_a_staged_file(tmp_path: Path) -> None:
     assert (context / "model/a/b.json").read_bytes() == MODEL
 
 
-async def test_an_extension_may_put_a_file_where_a_removal_makes_room(client, state) -> None:
+async def test_an_extension_may_put_a_file_where_a_removal_makes_room(
+    client, state, package_source
+) -> None:
     """The other half of the rule, so "refused" is not just "broken".
 
     Removals run before the archive, so a client that removes ``model/a``
@@ -1627,7 +1679,7 @@ async def test_an_extension_may_put_a_file_where_a_removal_makes_room(client, st
 
 
 async def test_a_merge_that_cannot_be_applied_is_refused_before_anything_moves(
-    client, state
+    client, state, package_source
 ) -> None:
     """ "Nothing is applied until everything is accepted" — including the
     merge itself.
@@ -1675,7 +1727,9 @@ def _measured(context: Path) -> int:
     return sum(path.stat().st_size for path in context.rglob("*") if path.is_file())
 
 
-async def test_overwriting_a_file_gives_its_bytes_back_to_the_disk_meter(client, state) -> None:
+async def test_overwriting_a_file_gives_its_bytes_back_to_the_disk_meter(
+    client, state, package_source
+) -> None:
     """ "Overwriting one file twenty times cost twenty files' worth of
     quota while the context never grew."
 
@@ -1705,7 +1759,9 @@ async def test_overwriting_a_file_gives_its_bytes_back_to_the_disk_meter(client,
     assert session.ledger.disk_bytes == _measured(paths.context), "the meter follows the directory"
 
 
-async def test_removing_a_file_gives_its_bytes_back_to_the_disk_meter(client, state) -> None:
+async def test_removing_a_file_gives_its_bytes_back_to_the_disk_meter(
+    client, state, package_source
+) -> None:
     """A quota that only ever counted up would turn the remove half of
     ``extend-context`` into a way of spending a session's whole budget
     without keeping anything.

@@ -24,8 +24,9 @@ never what is accepted: the labels are checked either way, and an image that
 declares a different package set is a different environment and is refused. A
 pin naming a repository outside `--allow-environment` is refused before any
 registry is asked; without a pin the allowed repositories are searched in
-order, newest assembly revision first. The digest that actually ran is in the
-build's own record.
+order, newest assembly revision first. Which image was chosen is answered at
+`send-context` — its digest and the declaration its labels carry — and a client
+records that digest as what built the firmware.
 
 **One limitation worth stating plainly.** The packages a context pins are
 fetched from the directories the operator configured (`--sdk-source`) and,
@@ -37,7 +38,10 @@ elsewhere would be a trust decision made where nobody looks.
 
 **A developer build cannot be built here.** A context created against a west
 workspace somebody maintains themselves names no packages anybody else has, and
-this server says so instead of guessing.
+this server says so instead of guessing. Neither can a context that does not say
+which tool wrote it: the declaration is what a build environment's own "which
+contexts do I accept" is checked against, so a context without it is refused
+before an environment is chosen for it.
 
 ## What this repository holds
 

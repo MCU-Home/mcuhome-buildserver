@@ -52,8 +52,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import zstandard
+from mcuhome.model.artifacts import Artifact
 
-from mcuhome.buildserver.abi import Artifact
 from mcuhome.buildserver.errors import SessionError
 
 __all__ = [

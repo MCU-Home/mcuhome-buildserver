@@ -1342,7 +1342,7 @@ class SessionManager:
                 f'This server has no session called "{session_id}".',
                 session_id=session_id,
             )
-        _signal_running(session)
+        _mark_cancelling(session)
         session.state = STATE_CLOSED
         self.mark_for_release(session_id)
         return session
@@ -1364,21 +1364,28 @@ def capabilities_payload(state: Any, containers: list[dict[str, Any]]) -> dict[s
     of dying mid-session, and it is the one verb that carries no session
     id, because there is no session yet to carry.
 
-    ``containers`` is real since the container backend landed: every
-    local image carrying the ``org.mcuhome.build-environment.contract`` label, with its
-    reference, its repo digest and its three §2.1 labels — which is
-    ADR 0019 §2's "tag + digest + contract labels". The labels are
-    pre-start scheduling data and are answered as such: an image is in
-    this list for carrying them, and what its program can actually do is
-    ``describe``'s answer, which ``send-context`` asks for once a
-    context names one. Nothing here starts a container, because a client
-    asking what this server has is not yet asking any image to prove it.
+    ``containers`` is what this host already **has**: every local image
+    carrying a build-environment declaration, with its reference, its
+    repo digest and the declaration its labels mirror (build environment
+    specification §5.2). It is pre-start scheduling data and is answered
+    as such — an image is in this list for carrying those labels, and
+    whether one of them serves a given context is decided by the package
+    set the context pins. Nothing here starts a container, because a
+    client asking what this server has is not yet asking any image to
+    prove it.
 
-    An empty list is still a truthful answer, and now it means what it
-    says: this host has no build-container image. So does a host whose
-    container runtime is down — the question is which images this server
-    can serve, and "none" is a fact rather than an error. The refusal
-    for a missing runtime belongs to the verb that needs a container.
+    ``environments`` is the other half and the one a client can act on:
+    the repositories this operator allows an environment to come from. A
+    context may travel with an image pin, and a pin naming a repository
+    outside this list is refused before any registry is asked — so the
+    list is announced rather than discovered by being refused.
+
+    An empty ``containers`` is still a truthful answer, and it means what
+    it says: this host has no build-environment image yet. So does a host
+    whose container runtime is down — the question is which environments
+    this server has, and "none" is a fact rather than an error. The
+    refusal for a missing runtime belongs to the verb that needs a
+    container.
 
     **``ingress`` is announced rather than discovered** (E57). The five
     caps of ADR 0019 decision 8 exist so that a client can refuse an
@@ -1426,6 +1433,10 @@ def capabilities_payload(state: Any, containers: list[dict[str, Any]]) -> dict[s
             "profiles": list(PROFILES),
         },
         "containers": containers,
+        # Which repositories an environment may be taken from here. It is
+        # the operator's boundary and the one part of image selection a
+        # client can act on before it uploads anything.
+        "environments": {"allowed": list(config.allowed_environments)},
         # The server's patch configuration IS the policy; unlisted layers
         # are denied by default (concept §6). Advertised per layer so the
         # workbench refuses a patched context before uploading it.
@@ -1647,25 +1658,35 @@ def _unpack_into(
     )
 
 
-def _signal_running(session: Session) -> None:
+def _mark_cancelling(session: Session) -> None:
+    """Running becomes *cancelling* for every invocation of *session*.
+
+    The state and nothing else: something has asked the invocation to
+    stop and it has not stopped yet. Raising the actual stop signal is
+    :func:`_signal_running`'s, one layer up, where the backend that owns
+    the step is in reach.
+    """
+    for invocation_id, found in session.invocations.items():
+        if found == INVOCATION_RUNNING:
+            session.invocations[invocation_id] = INVOCATION_CANCELLING
+
+
+def _signal_running(state: Any, session: Session) -> None:
     """Raise the stop signal for every invocation of *session* that runs.
 
     The first step of every teardown there is, and the reason it is one
     function: ``close-session``, the sweep, a handover and process
     shutdown all take a session away, and a session taken away without
-    the sentinel would have its supervisor sit out the whole
+    the signal would have its supervisor sit out the whole
     ``cancel_grace_seconds`` before anything reached it. What follows —
     removing the container and waiting for the supervisor — is bounded
-    by the ladder, and the ladder only starts where this file exists.
-
-    Running becomes *cancelling*, which is the state the invocation is
-    actually in: something has asked it to stop and it has not stopped
-    yet.
+    by the ladder, and the ladder only starts where the signal was
+    raised.
     """
+    _mark_cancelling(session)
     for invocation_id, found in session.invocations.items():
-        if found == INVOCATION_RUNNING:
-            session.invocations[invocation_id] = INVOCATION_CANCELLING
-            _signal_cancellation(session, invocation_id)
+        if found == INVOCATION_CANCELLING:
+            state.backend.signal_cancellation(session.id, invocation_id)
 
 
 def _discard_if_free(session: Session) -> bool:
@@ -1730,7 +1751,7 @@ async def release_session(state: Any, session_id: str, *, wait: float | None = N
     """
     session = state.sessions.find(session_id)
     if session is not None:
-        _signal_running(session)
+        _signal_running(state, session)
     reason = None if session is None else session.reaped
     if not await state.backend.release(session_id, reaped=reason, wait=wait):
         state.sessions.mark_for_release(session_id)
@@ -1781,65 +1802,36 @@ async def release_every_session(state: Any) -> None:
     await state.backend.release_all(deadline=deadline)
 
 
-def _signal_cancellation(session: Session, invocation_id: str) -> None:
-    """Raise the stop signal for one invocation: create the sentinel file.
-
-    Build-container contract §8, and it is deliberately one small thing:
-    the backend creates the **cancel sentinel file** that this
-    invocation's request document named, and the *existence* of the file
-    means "stop". The program polls it, stops within
-    ``limits.cancel_grace_seconds`` and writes a result document with
-    ``status: "cancelled"`` — which carries ``reason: null`` and
-    ``error: null``, because nothing was diagnosed. SIGTERM and then
-    SIGKILL stay the backend's hard path behind the cooperative one, and
-    :mod:`mcuhome.buildserver.backend` starts that ladder when it sees
-    this file appear.
-
-    A sentinel file rather than a signal, for the same reason the verb
-    exists at all: killing a ``docker exec`` client does not kill the
-    process inside the container, and a file works unchanged in the
-    ``subprocess`` profile. It lives in the backend-owned per-invocation
-    directory and never inside the context, which is what keeps the
-    context a genuinely read-only mount.
-
-    **It is here rather than on the backend** because both callers are
-    here — the ``cancel`` verb and ``close-session``'s implicit cancel —
-    and because the path is the session's own: the per-invocation
-    directory is named by :class:`~mcuhome.buildserver.contextstore.SessionPaths`,
-    which the session record already holds. Nothing about creating the
-    file needs a container, and the one thing it must not do is fail:
-    every caller is answering something else, and a cancel that raised
-    over a missing directory would turn an acknowledgement into an
-    internal error.
-
-    One consequence belongs to the backend rather than here: a
-    cancellation that lands **mid patch application** poisons the
-    session (:meth:`Session.poison`, ``session.poisoned``) — a crash, a
-    cancel or an out-of-memory kill after some patches but before all
-    leaves trees no future build may trust. The program is what reports
-    it, as ``error.patch.incomplete``, on the invocation after.
-    """
-    if session.paths is None:
-        return
-    with contextlib.suppress(OSError, ValueError):
-        directory = session.paths.invocation(invocation_id)
-        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        (directory / "cancel").touch(mode=0o600, exist_ok=True)
-
-
 async def send_context(state: Any, connection: Any, command: Command) -> dict[str, Any]:
     """``send-context`` — upload the base context and its pins.
 
     Payload::
 
         {"session_id": "s-…",
-         "archive": {"size": 4711, "sha256": "<64 hex digits>"}}
+         "archive": {"size": 4711, "sha256": "<64 hex digits>"},
+         "container_image": ":0.1.10.dev2-r1"}          # optional
 
     followed by the tar.zst as BINARY frames (E41; see
     :func:`_archive_announcement`). The result frame is the
     acknowledgement, and it arrives when the declared number of bytes
     has been received, hashed to the declared value, unpacked safely and
     parsed.
+
+    **The image pin travels here and not in the context.** A context
+    references packages and never an image (build environment
+    specification §4), so a pin inside it would change a context's
+    identity without changing a single build input. It belongs to *this
+    build*, and this is the message that carries this build's parameters
+    — the one at which the environment is chosen, frozen into the
+    session and answered back. Four forms are accepted, the same four a
+    local build takes: nothing, a bare repository, ``:tag`` or
+    ``@sha256:…`` on their own, and the canonical
+    ``repository:tag`` / ``repository@sha256:…``. A pin narrows which
+    images are looked at and never what is accepted — the labels decide
+    — and a pin naming a repository this server does not allow is
+    refused before any registry is asked. What never travels is the
+    client's own search list: which repositories may be used here is
+    this operator's decision and not a client's.
 
     The base context carries ``context.yaml``: the format version, the
     resolved pins — SDK package sha256, target board — the Zephyr line a
@@ -1895,6 +1887,7 @@ async def send_context(state: Any, connection: Any, command: Command) -> dict[st
     artifact and half of one has no meaning.
     """
     session = state.sessions.require(command.require_str("session_id"), connection)
+    image_pin = command.optional_str("container_image")
     session.require_workable()
     session.require_writable_context()
     with _context_work(session):
@@ -1926,7 +1919,10 @@ async def send_context(state: Any, connection: Any, command: Command) -> dict[st
             # refusal, so the context goes with it rather than sitting in
             # a session that can never build.
             image = await state.backend.resolve_image(
-                pins, paths.context, on_progress=_pulling(connection, session.id)
+                pins,
+                paths.context,
+                image_pin=image_pin,
+                on_progress=_pulling(connection, session.id),
             )
         except BaseException:
             session.discard_context()
@@ -2604,9 +2600,13 @@ async def cancel(state: Any, connection: Any, command: Command) -> dict[str, Any
 
     It is deliberately not gated on the lock and not gated on poison:
     only working commands produce invocations, and a poisoned session
-    may still have an invocation worth stopping. The sentinel file the
-    acknowledgement promises is :func:`_signal_cancellation`'s, which
-    the container backend fills in.
+    may still have an invocation worth stopping. What the
+    acknowledgement promises is the backend's
+    :meth:`~mcuhome.buildserver.backend.SessionBackend.signal_cancellation`:
+    the stop sentinel of the running step is raised, and the liveness
+    ladder behind it — SIGTERM, then SIGKILL, then the container's
+    removal — is what actually ends a build. A signal to the client that
+    started the container never was one: the build runs inside it.
     """
     session = state.sessions.require(command.require_str("session_id"), connection)
     invocation_id = command.require_str("invocation_id")
@@ -2627,7 +2627,7 @@ async def cancel(state: Any, connection: Any, command: Command) -> dict[str, Any
             "already_finished": True,
         }
     session.invocations[invocation_id] = INVOCATION_CANCELLING
-    _signal_cancellation(session, invocation_id)
+    state.backend.signal_cancellation(session.id, invocation_id)
     return {
         "session_id": session.id,
         "invocation_id": invocation_id,

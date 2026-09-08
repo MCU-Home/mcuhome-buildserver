@@ -57,6 +57,7 @@ from typing import Any
 
 from mcuhome.model.context import (
     CONTEXT_FILE,
+    DEVELOPER_ENVIRONMENT,
     MANIFEST_FILE,
     MODEL_FILE,
     ContextFile,
@@ -416,6 +417,34 @@ def _malformed(problem: str) -> ProtocolError:
     return ProtocolError(f"The context.yaml in this context is not usable: {problem}.")
 
 
+def developer_context_refusal() -> SessionError:
+    """A context created for a development build, sent to a build server.
+
+    The context format lets ``build_environment`` be the single word
+    ``developer``, and such a context is not remote-buildable by
+    construction rather than by policy: its sources are a checkout, its
+    SDK is that checkout's manifest repository and its tools are whatever
+    is on that person's ``PATH``. None of the three was published, so
+    none of them has a name, a version or a hash this server could
+    resolve — and the empty SDK hash that travels with the word is the
+    format saying so.
+
+    It is refused **before** the pins are read, and that is the whole
+    point of the check: read field by field, such a document fails on the
+    empty ``mcuhome.version`` and reports that a version string is empty,
+    which is true and tells nobody what is actually wrong.
+    """
+    return SessionError(
+        "version.builder-unsatisfiable",
+        "A developer build cannot be built remotely. This context was created against a "
+        "build environment you maintain yourself — a west workspace and the tools on your "
+        "own machine — and it names no packages a build server could deliver.\n"
+        "Fix: build it on the machine that has that workspace (`mcuhome device build`), "
+        "or create the context against MCUHome's own build environment and send that.",
+        required=DEVELOPER_ENVIRONMENT,
+    )
+
+
 def _environment(data: dict[str, Any]) -> EnvironmentPin:
     """``build_environment`` as the two package pins the format defines.
 
@@ -540,6 +569,9 @@ def parse_context_yaml(path: Path, *, expected_version: int, max_bytes: int) -> 
         raise _malformed(f"it is not valid YAML ({problem})") from exc
     if not isinstance(data, dict):
         raise _malformed("it does not describe a context")
+
+    if data.get("build_environment") == DEVELOPER_ENVIRONMENT:
+        raise developer_context_refusal()
 
     found = data.get("context")
     if found != expected_version:

@@ -46,7 +46,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from mcuhome.model.buildimage import IMAGE_REPOSITORY
+from mcuhome.model.buildimage import ENVIRONMENT_IMAGE_REPOSITORY
 
 from mcuhome.buildserver.environments import repository_of
 from mcuhome.buildserver.security import DEFAULT_PAIR_FILE, read_token_file
@@ -63,7 +63,6 @@ from mcuhome.buildserver.sessions import (
 
 __all__ = [
     "DEFAULT_BUILD_DEADLINE_SECONDS",
-    "DEFAULT_BUILD_JOBS",
     "DEFAULT_CANCEL_GRACE_SECONDS",
     "DEFAULT_CONTAINER_MEMORY",
     "DEFAULT_CONTAINER_PIDS",
@@ -131,15 +130,6 @@ DEFAULT_MAX_CONTEXT_YAML_BYTES = 64 * 1024
 #: it here rather than shadowing ``docker`` for the whole account.
 DEFAULT_DOCKER = "docker"
 
-#: ``limits.jobs`` for every working invocation — **authoritative**, and
-#: resolved host-side on purpose (contract §5.2): the container sees the
-#: host CPU count but not the RAM budget, so a program that fell back to
-#: ``nproc`` would run several concurrent sessions at full width and be
-#: killed for it. Two, because a Matter build on the machine this
-#: project develops on is a ``-j2`` build: CHIP's compile units are what
-#: decide the ceiling, and the ceiling is memory rather than cores.
-DEFAULT_BUILD_JOBS = 2
-
 #: ``limits.deadline_seconds`` — relative to program start, advisory to
 #: the program and **enforced here** (§9.1). Ninety minutes: generous
 #: against a cold Matter build, mean against one that is not going to
@@ -162,21 +152,24 @@ DEFAULT_CANCEL_GRACE_SECONDS = 60
 #: the wire towards other people's machines.
 DEFAULT_MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
 
-#: The per-session container's memory ceiling, in ``docker run --memory``
-#: spelling. Contract §1.2 makes "per-session resource limits" a promise
-#: of the ``container`` profile and §9.1 makes them the backend's to set
-#: and to enforce, so there is a number here rather than a hope: without
-#: one, a single build's linker takes the host down and every other
-#: session with it. Eight gibibytes is generous against a cold Matter
-#: build at ``--build-jobs 2`` and mean against a runaway, and it is the
-#: value that makes ``limits.memory_bytes``' absence from the request
-#: document honest — the runtime enforces, so the document does not ask.
+#: The memory one build step of a session may use, in ``docker run
+#: --memory`` spelling. It is **both halves of the budget**: the number
+#: is written into the request document as the recommendation the build
+#: environment sizes itself from (build environment specification §6.1)
+#: and set on the container as the hard limit the runtime holds it to.
+#: There is a number here rather than a hope because without one a
+#: single build's linker takes the host down and every other session
+#: with it. Eight gibibytes is generous against a cold Matter build and
+#: mean against a runaway; the empty string is an operator saying this
+#: host is not to be bounded by memory.
 DEFAULT_CONTAINER_MEMORY = "8g"
 
 #: ``docker run --pids-limit`` for the same container. A build legitimately
 #: spawns hundreds of short-lived children — which is why ``--init`` is
 #: there at all — and a fork bomb spawns them faster; four thousand is
 #: past any real toolchain and short of a host that stops scheduling.
+#: It is the one limit that is only ever hard: no document asks an
+#: environment how many processes it means to have.
 DEFAULT_CONTAINER_PIDS = 4096
 
 #: Concurrent ``/ws`` connections this server accepts, and in-flight
@@ -282,17 +275,11 @@ class Config:
     #: can be measured from the bytes on disk.
     session_quota_bytes: int = DEFAULT_SESSION_QUOTA_BYTES
 
-    #: The container runtime, and the numbers that go into every
-    #: invocation's request document. All four are configuration for the
-    #: same reason the ingress caps are — the config is the policy, and
-    #: a number an operator cannot move is a number they will work
-    #: around. ``limits.memory_bytes`` is deliberately **not** among
-    #: them: it is advisory, this server enforces memory through the
-    #: runtime rather than by asking, and a number written into the
-    #: document that nothing behind it enforces would be a promise to
-    #: the program that no one keeps.
+    #: The container runtime, and the numbers that bound one invocation.
+    #: All of them are configuration for the same reason the ingress caps
+    #: are — the config is the policy, and a number an operator cannot
+    #: move is a number they will work around.
     docker: str = DEFAULT_DOCKER
-    build_jobs: int = DEFAULT_BUILD_JOBS
     build_deadline_seconds: int = DEFAULT_BUILD_DEADLINE_SECONDS
     cancel_grace_seconds: int = DEFAULT_CANCEL_GRACE_SECONDS
     #: The idle half of the session lease (:data:`_SESSION_OPTIONS`). The
@@ -307,31 +294,31 @@ class Config:
     reconnect_grace_seconds: int = int(DEFAULT_RECONNECT_GRACE)
     max_artifact_bytes: int = DEFAULT_MAX_ARTIFACT_BYTES
 
-    #: The per-session container's resource ceilings — the enforcement
-    #: half of the sentence above. They are ``docker run`` flags rather
-    #: than request-document fields on purpose: the program is told what
-    #: parallelism to use (``limits.jobs``) and the runtime is told what
-    #: the container may consume, which is the only arrangement in which
-    #: "advisory to the program, enforced by the backend" is true of
-    #: both. ``container_cpus`` is unset by default because
-    #: ``limits.jobs`` already bounds the parallelism a conforming
-    #: program asks for and a hard CPU ceiling on top of it is an
-    #: operator's choice, not a safety property.
+    #: What one build step of a session is given, and held to. The CPU
+    #: and memory figures are **both** halves of the budget: they travel
+    #: in the request document as the recommendation the environment
+    #: sizes itself from and are set on the container as the hard limits
+    #: the runtime enforces, because an environment cannot be trusted to
+    #: stay inside a recommendation — it may have a bug and run amok.
+    #: ``container_cpus`` unset means this host's CPU count
+    #: (:func:`~mcuhome.buildserver.backend.session_limits`), which is
+    #: what a build gets when nobody said otherwise.
     container_memory: str | None = DEFAULT_CONTAINER_MEMORY
     container_cpus: str | None = None
     container_pids: int | None = DEFAULT_CONTAINER_PIDS
 
     #: The build environments this server is willing to run, as
-    #: repositories — no tag, no digest. **Always enforced**, and not a
-    #: consequence of :attr:`auto_pull`: a context's environment pin is
-    #: client-supplied, and the image found for it is matched by digest
-    #: alone, so without a list of repositories a pin decides which of
-    #: this host's images gets started with a session's mounts under it.
-    #: Defaults to MCUHome's own build container, which is what this
+    #: repositories — no tag, no digest. It is **two things at once** and
+    #: both are always enforced: the search list an environment is looked
+    #: for in when a context brings no pin, walked in order, and the
+    #: boundary a pin that names a repository has to be inside. Without
+    #: it a client's pin would decide which of this host's images gets
+    #: started with a session's mounts under it.
+    #: Defaults to MCUHome's own build environment, which is what this
     #: server exists to run; stating the option at all replaces that
     #: default rather than adding to it, because an operator who lists
     #: their own images must also be able to stop serving ours.
-    allowed_environments: tuple[str, ...] = (IMAGE_REPOSITORY,)
+    allowed_environments: tuple[str, ...] = (ENVIRONMENT_IMAGE_REPOSITORY,)
 
     #: Fetch an allowed build environment this host does not have yet.
     #: On by default: the environment is pinned to a digest and its
@@ -342,15 +329,19 @@ class Config:
     #: gigabyte of transfer on a client's say-so.
     auto_pull: bool = True
 
-    #: Where SDK packages are found, in search order (E48). ADR 0019's
-    #: amendment fixes the order — "a local directory first, then
-    #: ``packages.mcuhome.org``, then any other external source" — and
-    #: v1 of this server implements the first tier only: these
-    #: directories, holding ``mcuhome-sdk-<version>.tar.zst``. Empty by
-    #: default, which means a working action refuses with
-    #: ``sdk.unavailable`` naming the empty list; there is no built-in
-    #: source, because "somewhere on the internet" is not a source list
-    #: an operator chose.
+    #: The operator's own **mirror** of the packages a session needs, in
+    #: search order: directories holding ``mcuhome-sdk-<version>.tar.zst``
+    #: and the package index beside it. Searched first, and a server that
+    #: holds what its sessions pin never opens a socket for them.
+    #:
+    #: Empty by default, and that is not the same as having no source:
+    #: behind these directories is MCUHome's own package registry,
+    #: checked against the trust anchor the workbench ships and against
+    #: nothing else. There is deliberately no option for that registry —
+    #: no second domain, no other anchor — because a build server is an
+    #: operator's machine and not a project, and a trust root that could
+    #: be pointed elsewhere by a flag would be a trust decision made
+    #: where nobody looks.
     sdk_sources: tuple[Path, ...] = ()
 
     #: An optional shared ccache, offered to every invocation
@@ -415,12 +406,6 @@ _CAP_OPTIONS: tuple[tuple[str, str, int, str], ...] = (
 #: drives the command line, the environment and the defaults, so a knob
 #: cannot exist in one of the three and not the others.
 _BACKEND_OPTIONS: tuple[tuple[str, str, int, str], ...] = (
-    (
-        "--build-jobs",
-        "build_jobs",
-        DEFAULT_BUILD_JOBS,
-        "limits.jobs for every invocation — authoritative, resolved host-side",
-    ),
     (
         "--build-deadline-seconds",
         "build_deadline_seconds",
@@ -690,8 +675,9 @@ def build_parser() -> argparse.ArgumentParser:
         dest="sdk_sources",
         help=(
             "directory holding mcuhome-sdk-<version>.tar.zst packages; repeatable and "
-            "searched in the order given. The url in a context is a hint and is never "
-            "fetched — packages come from these directories only"
+            "searched in the order given, before MCUHome's own package registry. The url "
+            "in a context is a hint and is never fetched: a package is found by name and "
+            "accepted by the hash the context pins"
         ),
     )
     parser.add_argument(
@@ -701,9 +687,9 @@ def build_parser() -> argparse.ArgumentParser:
         dest="allowed_environments",
         help=(
             "build-environment repository this server may run, without tag or digest "
-            "(repeatable). Stating it replaces the default, which is MCUHome's own "
-            f"build container ({IMAGE_REPOSITORY}). A context pinning any other "
-            "repository is refused before the image is touched"
+            "(repeatable, searched in the order given). Stating it replaces the default, "
+            f"which is MCUHome's own build environment ({ENVIRONMENT_IMAGE_REPOSITORY}). "
+            "A build pinning any other repository is refused before any registry is asked"
         ),
     )
     parser.add_argument(
@@ -729,16 +715,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--container-memory",
         metavar="SIZE",
         help=(
-            "docker run --memory for the session container, in docker's own spelling "
-            f"(default {DEFAULT_CONTAINER_MEMORY}); the empty string removes the limit"
+            "how much memory one build step may use, in docker's own spelling "
+            f"(default {DEFAULT_CONTAINER_MEMORY}). Told to the build environment in its "
+            "request document and enforced as docker run --memory; the empty string "
+            "removes the limit"
         ),
     )
     parser.add_argument(
         "--container-cpus",
         metavar="N",
         help=(
-            "docker run --cpus for the session container (default: unset — limits.jobs "
-            "already bounds the parallelism a conforming program asks for)"
+            "how much CPU one build step may use, as a number of cores (fractions "
+            "allowed). Told to the build environment in its request document and "
+            "enforced as docker run --cpus; default: every CPU of this host"
         ),
     )
     for option, attribute, default, what in (
@@ -866,7 +855,7 @@ def load_config(
                 f"--allow-environment wants the registry named too: write {repository!r} "
                 f"rather than {entry!r}."
             )
-    allowed_environments = tuple(dict.fromkeys(environments)) or (IMAGE_REPOSITORY,)
+    allowed_environments = tuple(dict.fromkeys(environments)) or (ENVIRONMENT_IMAGE_REPOSITORY,)
 
     auto_pull = args.auto_pull
     if auto_pull is None:

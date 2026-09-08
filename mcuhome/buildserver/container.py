@@ -1,132 +1,75 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Docker, and the one seam every call to it goes through.
+"""Docker, as this server *asks* it questions.
 
-**This module is the whole of this server's container plumbing.** It
-composes argv, it runs it, and it says what came back; it knows nothing
-about sessions, contexts or the invocation ABI. That split is what makes
-the rest of the backend testable without a container runtime, and it is
-the same shape the workbench's own orchestrator uses
-(``mcuhome/workbench/orchestrator.py`` in mcu-home/mcuhome-workbench) — which this
-server may read and, today, does not import: that module drives the same
-contract from a host, and the two are the same lifecycle written for two
-worlds (a session state machine over a socket here, one blocking drive
-there). Which of the two survives is the open question of the rebuild;
-until it is answered, this stays this server's own.
+**Discovery, and nothing else.** Is there a container runtime, and which
+build environments does this host already have — that is the whole of
+this module. Everything that *runs* something belongs to the workbench's
+container profile (:mod:`mcuhome.workbench.containerbuild`): the
+``docker run`` that is a step, the limits it is given, the removal that
+reaps it. The two halves are split by concurrency shape rather than by
+taste — discovery is asked from verb handlers on the event loop and
+wants its answer as a value, while driving a build blocks a worker
+thread for minutes.
 
-**Two impure functions, and everything goes through them.**
+**One impure function, and everything goes through it.**
 :func:`run_docker` runs a short command to completion and answers its
-exit status and its output; :func:`spawn_docker` starts a long one and
-hands back a handle that streams its merged output line by line. Both
-are module-level and both are resolved **at call time** through
-:class:`Docker`'s optional constructor arguments, for the reason the
-reference states about its own seam: a default bound at definition time
-cannot be replaced by monkeypatching the module, and a test that thinks
-it stubbed docker out but did not is a test that starts a real build.
+exit status and its output. It is module-level and resolved **at call
+time** through :class:`Docker`'s optional constructor argument, for the
+reason the seam exists at all: a default bound at definition time cannot
+be replaced by monkeypatching the module, and a test that thinks it
+stubbed docker out but did not is a test that starts a real container.
 
-Both are one line each over :mod:`mcuhome.buildserver.processes`, which
-owns the child-process plumbing every profile needs — the log pump, the
-line cap, the signal-an-exited-process rule. They stay *here* as their
-own names anyway, because they are this profile's seam: a suite that
-stubs docker out must not thereby stub the ``subprocess`` profile's
-program out as well, and a shared function would be one seam for two
-things nobody ever wants replaced together.
-
-**Three refusals before anything else, because they have three
-different fixes.** No docker binary, no daemon, no image: a build that
-dies ten seconds in with somebody else's error text does not tell them
-apart. The first two are one wire code here —
-``builder.runtime-unavailable``, retryable, because a daemon that is
-down comes back — and the third is ``version.builder-unavailable``,
-which is not retryable once this server has decided it will not have
-that image: the pin is resolved against the **local** inventory, and
-when :attr:`~mcuhome.buildserver.config.Config.auto_pull` allows it
-(the default) a miss becomes a :meth:`Docker.pull` rather than a
-refusal. What never depends on that switch is *which* images may run at
-all — that is the allowlist
-(:mod:`mcuhome.buildserver.environments`), checked before any command
-here names the image.
-
-**Starting a container is not here any more.** The session's build
-environment is the workbench's orchestrator's — the same object a local
-build gets — so the ``docker run`` that creates it, the ``docker exec``
-that is the invocation and the ``docker rm`` that ends it are composed
-there, once, for both. What is left here is discovery: is there a
-runtime, which images does this host have, fetch one, and what does an
-image say about itself before a session is answered.
+**Two refusals, because they have two different fixes.** No docker
+binary and no daemon are one wire code — ``builder.runtime-unavailable``,
+retryable, because a daemon that is down comes back — and a build that
+dies ten seconds in with somebody else's error text tells neither of
+them. Which images may run at all is a different question again, and it
+is the operator's allowlist (:mod:`mcuhome.buildserver.environments`),
+checked before any command here names an image.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
-import re
 import shlex
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
 from typing import Any
 
-# The three image labels of contract §2.1 are **pre-start scheduling
-# data**: they let this server recognize a build environment before
-# paying for a container start. They are not authoritative about what the
-# program can do — ``describe`` is — which is why
-# :mod:`mcuhome.buildserver.backend` cross-checks them against it before
-# relying on them. Imported rather than spelled: the names belong to the
-# contract, and the repository that publishes an environment writes
-# exactly these strings onto it, so a second copy here is how one side
-# starts looking for a label the other stopped writing.
-from mcuhome.model.buildimage import CONTRACT_LABEL, TOOLCHAIN_LABEL, ZEPHYR_LABEL
+# An image that delivers a build environment mirrors its whole
+# declaration as ``org.mcuhome.build-environment.<member>`` labels
+# (build environment specification §5.2), and the spec generation is one
+# of the members every one of them must carry. That makes it the filter
+# for "is this image a build environment at all". Imported rather than
+# spelled: the names belong to the specification, the party that
+# publishes an image writes exactly these strings onto it, and a second
+# copy here is how one side starts looking for a label the other stopped
+# writing.
+from mcuhome.model.buildenvironment import LABEL_PREFIX, SPEC_GENERATION_MEMBER
 
 from mcuhome.buildserver.errors import SessionError
-from mcuhome.buildserver.processes import (
-    Completed,
-    LineSink,
-    Process,
-    run_command,
-    spawn_command,
-)
+from mcuhome.buildserver.processes import Completed, run_command
 
 __all__ = [
-    "CONTRACT_LABEL",
-    "PROGRAM",
-    "TOOLCHAIN_LABEL",
-    "ZEPHYR_LABEL",
+    "DECLARATION_LABEL_PREFIX",
+    "ENVIRONMENT_LABEL",
     "Completed",
     "Docker",
     "ImageFacts",
-    "Mount",
-    "Process",
-    "describe_run_command",
     "run_docker",
-    "spawn_docker",
 ]
 
 logger = logging.getLogger(__name__)
 
-#: The program every conforming image carries, at the one absolute path
-#: contract §2.2 fixes. Not looked up on ``PATH``: ``PATH`` inside the
-#: image is the image author's, ``docker exec`` inherits the environment
-#: fixed at container creation, and the invocation is resolved without a
-#: shell — so there is no lookup to fall back on.
-PROGRAM = "/mcuhome/run"
-
-#: How this server labels the containers it starts. A **container**
-#: label, not an image one: contract §2.1 governs image labels and this
-#: is backend policy, which §11 leaves free. It exists so that an
-#: operator can find the containers of a build server that was killed
-#: outright — there is deliberately no startup sweep, for the reason
-#: :meth:`~mcuhome.buildserver.sessions.SessionManager.shutdown` gives
-#: about the context root: two servers sharing one host is a
-#: configuration, and a sweep would answer it by reaping the other's live
-#: sessions.
-SESSION_LABEL = "org.mcuhome.build-server.session"
-
-#: A container id as docker writes it back — 64 hex digits, of which the
-#: first twelve are the short form. Checked because every later command
-#: puts this string in an argv.
-_CONTAINER_ID = re.compile(r"[0-9a-f]{12,64}\Z")
+#: The label prefix a build-environment image mirrors its declaration
+#: under (§5.2), and the one member of it that says "this is a build
+#: environment": every declaration states the specification generation it
+#: implements, so an image carrying that label is one, and an image
+#: without it is not.
+DECLARATION_LABEL_PREFIX = f"{LABEL_PREFIX}"
+ENVIRONMENT_LABEL = f"{LABEL_PREFIX}{SPEC_GENERATION_MEMBER}"
 
 
 async def run_docker(argv: Sequence[str]) -> Completed:
@@ -144,40 +87,6 @@ async def run_docker(argv: Sequence[str]) -> Completed:
     reaches their runtime.
     """
     return await run_command(argv)
-
-
-async def spawn_docker(argv: Sequence[str], *, on_line: LineSink) -> Process:
-    """Start *argv* and stream its merged output into *on_line*.
-
-    The other impure half. It exists separately from :func:`run_docker`
-    because an invocation is neither short nor bounded: its output is the
-    build log, which has to reach the client while the build runs rather
-    than as a value at the end, and the process has to stay addressable
-    so that liveness policy can reach it.
-    """
-    return await spawn_command(argv, on_line=on_line)
-
-
-@dataclass(frozen=True)
-class Mount:
-    """One bind mount, host source to container destination.
-
-    ``read_only`` is the whole of the mode. Contract §9.1 requires the
-    backend to "write-protect ``context`` and every non-``writable``
-    tree with the strongest means its profile has", and in the container
-    profile that means is a read-only bind mount — kernel-enforced,
-    rather than a promise the program is asked to keep.
-    """
-
-    source: Path
-    #: A path inside the container, and POSIX whatever the host is:
-    #: ``str()`` of a ``WindowsPath`` would hand docker backslashes.
-    target: PurePosixPath | Path
-    read_only: bool = False
-
-    def to_argument(self) -> str:
-        suffix = ":ro" if self.read_only else ""
-        return f"{self.source}:{self.target}{suffix}"
 
 
 @dataclass(frozen=True)
@@ -203,12 +112,13 @@ class ImageFacts:
     labels: dict[str, str] = field(default_factory=dict)
 
     def to_wire(self) -> dict[str, Any]:
-        """One entry of ``capabilities``' container inventory.
+        """One entry of ``capabilities``' environment inventory.
 
-        Tag, digest and the contract labels, which is exactly what
-        ADR 0019 §2 lists: enough for a workbench to resolve a pin
-        before it opens a session, and nothing about the image's
-        contents, which ``describe`` answers and this does not.
+        Reference, digest and the declaration the image's labels mirror
+        (§5.2) — its package set above all, which is what makes an image
+        findable at all. Only the labels under the specification's own
+        prefix travel: an image's other labels are its author's business
+        and none of this server's.
         """
         return {
             "reference": self.reference,
@@ -216,7 +126,7 @@ class ImageFacts:
             "labels": {
                 name: value
                 for name, value in sorted(self.labels.items())
-                if name in (CONTRACT_LABEL, ZEPHYR_LABEL, TOOLCHAIN_LABEL)
+                if name.startswith(DECLARATION_LABEL_PREFIX)
             },
         }
 
@@ -268,11 +178,6 @@ class Docker:
         runner = run_docker if self._runner is None else self._runner
         return await runner(argv)
 
-    async def _spawn(self, argv: Sequence[str], *, on_line: LineSink) -> Process:
-        logger.debug("docker: %s", shlex.join(argv))
-        spawner = spawn_docker if self._spawner is None else self._spawner
-        return await spawner(argv, on_line=on_line)
-
     # ----------------------------------------------------------------
     # Is there a runtime at all, and what does it hold?
     # ----------------------------------------------------------------
@@ -291,48 +196,14 @@ class Docker:
         if completed.status != 0:
             raise _no_runtime(self.program, f"found {self.program} but cannot reach its daemon")
 
-    async def image(self, reference: str) -> ImageFacts | None:
-        """One image's facts, or ``None`` when this host does not have it.
-
-        ``None`` rather than a refusal, because the two callers want
-        different refusals from the same absence: a pinned context that
-        names an image this host lacks is ``version.builder-unavailable``,
-        while an inventory listing simply leaves it out.
-        """
-        found = await self._inspect(reference)
-        return found[0] if found else None
-
-    async def pull(self, reference: str, *, on_line: LineSink) -> bool:
-        """Fetch *reference*, forwarding docker's own progress line by line.
-
-        Spawned rather than run, because a pull is minutes long and a
-        client watching one wants to see it happen; docker's layer
-        counts and percentages are that report, and inventing a spinner
-        over them would say less.
-
-        *reference* is pinned to a digest by the time it reaches here —
-        that is what makes fetching a mechanical step rather than a
-        decision: exactly one set of bytes answers to it, and either
-        they arrive or they do not. Whether this server may run them at
-        all was settled before the pull
-        (:mod:`mcuhome.buildserver.environments`).
-
-        ``False`` for every failure — no runtime, no network, a registry
-        that wants a login, a digest nothing answers to — because the
-        caller's next move is the same in each case and it names the
-        image rather than the mechanism.
-        """
-        process = await self._spawn([self.program, "pull", reference], on_line=on_line)
-        return await process.wait() == 0
-
     async def inventory(self) -> tuple[ImageFacts, ...]:
-        """Every local image that claims contract conformance.
+        """Every local image that declares itself a build environment.
 
-        The filter is the ``org.mcuhome.build-environment.contract`` label, which is what
-        §2.1 calls it: pre-start scheduling data. It is a *hint* here in
+        The filter is the specification-generation label, which every
+        declaration carries (§5.2). It is pre-start scheduling data in
         the strongest sense — an image lands in this list for carrying a
-        label, and what it can actually do is settled by ``describe``
-        when a context names it.
+        label, and whether it serves a given context is decided by its
+        package labels against what that context pins.
 
         Two calls rather than one because ``docker image ls`` reports no
         labels: it names the references, and one ``image inspect`` over
@@ -358,7 +229,7 @@ class Docker:
             "ls",
             "--digests",
             "--filter",
-            f"label={CONTRACT_LABEL}",
+            f"label={ENVIRONMENT_LABEL}",
             "--format",
             "{{.Repository}}:{{.Tag}}\t{{.Repository}}@{{.Digest}}",
         )
@@ -418,46 +289,6 @@ class Docker:
     # ----------------------------------------------------------------
     # Containers
     # ----------------------------------------------------------------
-
-    async def describe(
-        self,
-        *,
-        image: str,
-        mounts: Sequence[Mount],
-        request: Path,
-        user: str | None = None,
-    ) -> Completed:
-        """Run ``describe`` in a throwaway container.
-
-        ``describe`` is a property of the **image**, not of a session:
-        it needs only the preamble, never touches a context and writes
-        nothing but its result document. So it runs in its own
-        ``--rm`` container rather than in a session's, which keeps
-        container materialization lazy where ADR 0019 §2 puts it — a
-        session that never builds never starts a container of its own.
-        """
-        argv = describe_run_command(
-            docker=self.program, image=image, mounts=mounts, request=request, user=user
-        )
-        return await self._run(*argv[1:])
-
-    async def read_file(self, *, image: str, path: str) -> str | None:
-        """One file out of an image, without starting the program (§2.2.1).
-
-        A throwaway ``--rm`` run whose command is ``cat`` — the cheapest
-        read an image allows a backend that must not depend on the
-        program being invocable yet (the static self-description exists
-        for exactly the image whose program body arrives with a mount).
-        ``--network=none`` and no mounts: reading a file grants nothing.
-
-        ``None`` for every failure — image absent, file absent, runtime
-        down — because the caller's fallback is invoking ``describe``,
-        which was already mandatory and reports its own refusals.
-        """
-        completed = await self._run("run", "--rm", "--network=none", image, "cat", path)
-        if completed.status != 0:
-            return None
-        return completed.output
 
 
 def _first_line(output: str) -> str:
@@ -567,47 +398,3 @@ def _facts_from(reference: str, data: dict[str, Any]) -> ImageFacts:
         digest=digest,
         labels={str(k): str(v) for k, v in labels.items()} if isinstance(labels, dict) else {},
     )
-
-
-def describe_run_command(
-    *,
-    docker: str,
-    image: str,
-    mounts: Sequence[Mount],
-    request: Path,
-    user: str | None = None,
-) -> list[str]:
-    """The throwaway ``docker run`` that asks an image what it is.
-
-    Separate from :meth:`Docker.describe` for the same reason
-    :func:`session_run_command` is separate from :meth:`Docker.start`:
-    the composed command is the interface between the contract and the
-    runtime, and it can only be asserted line by line if there is a
-    function that composes it and runs nothing.
-
-    ``describe`` is an invocation, so §9.1's "no network during an
-    invocation" applies to it exactly as it applies to a build —
-    ``--network=none`` is not a session-container nicety. ``--rm``
-    because the container's only output is the result document on the
-    mount, ``--init`` for the same child-reaping reason a build needs
-    one, and one ``--volume`` per mount: the probe directory holds the
-    request document the program is about to read and the result
-    document it is about to write, and neither is reachable inside the
-    container without it.
-    """
-    argv = [docker, "run", "--rm", "--init", "--network=none"]
-    if user is not None:
-        argv += ["--user", user]
-    for mount in mounts:
-        argv += ["--volume", mount.to_argument()]
-    argv += [image, PROGRAM, "describe", str(request)]
-    return argv
-
-
-def current_user() -> str | None:
-    """``uid:gid`` of whoever runs this server, where that is a thing."""
-    getuid = getattr(os, "getuid", None)
-    getgid = getattr(os, "getgid", None)
-    if getuid is None or getgid is None:  # pragma: no cover - not POSIX
-        return None
-    return f"{getuid()}:{getgid()}"

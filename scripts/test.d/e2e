@@ -40,8 +40,8 @@ if ! "$venv/bin/python" -c 'import mcuhome.model.context' >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! command -v mcuhome >/dev/null 2>&1; then
-  echo "test.d/e2e: the mcuhome command is not on PATH. This harness drives the real client; install mcuhome-cli into this venv, as ci-test.yml's test-e2e job does." >&2
+if [ ! -x "$venv/bin/mcuhome" ]; then
+  echo "test.d/e2e: this .venv holds no mcuhome command. The harness drives the real client and finds it through this venv; install mcuhome-cli into it, as ci-test.yml's test-e2e job does." >&2
   exit 1
 fi
 

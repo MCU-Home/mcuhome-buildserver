@@ -59,7 +59,7 @@ def test_retryable_is_authoritative_not_inferred() -> None:
 def test_the_lock_replaced_the_manifest_immutability_code() -> None:
     """``session.manifest-immutable`` is gone, and two codes replace it.
 
-    It encoded the sentence ADR 0019's amendment replaced outright:
+    It encoded a sentence this design replaced outright:
     "``manifest.yaml`` is immutable for the session's lifetime". Under
     the valid layer that rule cannot fire from either end — before the
     lock there is no manifest to protect, and after it the whole context
@@ -78,7 +78,7 @@ def test_the_dropped_exit_codes_left_no_codes_behind() -> None:
 
     ``builder.command-unsupported`` and ``builder.parameter-unsupported``
     were each defined as "the container answered reserved exit code N",
-    and ADR 0019's amendment drops 64 and 65 by name — they are
+    and this design drops 64 and 65 by name — they are
     ``EX_USAGE`` and ``EX_DATAERR``, which foreign runtimes emit for
     ordinary argument errors. What carries the meaning now is the result
     document's ``reason``, and how a backend maps that into this
@@ -125,16 +125,19 @@ async def test_capabilities_answers_the_negotiation_surface(client, config) -> N
     }
     assert set(body["protocol"]["profiles"]) == {"oneshot", "dev", "test"}
     # Real since the container backend landed: every local image
-    # carrying the org.mcuhome.contract label, with the tag, the digest
-    # and the labels ADR 0019 §2 asks for. Nothing here starts a
-    # container — describe costs one, and a client asking what this
-    # server has is not yet asking any image to prove it.
+    # carrying an org.mcuhome.build-environment label, with the tag, the
+    # digest and the labels the build environment specification's
+    # self-description asks for. Nothing here starts a
+    # container — inspecting labels does not require running one, and a
+    # client asking what this server has is not yet asking any image to
+    # prove it.
     assert [entry["digest"] for entry in body["containers"]] == ["sha256:" + "b" * 64]
     # The config is the policy: nothing configured, everything denied.
-    # Four layers, because build-container contract §1.1 defines four —
+    # Four layers, because this server's own patch layers are four —
     # `mcuboot` is one because every device build is `west build
     # --sysbuild` with MCUboot as the second image, and leaving it out
-    # meant an operator could not allow a layer the contract names.
+    # meant an operator could not allow a layer this server otherwise
+    # knows.
     assert body["patch_policy"] == {
         "sdk": {"allow": False},
         "zephyr": {"allow": False},
@@ -278,8 +281,8 @@ def test_the_verb_set_is_the_whole_vocabulary() -> None:
 
     Re-homed from the deleted ``/capabilities`` test, which asserted the
     merged v1+v2 command set. The job commands are gone, so this table
-    *is* the surface, and it is the complete list of dashboard ADR 0012
-    decision 3 (amended 2026-08-09 from ADR 0019). The two that were
+    *is* the surface, and it is the complete verb set as amended on
+    2026-08-09. The two that were
     missing are the load-bearing ones: without ``lock-context`` a client
     can never reach ``build``, and without ``cancel`` a closed socket
     would be the only stop signal — which is no stop signal at all.
@@ -338,11 +341,11 @@ async def test_open_session_admits_with_id_lease_and_negotiation(client) -> None
         "min": sessions.CONTEXT_FORMAT_MIN,
         "max": sessions.CONTEXT_FORMAT_MAX,
     }
-    # What admission alone decides, and no more. The serving container's
-    # contract version is send-context's answer, because at this point
-    # the backend does not yet know which container serves the session.
+    # What admission alone decides, and no more. The serving environment's
+    # own spec generation is send-context's answer, because at this point
+    # the backend does not yet know which image serves the session.
     assert set(negotiated) == {"protocol_version", "context_format", "backend_profile"}
-    # `container` | `subprocess` (contract §1.2), and it can only ever be
+    # `container` | `subprocess`, and it can only ever be
     # the first here: a subprocess-profile backend "serves exactly one
     # build environment — the one it runs in", and this process is an
     # orchestrator that is never itself a build environment.
@@ -395,14 +398,14 @@ async def test_an_unknown_profile_is_rejected_typed(client) -> None:
     ],
 )
 async def test_a_falsy_operand_is_a_value_and_not_an_absence(client, what, payload, code) -> None:
-    """ "Version mismatch is a typed rejection at the door" (decision 2).
+    """ "Version mismatch is a typed rejection at the door."
 
     Both operands were read as ``optional(...) or <default>``, which
     cannot tell "the client did not ask" from "the client asked for a
     falsy value": ``context_format: 0`` and ``profile: ""`` were quietly
     turned into the defaults and answered ``result``, so a client asking
     for a format this server does not read was admitted and would have
-    discovered it downstream — the one place the ADR says a version
+    discovered it downstream — the one place a version
     mismatch must never surface.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
@@ -437,8 +440,8 @@ async def _open(ws) -> str:
 def _admit(manager: sessions.SessionManager | None = None) -> sessions.Session:
     """One admitted session, straight from the manager.
 
-    Admission takes three operands and no fourth — ADR 0019's amendment
-    took the manifest header away from ``open-session`` — so this helper
+    Admission takes three operands and no fourth — ``open-session``
+    carries no manifest header — so this helper
     is the whole of it.
     """
     manager = manager or sessions.SessionManager()
@@ -548,8 +551,8 @@ def test_a_session_past_its_lease_does_not_hold_an_admission_slot() -> None:
 def test_a_session_is_admitted_on_no_context_at_all() -> None:
     """The pins arrive with ``send-context``, not with admission.
 
-    ADR 0019's amendment takes ``open-session``'s first operand away and
-    ADR 0018's retires the term "manifest header" outright: there is no
+    ``open-session`` carries no first operand for it, and the term
+    "manifest header" is retired outright: there is no
     header separate from ``context.yaml``, and ``manifest.yaml`` does
     not exist until ``lock-context`` writes it. So a fresh session holds
     no context of any kind, and there is nothing on it to be immutable.
@@ -718,7 +721,7 @@ async def test_cancel_needs_the_invocation_it_addresses(client) -> None:
 
 
 async def test_cancel_of_an_unknown_invocation_is_typed(client) -> None:
-    """`invocation.unknown` — the one wrong answer is "cancelled" (E38).
+    """`invocation.unknown` — the one wrong answer is "cancelled".
 
     Answering an acknowledgement for an invocation that was never
     running would tell a client its build is stopping while nothing
@@ -765,7 +768,7 @@ async def test_cancel_acknowledges_the_signal_not_the_stop(client, state) -> Non
 
 
 async def test_cancel_racing_a_natural_completion_is_not_an_error(client, state) -> None:
-    """`already_finished` is an answer, not a refusal (E38).
+    """`already_finished` is an answer, not a refusal.
 
     The race between a cancel and a completion is legitimate — both
     parties behaved correctly — so the client gets a fact, not an error
@@ -820,7 +823,7 @@ async def test_the_exits_of_a_session_answer_while_an_invocation_is_running(clie
 
 
 async def test_close_session_cancels_a_running_invocation_implicitly(client, state) -> None:
-    """close-session on a busy session sets the stop signal first (E39).
+    """close-session on a busy session sets the stop signal first.
 
     Refusing to close while an invocation runs was rejected: connection
     loss is never abandonment (that is attach-session's reason to
@@ -841,8 +844,8 @@ async def test_close_session_cancels_a_running_invocation_implicitly(client, sta
 async def test_every_authenticated_verb_refreshes_the_idle_timer(client, state) -> None:
     """One rule, no per-verb list: a command is a command.
 
-    The idle timeout "counts absent *commands*" (ADR 0019), and the
-    second amendment settles which verbs qualify: all of them —
+    The idle timeout counts absent *commands*, and
+    every verb qualifies: all of them —
     lock-context and cancel included. The refresh lives in
     SessionManager.require(), the one door every session verb walks
     through, which is what makes the rule structural rather than a list

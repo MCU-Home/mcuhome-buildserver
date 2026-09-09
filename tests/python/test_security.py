@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """``/health`` and the bearer token.
 
-The transport half of dashboard ADR 0006 — WebSocket plus a bearer
+The transport half of an earlier protocol — WebSocket plus a bearer
 token, TLS at the deployment, the leaked-token threat model, same-host
-pairing — is carried forward unchanged by dashboard ADR 0012 decision 3.
+pairing — is carried forward unchanged into this one.
 Its ``GET /capabilities`` endpoint is not: the session protocol's
 ``capabilities`` verb replaced it, so the assertions that used that
 endpoint merely as *a gated path* now use ``/ws``, which is the only

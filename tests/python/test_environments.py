@@ -145,9 +145,7 @@ def test_the_option_refuses_a_tag_or_a_digest() -> None:
 def test_the_option_wants_the_registry_named() -> None:
     """Silently normalizing would make the list read back differently than it compares."""
     with pytest.raises(SystemExit):
-        load_config(
-            ["--token", "x" * 32, "--allow-environment", "mcu-home/build-container"], env={}
-        )
+        load_config(["--token", "x" * 32, "--allow-environment", "other/environment"], env={})
 
 
 def test_auto_pull_is_on_by_default_and_switchable_both_ways() -> None:

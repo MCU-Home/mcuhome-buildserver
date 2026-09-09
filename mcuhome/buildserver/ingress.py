@@ -2,15 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Context bytes arriving: the streaming caps, and safe extraction.
 
-Two duties of ADR 0019 decision 8 live here, and they are separate on
+Two duties of the ingress hardening floor live here, and they are separate on
 purpose.
 
 **Receiving** is :class:`Upload`. ``send-context`` and ``extend-context``
 announce an archive in their JSON payload — its compressed size and its
-SHA-256 — and the bytes follow as WebSocket BINARY frames (E41). The
+SHA-256 — and the bytes follow as WebSocket BINARY frames. The
 announcement is not trusted and neither is the size: the receiver counts
 what actually arrives, hashes it, and decompresses it as it goes, so a
-cap can refuse **mid-stream**. That is the whole point of the ADR's word
+cap can refuse **mid-stream**. That is the whole point of doing this
 *streaming*, and the reason the 8 MiB ``max_msg_size`` in
 :mod:`mcuhome.buildserver.ws` is explicitly *not* the ingress cap: a
 limit that only fires once the bytes are on the host is not a limit.
@@ -23,17 +23,16 @@ one-shot decompressor: the compressed bytes are pushed through
 refuses the moment the cumulative budget is spent. A bomb therefore
 costs at most one chunk beyond the cap instead of the whole expansion.
 
-**Unpacking** is :func:`unpack`. It is the ADR's safe-extraction rule
-and the build-container contract §9.1 duty of the same name, stated
-once: regular files and directories only; absolute paths, ``..``,
+**Unpacking** is :func:`unpack`. It is this server's safe-extraction
+rule, stated once: regular files and directories only; absolute paths, ``..``,
 symlinks, hardlinks and device nodes rejected; writes confined to
 ``context.yaml`` at the root plus ``model/``, ``keys/`` and
 ``patches/<layer>/``; ``manifest.yaml`` never an extraction target,
 because it is written by this side at ``lock-context``.
 
 The archive format is **tar.zst** and there is no negotiation of it: one
-format, chosen for family consistency with the SDK package the same
-contract pins (E41). A client that sends anything else is refused by the
+format, chosen for family consistency with the SDK package this server
+fetches the same way. A client that sends anything else is refused by the
 decompressor or by ``tarfile``, and that refusal is answered with the
 pre-registry ``bad_request`` code — see :func:`_unreadable`.
 
@@ -88,7 +87,7 @@ __all__ = [
 #: down a second time.
 MODEL_DIR = MODEL_FILE.split("/", 1)[0]
 
-#: Exactly 64 lowercase hex digits — build-container contract §3.3.1's
+#: Exactly 64 lowercase hex digits — this session protocol's own
 #: spelling for a bare hash. The archive hash is not part of any context
 #: identity, but a server that accepted ``SHA256:AB…`` here and refused
 #: it three fields later would be teaching clients two spellings.
@@ -100,7 +99,7 @@ _SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
 _COPY_BLOCK = 1 << 20
 
 #: How long one path component and one whole context path may be, in
-#: bytes. Not caps in ADR 0019 decision 8's sense and not configuration:
+#: bytes. Not caps in the ingress hardening floor's sense and not configuration:
 #: they are the filesystem's own limits (``NAME_MAX`` is 255 on every
 #: filesystem this server runs on, ``PATH_MAX`` 4096), and an operator
 #: raising them would only move the refusal from this module into
@@ -117,7 +116,7 @@ MAX_PATH_BYTES = 1024
 
 @dataclass(frozen=True)
 class IngressCaps:
-    """The five caps of ADR 0019 decision 8, as values.
+    """The five ingress hardening caps, as values.
 
     A frozen record rather than module constants, because the numbers
     are configuration ("the config is the policy") and because a test
@@ -147,7 +146,7 @@ class IngressLedger:
     """What one session has already spent of its budgets.
 
     The caps count **cumulatively across the base context and every
-    extension** (E44): ``extend-context`` is repeatable, so a per-archive
+    extension**: ``extend-context`` is repeatable, so a per-archive
     cap would bound nothing at all — a client would simply send the
     same bytes twice.
 
@@ -193,9 +192,9 @@ def _unreadable(reason: str) -> ProtocolError:
     Pre-registry on purpose. The typed registry of
     :mod:`mcuhome.buildserver.errors` describes a *session's* refusals —
     a cap, a forbidden path, a hash that disagrees — and none of its
-    entries means "these bytes are not an archive". No ADR names a code
-    for it either, and adding one is a protocol decision rather than an
-    implementation choice, so this answers in the envelope's own
+    entries means "these bytes are not an archive". Adding one is a
+    protocol decision rather than an implementation choice, so this
+    answers in the envelope's own
     vocabulary (``bad_request``, "the frame was not understood, always
     the client's fault") instead of inventing a code that would then be
     append-only forever.
@@ -209,8 +208,8 @@ class _Spool:
     ``zstandard``'s ``stream_writer`` calls :meth:`write` with at most
     one output buffer (128 KiB) per call, so raising from here stops a
     decompression bomb after one chunk over the budget rather than after
-    the whole expansion. That is the mechanism behind the ADR's
-    "enforced *streaming* during upload"; a decompressor that returned
+    the whole expansion. That is the mechanism behind enforcing this cap
+    *streaming* during upload; a decompressor that returned
     its output as one ``bytes`` would have allocated the bomb before any
     check could run.
     """
@@ -241,16 +240,15 @@ class Upload:
     :meth:`feed` for every BINARY frame — synchronously, so no queue can
     grow behind it — and the verb handler waits on :meth:`result`, which
     is what turns "the bytes arrived and hashed correctly" into the
-    command's own answer. That is E41's acknowledgement: the result
-    frame of ``send-context`` *is* the acknowledgement, correlated by
+    command's own answer. That is this upload's acknowledgement: the
+    result frame of ``send-context`` *is* the acknowledgement, correlated by
     the frame id like every other answer, so no new frame kind is
     needed.
 
     The declared hash is checked against the bytes actually received and
-    a disagreement is ``context.integrity-mismatch`` — ADR 0019 decision
-    8's "never trust client-declared hashes … declared values are
-    advisory", applied to the one hash the client declares about the
-    transport itself.
+    a disagreement is ``context.integrity-mismatch``: client-declared
+    hashes are never trusted and are only advisory, applied to the one
+    hash the client declares about the transport itself.
     """
 
     def __init__(
@@ -267,8 +265,8 @@ class Upload:
         if _SHA256_HEX.fullmatch(declared_sha256) is None:
             raise ProtocolError(
                 'An announced archive declares its "sha256" as exactly 64 lowercase hex '
-                "digits, the one spelling the build-container contract fixes for a bare "
-                f"hash (§3.3.1); this one reads {declared_sha256!r}."
+                "digits, the one spelling this server expects for a bare "
+                f"hash; this one reads {declared_sha256!r}."
             )
         # The compressed cap is checked twice, and both are needed. Here,
         # against the *declared* size, so an archive that cannot fit is
@@ -355,8 +353,8 @@ class Upload:
 
         *timeout* is the session's own idle timeout rather than a number
         of this module's making. A client that announces an archive and
-        then sends nothing is precisely an idle session — the ADR's
-        idle timeout "counts absent commands" and this is a command that
+        then sends nothing is precisely an idle session — the idle
+        timeout counts absent commands and this is a command that
         never finished — so the deadline that already exists is the one
         that applies, and there is no second number to invent.
         """
@@ -401,7 +399,7 @@ def check_path_shape(name: str) -> str:
     rejects ``.`` and ``..`` segments there. Silently rewriting ``./x``
     to ``x`` here would accept a context whose own identity rule then
     refuses it — two spellings for one file, which is exactly what
-    build-container contract §3.3.1 exists to prevent.
+    this rule exists to prevent.
     """
     cleaned = name.rstrip("/")
     usable = (
@@ -481,8 +479,8 @@ def type_conflict(path: str, *, conflict: str, where: str) -> SessionError:
 def patch_layer_of(path: str) -> str | None:
     """The patch layer *path* belongs to, or ``None`` if it is not a patch.
 
-    The whole of patch semantics, as ADR 0018 decision 2 defines it: a
-    patch's layer **is** its subfolder. There is no declared patch list
+    The whole of patch semantics: a patch's layer **is** its subfolder.
+    There is no declared patch list
     anywhere in the format, which is what lets a server re-derive its
     policy from the files actually present and be sure nothing disagrees.
     """
@@ -495,7 +493,7 @@ def patch_layer_of(path: str) -> str | None:
 def check_file_target(path: str, *, allow_context_file: bool) -> None:
     """Refuse a file the context layout has no place for.
 
-    The whitelist is ADR 0019 decision 8's: ``context.yaml`` and
+    The whitelist: ``context.yaml`` and
     ``build-context.json`` at the root plus ``model/``, ``keys/`` and
     ``patches/<layer>/``. ``patches`` is the one subtree with a fixed
     depth, because a layer folder holds patch files and nothing else — a
@@ -592,8 +590,8 @@ def check_patch_layer(layer: str, allowed_layers: frozenset[str], *, where: str)
     third-party ``x-`` name that nobody listed. Three different reasons
     to say no, one thing the client has to do about it.
 
-    Exported because ADR 0019 §2 requires the layer set to be re-derived
-    "from the files *actually present*" after every extension, and that
+    Exported because the layer set must be re-derived
+    from the files *actually present* after every extension, and that
     re-derivation must reach the same verdict as this one — which it can
     only be sure of by being this one.
     """
@@ -629,7 +627,7 @@ def unpack(
     upload leave a session exactly as it found it.
 
     The archive's own mode bits are discarded rather than applied. A
-    mode is not context content — nothing in the format or the contract
+    mode is not context content — nothing in the format
     reads one — and honouring it would let an archive ask for setuid
     bits on a file this server owns.
     """
@@ -650,15 +648,14 @@ def unpack_tree(
     caps: IngressCaps,
     quota_bytes: int,
 ) -> tuple[str, ...]:
-    """Safe extraction with **no layout whitelist** — the SDK package (E48).
+    """Safe extraction with **no layout whitelist** — the SDK package.
 
     The same extraction rule as :func:`unpack` and deliberately the same
     code path: regular files and directories only; absolute paths, ``..``
     after normalization, symlinks, hardlinks and device nodes rejected.
-    Build-container contract §9.1 states that rule once for "whatever
-    transport delivered" an input, and a second implementation of it in
-    this repository would be a second chance to get a symlink escape
-    wrong.
+    This server states that rule once for whatever transport delivered
+    an input, and a second implementation of it in this repository
+    would be a second chance to get a symlink escape wrong.
 
     What is dropped is only the part that is about a *context*: the
     ``context.yaml`` / ``model/`` / ``keys/`` / ``patches/<layer>/``
@@ -696,7 +693,7 @@ class _Layout:
 
 @dataclass(frozen=True)
 class _ContextLayout(_Layout):
-    """ADR 0019 decision 8's whitelist, plus the patch policy on it."""
+    """This server's ingress whitelist, plus the patch policy on it."""
 
     allowed_layers: frozenset[str]
     allow_context_file: bool

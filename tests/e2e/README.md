@@ -1,7 +1,7 @@
 # The end-to-end job
 
 One real remote build, with nothing faked: this server as a process, a
-real build container, `mcuhome device build --build-target remote` driven
+real build environment, `mcuhome device build --build-target remote` driven
 at it over a real socket, and a signed image at the end.
 
 ## Why it exists
@@ -39,7 +39,7 @@ directory exists to prevent.
    cannot pass by emptiness.
 7. The signed image verifies against the public key, through the same
    imgtool lookup the workbench signs with.
-8. The server kept nothing after the session closed (ADR 0019).
+8. The server kept nothing after the session closed.
 
 ## The device
 

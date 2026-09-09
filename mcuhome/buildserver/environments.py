@@ -2,27 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Which build environments this server is willing to run.
 
-A build context names its build environment itself, pinned to a digest,
-and that pin arrives **from the client**. Everything else about the pin
-is verified — the digest binds one set of bytes, the image's labels are
-checked against what it claims, ``describe`` has to answer conformingly
-— but none of that answers the one question an operator actually has:
-*may this server run that image at all?*
+A build context names its build environment by the package set it
+pins, and that pin arrives **from the client**. Everything else about
+the pin is verified — the digest binds one set of bytes, and the
+image's labels are checked against what the context asked for — but
+none of that answers the one question an operator actually has: *may
+this server even talk to that image at all?*
 
-It is a separate question from every other gate here, and it is the
-first one, because the gates below it all cost a container:
-
-* ``docker run --rm <image> cat /mcuhome/describe.json`` reads the
-  static self-description (§2.2.1) — and a ``cat`` argument does not
-  displace an image's own ``ENTRYPOINT``;
-* ``describe`` starts the program deliberately.
-
-So by the time an image's labels are read, it has already run. A
-conformance check cannot be the thing that decides whether a stranger's
-image is allowed to execute, because it happens too late — and it is a
-weak filter besides: a label is a string anybody can put in a
-Dockerfile, which is exactly why the contract calls labels "a pre-start
-hint".
+It is a separate question from every other check here, and it is the
+first one: the image's labels are read by inspecting it, with no
+container started to get them, but even that inspection — and pulling
+the image, where the operator allows it — reaches whatever registry the
+reference names. A pin that fails the allowlist must not cost that
+registry request.
 
 **The allowlist is the boundary, and it is always on.** It holds
 repositories, not tags and not digests: a repository is the thing an

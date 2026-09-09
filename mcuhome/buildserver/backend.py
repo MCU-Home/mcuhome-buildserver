@@ -965,7 +965,7 @@ class SessionBackend:
         pins: ContextPins,
         context_id: str,
     ) -> InvocationRecord:
-        """Start one working invocation and answer immediately (E46).
+        """Start one working invocation and answer immediately.
 
         The verb's answer is ``{invocation_id}`` and nothing else: the
         completion travels as a typed ``invocation.verdict`` event
@@ -1128,7 +1128,7 @@ class SessionBackend:
         )
 
     def _verdict(self, outcome: LocalOutcome, record: InvocationRecord) -> dict[str, Any]:
-        """The payload of the ``invocation.verdict`` frame (E46, E58).
+        """The payload of the ``invocation.verdict`` frame.
 
         It carries the status and the artifact list, plus the two things
         a client cannot get anywhere else: the context id **this server**

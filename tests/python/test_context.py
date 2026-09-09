@@ -3,8 +3,8 @@
 """The context path: the wire, the ingress caps, safe extraction, policy.
 
 Every test here sends real bytes over a real socket. That is deliberate
-and it is what the previous skeleton could not do: the caps of ADR 0019
-decision 8 are specified as *streaming*, and a cap can only be shown to
+and it is what the previous skeleton could not do: the caps of the
+ingress hardening floor are specified as *streaming*, and a cap can only be shown to
 be streaming by being fed something that would be fatal if it were not.
 """
 
@@ -78,9 +78,9 @@ async def test_send_context_accepts_a_base_context_and_answers_its_pins(
 ) -> None:
     """The happy path, and the shape of the answer.
 
-    ADR 0019 §2 spells ``send-context(archive)`` and that one word is the
-    whole wire specification the verb set gives it; the rest is E41 —
-    the JSON payload announces the compressed size and the SHA-256, the
+    The verb set spells ``send-context(archive)`` and that one word is
+    the whole wire specification it gives; the rest is this server's own
+    — the JSON payload announces the compressed size and the SHA-256, the
     bytes follow as BINARY frames, and the verb's own result frame is
     the acknowledgement. What comes back is what this server decided:
     the pins it accepted and where the context now stands.
@@ -345,9 +345,8 @@ async def test_a_base_context_without_context_yaml_is_refused(client, state) -> 
     """The pin document is required even for an empty context.
 
     Two of the three inputs of the context ID live in it, so a context
-    without one has no identity to freeze. "Empty" in ADR 0019's "a
-    context that was sent but is empty may be locked" means no *content*
-    files, which is a different thing.
+    without one has no identity to freeze. "Empty" means no *content*
+    files here, which is a different thing.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
@@ -426,8 +425,8 @@ async def test_more_bytes_than_announced_are_cut_off(client) -> None:
 
 
 async def test_binary_frames_outside_an_announced_upload_are_still_refused(client) -> None:
-    """ "The ws layer must accept BINARY frames only while an upload is
-    announced, and keep refusing them otherwise" (E41).
+    """The ws layer accepts BINARY frames only while an upload is
+    announced, and keeps refusing them otherwise.
 
     The frame cannot say what it is — it carries no id and no session —
     so the announcement is the only thing that can, and outside one this
@@ -482,7 +481,7 @@ async def test_an_announcement_needs_both_of_its_two_values(client) -> None:
 
 
 async def test_an_archive_hash_in_the_wrong_spelling_is_refused(client) -> None:
-    """One spelling per hash, everywhere (contract §3.3.1).
+    """One spelling per hash, everywhere.
 
     The archive hash is not part of any context identity, so nothing
     breaks if it is uppercase — which is exactly why it is worth
@@ -564,7 +563,8 @@ async def test_the_entry_count_cap_fires(aiohttp_client, config) -> None:
     """Many small files are a bomb too, in inode terms.
 
     Nothing about the byte caps notices ten thousand empty files, which
-    is why the entry count is a cap of its own in the ADR's list.
+    is why the entry count is a cap of its own in the ingress hardening
+    floor's list.
     """
     client, _ = await serve(aiohttp_client, config, max_entries=3)
     archive = base_context(**{f"model/{index}.json": b"{}" for index in range(6)})
@@ -770,7 +770,7 @@ async def test_a_refused_upload_leaves_the_session_exactly_as_it_was(
 async def test_the_archives_own_mode_bits_are_discarded(client, state, package_source) -> None:
     """A mode is not context content.
 
-    Nothing in the format or the contract reads one, so honouring it
+    Nothing in the format reads one, so honouring it
     would only let an archive ask for bits — setuid above all — on a
     file this server owns and later mounts into a build environment.
     """
@@ -841,7 +841,7 @@ async def test_an_allowed_layer_passes_and_the_patch_lands(
 async def test_mcuboot_is_a_layer_an_operator_can_allow(
     aiohttp_client, config, package_source
 ) -> None:
-    """Contract §1.1 names four layers and this server knew three.
+    """This server's own layer set names four layers and this server knew three.
 
     ``mcuboot`` is a layer because every device build is ``west build
     --sysbuild`` with MCUboot as the second image, so a context that
@@ -917,10 +917,10 @@ def test_the_configuration_accepts_the_four_names_and_the_x_prefix() -> None:
 
 
 def test_the_caps_and_the_context_root_are_configuration() -> None:
-    """ "The config is the policy" applies to the numbers too (E44).
+    """ "The config is the policy" applies to the numbers too.
 
-    ADR 0019 decision 8 requires the caps and names no number for any of
-    them, so every one of them is an operator's to move — including from
+    The ingress hardening floor requires the caps and names no number
+    for any of them, so every one of them is an operator's to move — including from
     the environment, which is what an App's ``run`` script and a
     ``docker run`` have.
     """
@@ -994,9 +994,9 @@ async def test_a_context_yaml_the_format_does_not_describe_is_refused(
     anchor graph is how a small file becomes a large one inside a parser
     that runs before any cap of this server sees the result.
 
-    The two hash cases are build-container contract §3.3.1: "invalid
-    input, not something to normalize", refused "naming the offending
-    value" and without computing an ID from it.
+    The two hash cases are refused as invalid input, not something to
+    normalize, naming the offending value and without computing an ID
+    from it.
     """
     archive = make_archive({"context.yaml": document.encode()})
     async with client.ws_connect("/ws", headers=auth()) as ws:
@@ -1238,8 +1238,8 @@ async def test_an_extension_that_removes_and_adds_the_same_path_keeps_the_new_on
 async def test_an_extension_may_not_touch_context_yaml(client, how, package_source) -> None:
     """``context.pins-immutable``, in both directions.
 
-    ADR 0018 requires "an attempt is a typed error" and names this code;
-    it is registered deliberately apart from
+    An attempt to touch it must be a typed error, and this code was
+    registered for exactly that; it is registered deliberately apart from
     ``context.unsafe-entry``. A ``context.yaml`` in an extension is a
     perfectly well-formed entry aimed at a forbidden target, and telling
     a client its path was unsafe would send it looking for the wrong
@@ -1860,8 +1860,8 @@ async def test_an_archive_that_names_one_path_twice_is_ambiguous(client, state) 
 def test_the_patch_policy_recheck_refuses_on_its_own(tmp_path: Path) -> None:
     """The second guard, pinned independently of the first.
 
-    ADR 0019 §2 requires the layer set to be re-derived "from the files
-    *actually present*" after every extension, and both call sites of
+    The layer set is re-derived from the files
+    *actually present* after every extension, and both call sites of
     this function could be deleted with the suite green — the test named
     after the rule is in fact answered by the ingress-time check, which
     refuses a denied patch before it is ever written. Testing this one as
@@ -1938,8 +1938,7 @@ def test_the_context_root_is_created_private_and_level_by_level(tmp_path: Path) 
 
 
 def test_a_relative_context_root_is_refused_at_startup(tmp_path: Path, monkeypatch) -> None:
-    """Contract §5.2 rule 4: "a path value that is not absolute ⇒
-    ``unsupported.request``".
+    """Every path in this server's own directories must be absolute.
 
     Every path in an invocation's request document descends from the
     context root — ``out``, ``work``, ``tmp``, ``context``, ``result``,
@@ -2042,8 +2041,9 @@ def test_a_context_root_owned_by_somebody_else_refuses_to_serve(
 
 
 def test_the_two_informational_pin_fields_may_be_empty(tmp_path) -> None:
-    """Contract §3.2: constraint is "original intent — never hashed" and
-    package.url is "hint only — never hashed". The reference client
+    """The build context format calls constraint "the intent, not the
+    answer" and package.url a hint that may be empty — neither is ever
+    hashed. The reference client
     writes both empty for a local source (an unstated constraint is PEP
     440's empty "any", and a file:// hint would leak its filesystem
     layout here), so an empty statement is accepted; a missing key or a

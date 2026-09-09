@@ -21,16 +21,15 @@ renamed, never removed and never re-classified to a different
 ``retryable``; fixing a bad name means adding a new code and letting the
 old one age out of use. Codes are dotted, and the first segment is the
 ``layer`` — one of :data:`LAYERS`. The ``x-`` prefix is reserved for
-third-party build containers and is deliberately not registered here:
+third-party build environments and is deliberately not registered here:
 an ``x-*`` code passes through with whatever the third party declared,
 under the unknown-code rule above.
 
 **Append-only starts at the first published entry**, and nothing here
 has been published: this package is ``0.1.0.dev0``, no release exists
-and no client is implemented against it. ADR 0019's amendment says as
-much of the protocol's own registry, and that window is the only reason
+and no client is implemented against it. That window is the only reason
 ``session.manifest-immutable`` could be *taken out* rather than left to
-age — ADR 0019's amendment replaced the rule it encoded outright (see
+age — the rule it encoded was replaced outright (see
 the ``context.*`` block, which has the two codes that replaced it). The
 window closes at the first release; after that a wrong entry can only be
 superseded, never removed.
@@ -54,9 +53,9 @@ __all__ = [
 #:
 #: **Two joined on 2026-08-10, with the container backend**, and both
 #: name a thing the six could not. ``sdk`` is the one external input the
-#: backend fetches and hash-verifies on a client's behalf (ADR 0019 §8,
-#: contract §9.1) — not a policy, not a version negotiation and not the
-#: builder, which is the thing that consumes it. ``artifact`` is what
+#: backend fetches and hash-verifies on a client's behalf — not a policy,
+#: not a version negotiation and not the builder, which is the thing that
+#: consumes it. ``artifact`` is what
 #: ``get-artifact`` addresses beside an invocation id: a path that is
 #: not a declared artifact is a statement about the artifact and not
 #: about the invocation, which exists and answered.
@@ -173,7 +172,7 @@ REGISTRY: dict[str, ErrorCode] = _seed(
         "context.integrity-mismatch",
         retryable=False,
         summary="a recomputed file hash or the context id disagrees with the received bytes, "
-        "or the serving build container could not read the manifest this server wrote",
+        "or the serving build environment could not read the manifest this server wrote",
     ),
     # The summary was widened on 2026-08-10 to name the type collision —
     # one path that has to be a file and a directory at once, in one
@@ -193,7 +192,7 @@ REGISTRY: dict[str, ErrorCode] = _seed(
     ),
     # The two codes the explicit freeze verb exists to produce. They
     # replace `session.manifest-immutable`, whose rule — "manifest.yaml
-    # is immutable for the session's lifetime" — ADR 0019's amendment
+    # is immutable for the session's lifetime" — was
     # replaced rather than kept: before the lock there is no manifest at
     # all, `context.yaml` is what may not change, and after the lock the
     # context is closed to writes entirely. The old code was unreachable
@@ -210,9 +209,9 @@ REGISTRY: dict[str, ErrorCode] = _seed(
         summary="a working command arrived before lock-context; verify and build run only "
         "from the lock onwards",
     ),
-    # ADR 0018's amendment requires "an attempt is a typed error" for an
-    # extension that touches `context.yaml` and names no code for it; the
-    # product owner registered this one on 2026-08-09. It is deliberately
+    # An extension that touches `context.yaml` needs a typed error and
+    # named no code for it; the product owner registered this one on
+    # 2026-08-09. It is deliberately
     # NOT `context.unsafe-entry`: that code is about extraction *shape* —
     # an absolute path, a `..`, a symlink — while a `context.yaml` in an
     # extension is a perfectly well-formed entry aimed at a forbidden
@@ -224,7 +223,7 @@ REGISTRY: dict[str, ErrorCode] = _seed(
         summary="an extension tried to write or remove context.yaml; it carries the pins "
         "the session was admitted on, and changing them is a new session",
     ),
-    # E43: a second `send-context` before the lock. Not `context.locked`
+    # A second `send-context` before the lock. Not `context.locked`
     # (nothing is frozen yet) and not an implicit replacement: the pins
     # were already accepted and answered, and replacing them mid-session
     # is the one thing the format forbids for a session's lifetime.
@@ -244,7 +243,7 @@ REGISTRY: dict[str, ErrorCode] = _seed(
         "version.context-format-unsupported",
         retryable=False,
         summary="the context format version (declared in context.yaml) is outside the range "
-        "this server, or the build container serving the session, implements",
+        "this server, or the build environment serving the session, implements",
     ),
     ErrorCode(
         "version.verb-unknown",
@@ -254,22 +253,22 @@ REGISTRY: dict[str, ErrorCode] = _seed(
     ),
     # The requirement lives in `context.yaml` and arrives with
     # `send-context`; `manifest.yaml` only exists once `lock-context` has
-    # written it (ADR 0018's amendment) and repeats the requirement
+    # written it and repeats the requirement
     # beside the resolution this server chose for it.
     #
-    # The summary was widened by E61, which took the `container.digest`
-    # pin out of the context format: this code never meant the pin
+    # The summary was widened when the `container.digest`
+    # pin was taken out of the context format: this code never meant the pin
     # specifically, it meant "the image this session would build in is
     # not one this server can invoke a build on", and both of its raisers
     # still say exactly that — an image the runtime cannot produce facts
-    # for, and an image whose `describe` contradicts its own labels.
+    # for, and an image whose declared labels do not match what this session needs.
     ErrorCode(
         "version.builder-unavailable",
         retryable=False,
-        summary="the build container this session would use cannot serve it: the image is "
-        "not on this host, or its describe answer contradicts its labels",
+        summary="the build environment this session would use cannot serve it: the image is "
+        "not on this host, or its labels do not match what this session needs",
     ),
-    # E61's refusal, and a sibling of the entry above rather than a
+    # A sibling of the entry above rather than a
     # rename of it. The two answer different questions and a client can
     # act on exactly one of them: `builder-unavailable` is about ONE
     # image — named in the details, actionable only by this server's
@@ -293,11 +292,11 @@ REGISTRY: dict[str, ErrorCode] = _seed(
         "retryable because its usual causes — no network, a registry wanting a login — "
         "come back",
     ),
-    # invocation.* — one invocation of the build container's program,
-    # addressed by the server-assigned invocation id (ADR 0019 decision
-    # 2). One entry, on purpose: a cancel that races a natural
-    # completion is answered `already_finished` and is NOT an error —
-    # both parties behaved correctly (second amendment).
+    # invocation.* — one invocation of the build environment's program,
+    # addressed by the server-assigned invocation id. One entry, on
+    # purpose: a cancel that races a natural completion is answered
+    # `already_finished` and is NOT an error — both parties behaved
+    # correctly.
     ErrorCode(
         "invocation.unknown",
         retryable=False,
@@ -306,10 +305,11 @@ REGISTRY: dict[str, ErrorCode] = _seed(
     # builder.* — the thing that builds, whatever shape it takes. The
     # spelling was settled by the product owner on 2026-08-09, before the
     # first release made the registry append-only: the prefix names the
-    # ROLE, not the deployment. The build container is the builder here,
-    # but the builder is not necessarily the build container — in the
-    # a machine that builds without one has no container at all, and its
-    # build environment fails under exactly these codes. `builder.failed`
+    # ROLE, not the deployment. In the container profile, the build
+    # environment's container is the builder; the builder is not
+    # necessarily a container — in the subprocess profile a machine that
+    # builds without one has no container at all, and its build
+    # environment fails under exactly these codes. `builder.failed`
     # says the one thing a client needs: the thing that was building had
     # an error; what stood behind it is the session's business.
     # This is deliberately not a leftover of the retired terminology —
@@ -329,7 +329,7 @@ REGISTRY: dict[str, ErrorCode] = _seed(
     ErrorCode(
         "builder.crashed",
         retryable=True,
-        summary="the build container died without a result document — an infrastructure "
+        summary="the build environment died without a result document — an infrastructure "
         "failure, not a verdict on the context",
     ),
     # The third pre-start refusal of the container backend, and the one
@@ -338,15 +338,17 @@ REGISTRY: dict[str, ErrorCode] = _seed(
     # is untouched, and the same command works once the runtime is up —
     # which is exactly the promise `retryable: true` makes. A missing
     # *image* is deliberately not this code: it is
-    # `version.builder-unavailable`, because contract v1 of this server
-    # pulls nothing and "not on this host" is therefore a final answer.
+    # `version.builder-unavailable`, because a session does not silently
+    # substitute another image for the one it already resolved — refetching
+    # one gone missing would attribute the build to an image the manifest
+    # never named, so "not on this host" is a final answer for that check.
     ErrorCode(
         "builder.runtime-unavailable",
         retryable=True,
         summary="this server cannot reach its container runtime at all — no docker binary, "
         "or a daemon that is down",
     ),
-    # sdk.* — the one external input the backend fetches (ADR 0019 §8).
+    # sdk.* — the one external input the backend fetches.
     ErrorCode(
         "sdk.unavailable",
         retryable=False,
@@ -361,7 +363,7 @@ REGISTRY: dict[str, ErrorCode] = _seed(
         "paths it did declare",
     ),
     # The one genuinely new situation of the delivery re-verification:
-    # §9.3's egress check ran when the invocation ended, and the bytes
+    # the egress check ran when the invocation ended, and the bytes
     # behind a verified artifact are not those bytes any more when the
     # client asks for them. Not `artifact.unknown` — the artifact was
     # declared and was verified — and not `context.integrity-mismatch`,

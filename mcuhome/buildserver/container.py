@@ -95,9 +95,9 @@ class ImageFacts:
 
     ``digest`` is the **repo digest** — the value a backend names a
     chosen image by, and records in ``manifest.yaml``'s ``container``
-    block — and not the image ID: contract §3.3.1 fixes the spelling and
-    ADR 0018 makes it the one name for an image that cannot be moved to
-    other bytes. It is ``None`` for an image that was built locally and
+    block — and not the image ID: the repo digest is the one name for an
+    image that cannot be moved to other bytes. It is ``None`` for an
+    image that was built locally and
     never pushed, which is a perfectly ordinary image; such an image is
     served and recorded with ``digest: null``, because it names no bytes
     anybody could fetch. It is ``None`` for the same reason when
@@ -143,7 +143,7 @@ def _no_runtime(program: str, what: str) -> SessionError:
     """
     return SessionError(
         "builder.runtime-unavailable",
-        f"This build server drives build containers and {what}. It orchestrates builds "
+        f"This build server drives build environments and {what}. It orchestrates builds "
         "and is never itself a build environment, so there is nothing it can fall back "
         "to; the session is untouched and the command can be retried once the container "
         "runtime is up.",
@@ -349,7 +349,7 @@ def _facts_from(reference: str, data: dict[str, Any]) -> ImageFacts:
     also pushed to a local mirror, or simply retagged for a private name
     — and ``RepoDigests`` then holds one entry per repository, each with
     that registry's own digest. A digest is only a name *within* its
-    repository: ``mirror/build-container@sha256:<the ghcr digest>``
+    repository: ``mirror/other-image@sha256:<the ghcr digest>``
     resolves nowhere, so pairing across repositories would compose a
     reference this host cannot answer and hand it to ``docker run`` on a
     server whose whole invariant is that it pulls nothing — and would

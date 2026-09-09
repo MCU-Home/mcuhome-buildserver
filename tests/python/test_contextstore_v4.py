@@ -120,7 +120,10 @@ def environment_block(workspace: str) -> str:
         ),
         ("no tools entry", "{workspace: {name: w, version: '1', sha256: '" + "a" * 64 + "'}}"),
         ("no workspace entry", "{tools: " + GOOD_TOOLS + "}"),
-        ("a scalar where the set belongs", "ghcr.io/mcu-home/build-container@sha256:" + "b" * 64),
+        (
+            "a scalar where the set belongs",
+            "registry.example.test/other/environment@sha256:" + "b" * 64,
+        ),
         ("a list where the set belongs", "[]"),
     ],
 )

@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Egress: what is not served, and the download archive.
 
-Contract §9.3 opens with the reason all of this exists: "``out`` is
+The reason all of this exists: ``out`` is
 written by the least trusted component in the system and its contents
-travel over the network onto other people's machines." The cases below
-are the ones a build container would have to be hostile or broken to
+travel over the network onto other people's machines. The cases below
+are the ones a build environment would have to be hostile or broken to
 produce, which is exactly why they are stated directly rather than
 through a session.
 """
@@ -60,7 +60,7 @@ def test_undeclared_files_are_not_served_and_not_deleted(tmp_path: Path) -> None
 
 
 # --------------------------------------------------------------------------
-# The download archive (E45)
+# The download archive
 # --------------------------------------------------------------------------
 
 

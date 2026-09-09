@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""The bearer token, where it comes from, and where it is left (ADR 0006).
+"""The bearer token, where it comes from, and where it is left.
 
-ADR 0006 decision 1 chose WebSocket plus a bearer token over ESPHome's
-Noise handshake, for one reason recorded as the product owner's: **a
-WebSocket over HTTPS traverses firewalls, NAT and reverse proxies
-naturally**, and a build server outside the home network is the expected
-case rather than the exotic one. The cost of that choice is stated
+WebSocket plus a bearer token was chosen over ESPHome's Noise handshake,
+for one reason recorded as the product owner's: **a WebSocket over HTTPS
+traverses firewalls, NAT and reverse proxies naturally**, and a build
+server outside the home network is the expected case rather than the
+exotic one. The cost of that choice is stated
 rather than hidden — a build server reachable from the internet **must**
 sit behind TLS, because a bearer token on a plaintext connection is a
 token that has been given away.
@@ -23,7 +23,7 @@ none gets one generated at startup and logged once — the code-server
 pattern the dashboard already uses for its password, and the reason a
 fresh container is usable in one step without ever being open.
 
-**Same-host pairing** (ADR 0006 decision 8): when both Apps run on one
+**Same-host pairing**: when both Apps run on one
 Home Assistant instance they share a ``/share`` mount, so the token is
 written to a file there and the dashboard finds it. It is written only
 when the directory already exists, which is exactly the condition "we
@@ -69,7 +69,7 @@ logger = logging.getLogger(__name__)
 
 TOKEN_HEADER = "Authorization"
 
-#: Where a Home Assistant App pair meets (ADR 0006 decision 8).
+#: Where a Home Assistant App pair meets.
 DEFAULT_PAIR_FILE = Path("/share/mcuhome/build-server.token")
 
 #: Application key holding the server state.
@@ -79,7 +79,7 @@ STATE_KEY: web.AppKey[Any] = web.AppKey("mcuhome.buildserver_state")
 #: nothing about what it holds, which is what an orchestrator's liveness
 #: probe needs and all it may have. Everything else is gated — which
 #: today means ``/ws``, and with it every answer about what this server
-#: can build: the ``capabilities`` verb names build-container images and
+#: can build: the ``capabilities`` verb names build-environment images and
 #: patch policy, an inventory of the machine and not something to hand
 #: to an unauthenticated caller.
 OPEN_PATHS = frozenset({"/health"})

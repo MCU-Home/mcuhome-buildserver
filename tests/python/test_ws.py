@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The ``/ws`` transport itself: the outbox, the refusals, the teardown.
 
-Dashboard ADR 0012 decision 3 carries the transport of ADR 0006 forward
-unchanged while replacing its vocabulary, so these properties outlived
+This transport carries forward unchanged from an earlier protocol while
+replacing its vocabulary, so these properties outlived
 the job protocol that used to exercise them: the drop-oldest outbox was
 covered only through ``job_output`` events, and the disconnect teardown
 only through ``follow_job``. They are asserted directly here instead.

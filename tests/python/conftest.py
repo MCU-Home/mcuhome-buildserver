@@ -831,12 +831,13 @@ async def collect(ws, *, until: str, timeout: float = 15) -> list[dict]:
     Event frames carry no frame id — they belong to an invocation rather
     than to a command — so a test that waits for one waits on its name.
 
-    **The name is enough** since E58. The end of an invocation is
+    **The name is enough.** The end of an invocation is
     ``invocation.verdict``, which is this server's own frame and no
-    program's: contract §8's frozen registry keeps ``invocation.finished``
-    for the program's announcement, so waiting for one can no longer stop
-    on the other. Before the rename this helper had to filter on the
-    absence of ``seq``, which is exactly the discrimination E58 replaced.
+    program's: the program's own frozen event vocabulary keeps
+    ``invocation.finished`` for its own announcement, so waiting for one
+    can no longer stop on the other. Before the rename this helper had to
+    filter on the absence of ``seq``, which is exactly the discrimination
+    the rename replaced.
     """
     frames: list[dict] = []
     while True:

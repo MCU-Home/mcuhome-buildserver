@@ -107,7 +107,7 @@ Needs Python ≥3.13; `requirements-dev.txt` installs it together with sibling
 checkouts of `mcuhome-sdk` (`packaging/model`) and `mcuhome-workbench`, the
 build environment this server orchestrates — see the file for the git-URL
 form when this is the only checkout. `scripts/test e2e` additionally needs a
-container runtime and the pinned build-container image.
+container runtime and the pinned build-environment image.
 
 ```sh
 python3 -m venv .venv && .venv/bin/pip install \

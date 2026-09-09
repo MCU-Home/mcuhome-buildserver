@@ -3,7 +3,7 @@
 """Session protocol v2 — the session registry and one handler per verb.
 
 The remote-build architecture replaced the one-shot job protocol with a
-**session model**: one session = one ephemeral build container = one
+**session model**: one session = one ephemeral build environment = one
 effective build context. The same verb set has a local backend (the
 workbench drives the container runtime directly) and this remote one,
 which adds auth, policy and scheduling on top of the identical verbs.
@@ -14,11 +14,11 @@ survived it is the transport underneath — the frame envelope, the
 connection handling and the bearer token.
 
 **The context has a lifetime of its own inside the session, and
-``lock-context`` is where the two part company** (ADR 0019's amendment
-of 2026-08-09). A context arrives, is extended any number of times, and
+``lock-context`` is where the two part company.** A context arrives, is
+extended any number of times, and
 is then frozen by an explicit verb; the freeze writes ``manifest.yaml``,
 computes the context ID and unlocks the working commands. That order is
-ADR 0019 §2's flow diagram, and it is what the state machine on
+this protocol's own flow, and it is what the state machine on
 :class:`Session` enforces::
 
     open-session       session id, lease, version negotiation (no context yet)
@@ -53,12 +53,12 @@ directory, the pin document and the freeze in
 ``verify`` and ``build`` re-measure the locked context, hand it to
 :mod:`mcuhome.buildserver.backend` and answer an invocation id
 immediately; the completion arrives as an ``invocation.verdict`` event
-with the status and the artifact list (E58 gave it that name of its own,
-so that it is never confused with the program's contract §8
-``invocation.finished``), the program's own events are relayed verbatim
-and its raw log travels as its own frame kind (E46).
+with the status and the artifact list, named on its own so that it is
+never confused with the program's own ``invocation.finished`` event,
+the program's own events are relayed verbatim
+and its raw log travels as its own frame kind.
 ``get-artifact`` answers a ``tar.zst`` announced in its result frame and
-streamed as BINARY frames behind it (E45), and ``attach-session``
+streamed as BINARY frames behind it, and ``attach-session``
 replays an invocation's events from a sequence number the client states
 — out of the NDJSON file on disk, which is the replay buffer.
 
@@ -71,7 +71,7 @@ a version mismatch is a typed rejection at the door, never a downstream
 failure. Container materialization is lazy by design — opening a
 session reserves nothing but a record and a lease, and the backend may
 defer creating a container until the first command that needs one,
-which is also why the serving container's own contract version is
+which is also why the serving environment's own spec generation is
 answered by ``send-context`` rather than here.
 """
 
@@ -150,15 +150,15 @@ __all__ = [
 ]
 
 #: Bumped when the *session* protocol changes shape. Version 2 because
-#: the one-shot job protocol of dashboard ADR 0006 was version 1. That
+#: the one-shot job protocol that came before was version 1. That
 #: protocol no longer exists here, but the number is not reclaimed: a
 #: client that speaks 1 must be told it is behind, not handed a 2 that
 #: means something else.
 SESSION_PROTOCOL_VERSION = 2
 
 #: The context format range this server accepts (`context: N` in the
-#: context's entry file `context.yaml`). Not "manifest format": ADR
-#: 0018's amendment splits the request from the record, and the version
+#: context's entry file `context.yaml`). Not "manifest format": the
+#: request is split from the record, and the version
 #: is declared in the document that travels with the base context —
 #: `manifest.yaml` repeats it, but that document is written by this side
 #: at `lock-context` and is never an input. Two constants for the same
@@ -190,16 +190,16 @@ PROFILES = ("oneshot", "dev", "test")
 #: in the context (``patches/<layer>/``); policy is always re-derived
 #: from the files actually present, never from a declared list.
 #:
-#: **Four**, since 2026-08-09: build-container contract §1.1 defines
+#: **Four**, since 2026-08-09: this server's own patch layers are
 #: ``zephyr``, ``sdk``, ``chip`` and ``mcuboot``, and ``mcuboot`` is a
 #: layer because every device build is ``west build --sysbuild`` with
 #: MCUboot as the second image. It was missing here, which meant an
-#: operator could not allow a layer the contract names.
+#: operator could not allow a layer this server otherwise knows.
 PATCH_LAYERS = ("sdk", "zephyr", "chip", "mcuboot")
 
-#: Third-party layer names carry an ``x-`` prefix, "so that two vendors
+#: Third-party layer names carry an ``x-`` prefix, so that two vendors
 #: cannot collide on one name and have a context silently patch the
-#: wrong tree" (contract §1.1). The registry of un-prefixed names is
+#: wrong tree. The registry of un-prefixed names is
 #: owned by the MCUHome project and is :data:`PATCH_LAYERS`; an ``x-``
 #: name is nameable by anyone and, like every other layer, allowed only
 #: where an operator listed it.
@@ -282,7 +282,7 @@ SHUTDOWN_RELEASE_SECONDS = 30.0
 
 #: Concurrent open sessions, per **server**. v1.0 is single-tenant and
 #: one bearer token is one principal, so a per-user quota would be a
-#: per-server quota with a misleading name (ADR 0019's amendment); the
+#: per-server quota with a misleading name; the
 #: per-user machinery, work metering and cost classes belong to the
 #: hosted phase and are not implemented here.
 DEFAULT_MAX_OPEN_SESSIONS = 4
@@ -323,7 +323,7 @@ SEAT_ID_BYTES = 12
 #: How long a session with no client attached is protected from being
 #: handed to somebody who is waiting.
 #:
-#: "Connection loss is never abandonment" (ADR 0019) is what makes
+#: Connection loss is never abandonment — that is what makes
 #: ``attach-session`` worth having, and it stays true: a session is taken
 #: away only when a *third party* wants the slot, and only after this
 #: much quiet. What it stops being is unconditional. With
@@ -375,8 +375,8 @@ STATE_CLOSED = "closed"
 #: session rather than random, because the id is a path segment
 #: (``invocations/<id>/``) and an ordinal is the one form that is
 #: readable in a log, sortable by age and impossible to collide inside
-#: the session that issues it. It is never named to the program —
-#: contract §5.2 has no invocation field, and the backend addresses an
+#: the session that issues it. It is never named to the program by this
+#: server's own choice — the backend addresses an
 #: invocation by the paths it chose for it — so nothing outside this
 #: server depends on the spelling.
 INVOCATION_ID = re.compile(r"inv-[1-9][0-9]{0,9}\Z")
@@ -386,7 +386,7 @@ INVOCATION_ID = re.compile(r"inv-[1-9][0-9]{0,9}\Z")
 #: first writing command": an implicit freeze needs an enumerated list
 #: of writing commands kept in sync with a verb set that is append-only
 #: by decision, and a third-party command could not know which side of
-#: the line it falls on (ADR 0019's amendment). The two states that
+#: the line it falls on. The two states that
 #: matter are named after the two typed errors that hang on them —
 #: `context.not-locked` while the context is still open to writes,
 #: `context.locked` once it is not.
@@ -396,8 +396,8 @@ CONTEXT_LOCKED = "locked"
 
 #: One invocation's place in its life, as `cancel` and `close-session`
 #: see it. The container backend moves invocations to FINISHED when a
-#: result document lands; CANCELLING is "the stop signal is set" — the
-#: acknowledged state of ADR 0019's second amendment, never "it
+#: result document lands; CANCELLING is "the stop signal is set" — an
+#: acknowledged state only, never "it
 #: stopped", which only the result document says.
 INVOCATION_RUNNING = "running"
 INVOCATION_CANCELLING = "cancelling"
@@ -414,8 +414,8 @@ _WORKING = (INVOCATION_RUNNING, INVOCATION_CANCELLING)
 class Session:
     """One admitted session: its identity, profile, lease and context state.
 
-    The session is admitted on **no context at all** — that is what
-    ADR 0019's amendment takes away from ``open-session`` — so a fresh
+    The session is admitted on **no context at all** — deliberately —
+    so a fresh
     session starts at :data:`CONTEXT_NONE` and the pins arrive later,
     with ``send-context``, in ``context.yaml``.
     """
@@ -453,7 +453,7 @@ class Session:
     #: starts and what the result document's own ``context`` is compared
     #: to when it comes back.
     context_id: str | None = None
-    #: What ``send-context`` learned about the build container serving
+    #: What ``send-context`` learned about the build environment serving
     #: this session, or ``None`` before it. Duck-typed rather than
     #: imported, because the verbs call the backend and the backend
     #: never calls the verbs.
@@ -470,8 +470,8 @@ class Session:
     #: integrity list by construction, so nothing else would notice.
     context_yaml_sha256: str | None = None
     #: What this session has spent of the ingress caps and its disk
-    #: quota. Cumulative across the base context and every extension
-    #: (E44), which is the only way a cap can bound a repeatable verb.
+    #: quota. Cumulative across the base context and every extension,
+    #: which is the only way a cap can bound a repeatable verb.
     ledger: IngressLedger = field(default_factory=IngressLedger)
     #: True while a context command is running. One at a time, per
     #: session — see :func:`_context_work`.
@@ -554,9 +554,10 @@ class Session:
         """Refuse a command that has no context to work on.
 
         ``extend-context`` and ``lock-context`` both need a base context
-        to exist. No ADR names a code for the case, and this is the
-        registry's own entry for "the command needs a context and
-        send-context has not happened" — which is exactly it.
+        to exist. Nothing else in the protocol names a code for the
+        case, and this is the registry's own entry for "the command
+        needs a context and send-context has not happened" — which is
+        exactly it.
         """
         if self.context_state == CONTEXT_NONE:
             raise SessionError(
@@ -568,7 +569,7 @@ class Session:
             )
 
     def require_no_context(self) -> None:
-        """Refuse a second base context before the lock (E43).
+        """Refuse a second base context before the lock.
 
         ``send-context`` delivers *the* base context, once. A second one
         is not an extension — it would replace the pins the session was
@@ -614,7 +615,7 @@ class Session:
     def discard_context(self) -> None:
         """Delete the session's directory and forget the context.
 
-        ADR 0019's amendment: the per-session directory — the context
+        By design: the per-session directory — the context
         and every artifact in it — is destroyed at ``close-session``,
         which is also why ``get-artifact`` has to run before it. The same
         call is what a refused ``send-context`` uses, so that a rejected
@@ -1106,8 +1107,8 @@ class SessionManager:
         wire needs it now rather than after the fact: today the only
         reason is a full queue, and the reason that follows it is a
         per-client seat quota — a rule about identity, which this server
-        cannot express while one bearer token is one principal
-        (ADR 0019). That later work adds a reason, not a wire format.
+        cannot express while one bearer token is one principal. That
+        later work adds a reason, not a wire format.
 
         A token this queue does not hold — never issued, long expired,
         already spent, invented — is not an error. The caller simply has
@@ -1169,10 +1170,10 @@ class SessionManager:
         context_format: int,
         seat: str | None = None,
     ) -> Session:
-        """Admission. Every refusal is typed, at the door (concept §4).
+        """Admission. Every refusal is typed, at the door.
 
-        Three operands and no fourth: ADR 0019's amendment takes the
-        manifest header away from ``open-session``, so admission decides
+        Three operands and no fourth: ``open-session`` carries no
+        manifest header, so admission decides
         the protocol version, the context-format version and the
         profile, and nothing about the context itself.
 
@@ -1278,7 +1279,7 @@ class SessionManager:
         """Close a session. Closing a closed one is not an error: the
         client asked for a state and that state holds.
 
-        **A busy session is cancelled implicitly** (E39): every running
+        **A busy session is cancelled implicitly**: every running
         invocation gets the stop signal, and then the session is reaped.
         Refusing to close while an invocation runs was rejected because
         connection loss is never abandonment — that is
@@ -1288,8 +1289,8 @@ class SessionManager:
         until lease expiry as the *normal* path rather than the
         fallback.
 
-        **The sentinel here is best-effort and nothing more.** E39's
-        "the result document is still written" orders the *program's*
+        **The sentinel here is best-effort and nothing more.** "The
+        result document is still written" orders the *program's*
         shutdown — write before you die — and promises nobody a
         document: the client gets no result for an implicitly cancelled
         invocation either way, and the directory the document would be
@@ -1323,9 +1324,9 @@ def capabilities_payload(state: Any, containers: list[dict[str, Any]]) -> dict[s
 
     It stays the **pre-session query** after the freeze verb landed:
     ahead of a session at all, this is what lets the workbench choose a
-    build container during pin resolution rather than discover the
-    mismatch from inside one (ADR 0019's amendment). It fails fast
-    ("this server has no build container for zephyr-4.4.0-r1") instead
+    build environment during pin resolution rather than discover the
+    mismatch from inside one. It fails fast
+    ("this server has no build environment for zephyr-4.4.0-r1") instead
     of dying mid-session, and it is the one verb that carries no session
     id, because there is no session yet to carry.
 
@@ -1352,13 +1353,13 @@ def capabilities_payload(state: Any, containers: list[dict[str, Any]]) -> dict[s
     refusal for a missing runtime belongs to the verb that needs a
     container.
 
-    **``ingress`` is announced rather than discovered** (E57). The five
-    caps of ADR 0019 decision 8 exist so that a client can refuse an
+    **``ingress`` is announced rather than discovered.** The five
+    caps of the ingress hardening floor exist so that a client can refuse an
     oversized upload before the first byte leaves, and a cap it cannot
     see can only be found by hitting it — after the bytes have been
     sent, which is the one cost the caps exist to avoid. They are
     answered from *this server's configuration* and never from a
-    constant, because E44 makes the config the policy: an operator who
+    constant, because the config is the policy: an operator who
     lowered a cap has lowered what this block says.
 
     The sixth number is not one of the five. ``frame_bytes`` is the
@@ -1368,16 +1369,16 @@ def capabilities_payload(state: Any, containers: list[dict[str, Any]]) -> dict[s
     rather than a typed refusal, and which therefore has to be knowable
     in advance or not at all.
 
-    There is deliberately **no ``quota.work``** and no cost class. ADR
-    0019's amendment binds work metering and cost classes to the hosted
-    phase and says of v1.0, in as many words, that there is neither; a
+    There is deliberately **no ``quota.work``** and no cost class. Work
+    metering and cost classes belong to the hosted
+    phase, and v1.0 has neither; a
     field promising a concept the valid layer removed is worse than a
     field that is not there.
     """
     config = state.config
     allowed = frozenset(config.allowed_patch_layers)
     caps = IngressCaps.from_config(config)
-    # The four names contract §1.1 fixes, plus any third-party `x-` layer
+    # The four names this server's own layer set fixes, plus any third-party `x-` layer
     # this operator listed. An `x-` name cannot be enumerated — the
     # prefix exists precisely so vendors need no registration — so the
     # only ones this server can name are the ones it was told about.
@@ -1403,10 +1404,10 @@ def capabilities_payload(state: Any, containers: list[dict[str, Any]]) -> dict[s
         # client can act on before it uploads anything.
         "environments": {"allowed": list(config.allowed_environments)},
         # The server's patch configuration IS the policy; unlisted layers
-        # are denied by default (concept §6). Advertised per layer so the
+        # are denied by default. Advertised per layer so the
         # workbench refuses a patched context before uploading it.
         "patch_policy": {layer: {"allow": layer in allowed} for layer in layers},
-        # What one upload may cost here (E44's five caps), plus the
+        # What one upload may cost here (the five ingress caps), plus the
         # transport bound under the verbs. Read from the config, so the
         # announcement follows an operator's setting rather than a
         # constant this module could drift from.
@@ -1450,11 +1451,11 @@ async def open_session(state: Any, connection: Any, command: Command) -> dict[st
     server gave it. A token this server no longer holds is not an error
     — the caller is simply a walk-in again.
 
-    **There is no manifest operand.** ADR 0019's amendment takes
-    ``open-session``'s first operand away: admission negotiates the
+    **There is no manifest operand.** ``open-session`` carries no first
+    operand for it: admission negotiates the
     protocol version, the context-format version and the profile, and
     the pins arrive with ``send-context``, in ``context.yaml``. The term
-    "manifest header" is retired outright (ADR 0018's amendment) —
+    "manifest header" is retired outright —
     there is no header separate from ``context.yaml``, and
     ``manifest.yaml`` does not exist until ``lock-context`` writes it.
 
@@ -1464,16 +1465,16 @@ async def open_session(state: Any, connection: Any, command: Command) -> dict[st
          "lease": {"ttl_seconds", "idle_timeout_seconds", "expires_at"},
          "negotiated": {"protocol_version", "context_format", "backend_profile"}}
 
-    The serving build container's contract version and command set are
+    The serving build environment's declaration and action set are
     **not** here. With no context at ``open-session`` the backend does
-    not yet know *which* container serves the session — the digest
+    not yet know *which* image serves the session — the digest
     arrives with the pins — so ``send-context`` answers that half. What
     discovering early was for survives the split intact, because
     ``send-context`` precedes ``lock-context`` and therefore precedes
     every working command.
 
-    ``negotiated.backend_profile`` is the field ADR 0019's amendment puts
-    in this response: how this server executes the builds it accepts, and
+    ``negotiated.backend_profile`` is the field this response carries
+    for it: how this server executes the builds it accepts, and
     the one thing a client learns about which promises are being made to
     it. Today it is always ``container`` — one container per session, no
     network, per-session limits, the session as the trust boundary — and
@@ -1498,9 +1499,9 @@ async def open_session(state: Any, connection: Any, command: Command) -> dict[st
     # asked for", and the two are told apart by `is None` rather than by
     # truthiness. An `or` here read `context_format: 0` and `profile: ""`
     # as absent, so both walked past the admission checks below them and
-    # were answered `result` — the one thing ADR 0019 decision 2 says
-    # must not happen, since "version mismatch is a typed rejection at
-    # the door, never a downstream failure".
+    # were answered `result` — the one thing that
+    # must not happen, since version mismatch is a typed rejection at
+    # the door, never a downstream failure.
     profile = command.optional_str("profile", "oneshot")
     context_format = command.optional_int("context_format", CONTEXT_FORMAT_MAX)
     try:
@@ -1540,9 +1541,9 @@ async def open_session(state: Any, connection: Any, command: Command) -> dict[st
 def _archive_announcement(command: Command, key: str = "archive") -> tuple[int, str]:
     """The ``{"size", "sha256"}`` object a context upload is announced with.
 
-    **The wire shape is E41's and nothing in the documents fixed it.**
-    ADR 0019 §2 spells ``send-context(archive)`` and that single word is
-    the whole wire specification the verb set gives it; the product
+    **The wire shape is this server's own and nothing in the documents
+    fixed it.** The verb set spells ``send-context(archive)`` and that
+    single word is the whole wire specification it gives; the product
     owner settled the rest on 2026-08-09. The JSON payload announces the
     archive's compressed size and its SHA-256, the bytes follow as
     WebSocket BINARY frames within the existing frame cap, and the
@@ -1550,8 +1551,8 @@ def _archive_announcement(command: Command, key: str = "archive") -> tuple[int, 
 
     Two values and no third. There is deliberately no ``format`` field:
     the format is **tar.zst**, fixed, chosen for family consistency with
-    the SDK package the same contract pins, and a field whose only legal
-    value is the default is a negotiation nobody asked for.
+    the SDK package this server fetches the same way, and a field whose
+    only legal value is the default is a negotiation nobody asked for.
     """
     announcement = command.optional_dict(key)
     if not announcement:
@@ -1775,7 +1776,7 @@ async def send_context(state: Any, connection: Any, command: Command) -> dict[st
          "archive": {"size": 4711, "sha256": "<64 hex digits>"},
          "container_image": ":0.1.10.dev2-r1"}          # optional
 
-    followed by the tar.zst as BINARY frames (E41; see
+    followed by the tar.zst as BINARY frames (see
     :func:`_archive_announcement`). The result frame is the
     acknowledgement, and it arrives when the declared number of bytes
     has been received, hashed to the declared value, unpacked safely and
@@ -1799,24 +1800,24 @@ async def send_context(state: Any, connection: Any, command: Command) -> dict[st
 
     The base context carries ``context.yaml``: the format version, the
     resolved pins — SDK package sha256, target board — the Zephyr line a
-    build container must carry, and the constraint the SDK pin was
+    build environment must carry, and the constraint the SDK pin was
     resolved from. It is **required**, even for the empty context
-    ADR 0019's amendment says may be locked: two of the three inputs of
+    that may be locked: two of the three inputs of
     the context ID live in it, so a context without it has no identity to
     freeze. "Empty" means no *content* files, and that is allowed here —
     what a ``build`` needs beyond existence, ``keys/signing.pub`` above
     all, is checked by ``build``.
 
-    **The response carries the serving container**, which is the half of
-    the discovery payload ADR 0019's amendment moved here: with no
+    **The response carries the serving environment**, which is the half
+    of the discovery payload that belongs here: with no
     context at ``open-session`` the backend does not yet know *which*
-    container serves the session, and the requirement it answers arrives
-    with the pins. Since E61 the answer is this server's **choice** and
+    image serves the session, and the requirement it answers arrives
+    with the pins. The answer is this server's **choice** and
     not an echo — the context named no image — so ``container`` carries
-    the image, tag and digest it selected, plus that image's contract
-    version, program identity and command set, all of them out of
-    ``describe``, which is authoritative, rather than out of the labels,
-    which are a pre-start hint that is cross-checked against it.
+    the image and digest it selected, plus the declaration its labels
+    mirror: spec generation, Zephyr version, generator constraint and
+    package set, read from the image's own labels rather than from any
+    answer it gives at runtime.
 
     That is also where ``version.builder-unsatisfiable`` becomes real.
     The line is answered out of this host's **local** image inventory and
@@ -1826,7 +1827,7 @@ async def send_context(state: Any, connection: Any, command: Command) -> dict[st
     is the useful moment: the client can go to a server that serves the
     line, without having paid for a lock.
 
-    **The §9.1 cross-checks, as context format 2 leaves them.** The
+    **The cross-checks, as context format 2 leaves them.** The
     container check is gone as a *comparison* and survives as a
     *construction*: this server picks the image itself, so there is
     nothing left to disagree with, and what used to be checked is now
@@ -1837,8 +1838,8 @@ async def send_context(state: Any, connection: Any, command: Command) -> dict[st
     ``zephyr`` are compared against the pins the session was admitted on
     by the pre-invocation re-check
     (:func:`~mcuhome.buildserver.contextstore.recheck_locked_context`):
-    admission carries no pins since ADR 0019's amendment took the
-    manifest header away from ``open-session``, so the pins this
+    admission carries no pins since ``open-session`` carries no
+    manifest header, so the pins this
     ``send-context`` accepted *are* what the session was admitted on,
     and re-measuring the manifest against them is the only comparison
     that exists to be made.
@@ -1867,7 +1868,7 @@ async def send_context(state: Any, connection: Any, command: Command) -> dict[st
                 raise ProtocolError(
                     "This base context carries no context.yaml. It is what carries the "
                     "pins into a session — the SDK package hash, the target board and "
-                    "the Zephyr line a build container has to carry — and a context "
+                    "the Zephyr line a build environment has to carry — and a context "
                     "without it has no identity to freeze."
                 )
             pins = parse_context_yaml(
@@ -2064,10 +2065,11 @@ async def extend_context(state: Any, connection: Any, command: Command) -> dict[
          "archive": {"size": 812, "sha256": "<64 hex digits>"},   # add / overwrite
          "remove": ["patches/zephyr/0002-old.patch"]}             # remove
 
-    ADR 0019 §2 gives the verb "per-layer **replace semantics** (add /
-    overwrite / remove)" and names no wire shape for any of the three;
-    E42 settles it as the same archive mechanics as ``send-context``
-    plus a list of paths, both allowed in one call. An extension that
+    This verb gives per-layer **replace semantics** (add /
+    overwrite / remove) and names no wire shape for any of the three by
+    itself; this server settles it as the same archive mechanics as
+    ``send-context`` plus a list of paths, both allowed in one call. An
+    extension that
     asks for neither is refused rather than answered "nothing changed":
     a client that sent it meant something.
 
@@ -2078,9 +2080,9 @@ async def extend_context(state: Any, connection: Any, command: Command) -> dict[
     document settles it; this is the determination.
 
     **It MUST NOT touch ``context.yaml``** — the pins the session was
-    admitted on, and "changing them is a new session, not an extension"
-    (ADR 0018's amendment, contract §3.2). ADR 0018 requires a typed
-    error and names no code, so ``context.pins-immutable`` was added to
+    admitted on, and changing them is a new session, not an extension.
+    A typed error was needed and no code named it, so
+    ``context.pins-immutable`` was added to
     the registry for it: deliberately distinct from
     ``context.unsafe-entry``, because a ``context.yaml`` in the archive
     is a perfectly well-formed entry aimed at a forbidden target, and
@@ -2099,8 +2101,8 @@ async def extend_context(state: Any, connection: Any, command: Command) -> dict[
     runs (:func:`_check_merge`).
 
     After the change the patch-layer set is re-derived **from the files
-    actually present** and policy is re-run, which is ADR 0019 §2's own
-    wording. There is no cost class to re-run with it: v1.0 has none.
+    actually present** and policy is re-run. There is no cost class to
+    re-run with it: v1.0 has none.
 
     Removing a path that is not in the context is not an error. The
     client asked for a state and that state holds — the rule
@@ -2283,8 +2285,8 @@ def _merge_staging(session: Session, staging: Path, context: Path) -> None:
 async def lock_context(state: Any, connection: Any, command: Command) -> dict[str, Any]:
     """``lock-context`` — freeze the context. **Guarded here, stubbed behind.**
 
-    The verb ADR 0019's amendment adds to the set, append-only as its
-    Consequences require, to say where the session's lifetime and the
+    This verb was added to the set, append-only as it requires, to say
+    where the session's lifetime and the
     context's part company. The alternative was an implicit freeze on
     "the first writing command", rejected structurally: it needs an
     enumerated list of writing commands kept in sync with a verb set
@@ -2299,8 +2301,8 @@ async def lock_context(state: Any, connection: Any, command: Command) -> dict[st
     different depending on what ran before it.
 
     It does exactly four things and unlocks a fifth: freeze the context,
-    write ``manifest.yaml`` — including the build container this server
-    selected for the context's Zephyr line at ``send-context`` (E61) —
+    write ``manifest.yaml`` — including the build environment this server
+    selected for the context's Zephyr line at ``send-context`` —
     compute the context ID, return it, and from here ``verify`` and
     ``build`` are permitted. The selected image is written into the
     manifest and stays out of the ID, so the identity this verb answers
@@ -2313,10 +2315,10 @@ async def lock_context(state: Any, connection: Any, command: Command) -> dict[st
     base context is ``context.missing``.
 
     **The wire shape is minimal by explicit product-owner choice**
-    against the richer alternative (E37, ADR 0019's second amendment):
+    against a richer alternative:
     the request carries ``session_id`` and nothing else, the response
-    carries the context ID and nothing else. The comparison ADR 0019
-    requires — "both sides compare values they computed independently" —
+    carries the context ID and nothing else. The comparison this design
+    relies on — both sides comparing values they computed independently —
     therefore happens **on the client**: the workbench computes the ID
     from the bytes it sent, compares it against this answer, and closes
     the session on a disagreement. The consequence is stated here so
@@ -2327,8 +2329,8 @@ async def lock_context(state: Any, connection: Any, command: Command) -> dict[st
 
     An empty context may be locked. It has a well-defined ID, and the
     things a ``build`` needs beyond existence — ``keys/signing.pub``
-    above all — are checked by ``build``, which is where the contract
-    scopes them, not by the lock.
+    above all — are checked by ``build``, which is where they belong,
+    not by the lock.
 
     The context state flips to :data:`CONTEXT_LOCKED` only once
     ``manifest.yaml`` is durably on disk. The lock is one-way and it is
@@ -2400,7 +2402,7 @@ async def _start_working(
     a step builds in a container that is thrown away, so a client that
     fixes its context is fixing something this session never acted on.
 
-    **The answer is the invocation id and nothing else** (E46). A build
+    **The answer is the invocation id and nothing else.** A build
     is minutes to hours; a command frame that waited for it would make
     every client's socket a build timer, and a client that lost the
     socket would lose the result of work that is still running. So the
@@ -2409,8 +2411,8 @@ async def _start_working(
     list — on the channel that survives a reconnect, because the
     invocation continues detached and ``attach-session`` re-joins it.
     The verdict is this server's, and the program's own
-    ``invocation.finished`` (contract §8, numbered like every program
-    event) is a different frame that arrives before it (E58).
+    ``invocation.finished`` event — numbered like every program
+    event — is a different frame that arrives before it.
     """
     session = state.sessions.require(command.require_str("session_id"), connection)
     session.require_locked_context()
@@ -2547,11 +2549,11 @@ async def cancel(state: Any, connection: Any, command: Command) -> dict[str, Any
     client *says*.
 
     The id it addresses is the **server-assigned** invocation id that
-    ``build`` hands out. ADR 0019 names the operand and no document
+    ``build`` hands out. This verb names the operand and no document
     fixes the payload's field name; ``invocation_id`` is the spelling
     this package already uses for the same value at ``get-artifact``.
 
-    The wire shape is the second amendment's (E38): the answer means
+    The wire shape is deliberate: the answer means
     "the stop signal is set", never "the invocation has stopped" — the
     actual end travels on the invocation's event stream, and its result
     document carries ``status: "cancelled"``. Three answers, one each:
@@ -2616,8 +2618,8 @@ async def get_artifact(state: Any, connection: Any, command: Command) -> None:
          "invocation_id": "inv-1",
          "path": "firmware.hex"}      # optional; absent means all of them
 
-    **The wire shape is the mirror of E41's upload, and the bytes are a
-    ``tar.zst``** (E45): one archive format in both directions. With a
+    **The wire shape mirrors the context upload, and the bytes are a
+    ``tar.zst``**: one archive format in both directions. With a
     ``path`` the archive holds exactly that declared artifact, without
     one it holds every declared artifact of the invocation under its
     declared path. The result frame **is** the announcement — the
@@ -2633,7 +2635,7 @@ async def get_artifact(state: Any, connection: Any, command: Command) -> None:
     what keeps this hash a transport check rather than a second
     integrity claim that could disagree with the first.
 
-    What is served is the intersection of declared and verified (§9.3).
+    What is served is the intersection of declared and verified.
     The verification happened when the invocation finished — every
     declared artifact re-hashed from the bytes on disk, paths normalized
     and contained, links, devices and oversized files refused — and it
@@ -2657,9 +2659,9 @@ async def get_artifact(state: Any, connection: Any, command: Command) -> None:
     **Inside the session and nowhere else.** The per-session directory —
     the context and every artifact in it — is deleted at
     ``close-session``, so download happens after the build and before
-    closing. ADR 0019's amendment removed decision 2's "and for a
-    bounded grace period after close" together with an undefined bound:
-    nothing said how long, while the directory it kept alive holds a
+    closing. An earlier draft allowed "a
+    bounded grace period after close" together with an undefined bound;
+    that was removed: nothing said how long, while the directory it kept alive holds a
     device's Matter commissioning credentials.
 
     Like ``cancel``, it is deliberately not gated on the lock. The flow
@@ -2759,7 +2761,7 @@ async def attach_session(state: Any, connection: Any, command: Command) -> dict[
     its events are replayed from the sequence number the client last
     saw — read straight out of the NDJSON file the program wrote, which
     stays on disk for the life of the session and **is** the replay
-    buffer (E46). There is no in-memory ring behind it, so there is
+    buffer. There is no in-memory ring behind it, so there is
     nothing a long reconnect can find already evicted.
 
     The replayed events go out **before** this verb's own result frame,
@@ -2901,8 +2903,8 @@ async def close_session(state: Any, connection: Any, command: Command) -> dict[s
     container left running on a server nobody asks again is not
     something a client's manners should decide.
 
-    **The client gets no result for an implicitly cancelled invocation**
-    (E39), and this verb no longer promises one survives. The guarantee
+    **The client gets no result for an implicitly cancelled invocation,**
+    and this verb no longer promises one survives. The guarantee
     that the result document is still written orders the *program's*
     shutdown — it is not a deliverable, and there is nowhere left to
     deliver it to.
@@ -2928,15 +2930,14 @@ async def close_session(state: Any, connection: Any, command: Command) -> dict[s
 #: whole registration — there is no second list to keep in step.
 #: Hyphenated names as in the concept.
 #:
-#: **Eleven**, which is the complete set of dashboard ADR 0012 decision
-#: 3 (amended 2026-08-09 from ADR 0019), in that decision's own order.
+#: **Eleven**, the complete verb set as amended on 2026-08-09.
 #: ``lock-context`` and ``cancel`` were the two missing, and neither is
 #: optional: without ``lock-context`` a client can never reach
 #: ``build``, and without ``cancel`` a closed socket would be the only
 #: stop signal a client had — which is no stop signal at all, because a
 #: build runs inside a container and nothing outside it stops one.
 #: The verbs whose body arrives as BINARY frames after the JSON that
-#: announced it (E41). The transport needs this and cannot derive it: a
+#: announced it. The transport needs this and cannot derive it: a
 #: binary frame carries no id, so the reader has to know **before** it
 #: reads on that the command it just spawned is about to claim the next
 #: frames — see :meth:`~mcuhome.buildserver.ws.Connection.await_announcement`.

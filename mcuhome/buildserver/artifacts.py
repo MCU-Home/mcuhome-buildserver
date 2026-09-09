@@ -2,23 +2,23 @@
 # SPDX-License-Identifier: Apache-2.0
 """Egress: what this server does with ``out``, and what it hands back.
 
-Build-container contract §9.3 opens with the reason the whole module
-exists: "``out`` is written by the least trusted component in the system
-and its contents travel over the network onto other people's machines."
+The reason the whole module exists: ``out`` is written by the least
+trusted component in the system and its contents travel over the
+network onto other people's machines.
 
-Its five duties are the orchestrator's when an invocation ends — it is
-what judges the result and re-hashes every declared artifact — and this
+Judging the result and re-hashing every declared artifact are the
+orchestrator's duties when an invocation ends, and this
 module is the *second* enforcement, at the moment bytes actually leave:
 enumerate without following symlinks, refuse hardlinks, devices, FIFOs
 and sockets, enforce strict containment under the declared ``root``, and
-re-hash while packing. The program is forbidden to create links, devices,
-sockets or FIFOs in ``out`` at all, and ``out`` path segments are
-``[A-Za-z0-9._-]+`` (§9.2). That is what makes this an audit rather than
-a repair: everything below refuses, and nothing below rewrites a path
-into one that would have been allowed.
+re-hash while packing. The build environment is forbidden to create
+links, devices, sockets or FIFOs in ``out`` at all, and ``out`` path
+segments are ``[A-Za-z0-9._-]+``. That is what makes this an audit
+rather than a repair: everything below refuses, and nothing below
+rewrites a path into one that would have been allowed.
 
 **Download is an archive, in the format the wire already speaks.** The
-mirror of E41's upload, settled by the product owner as E45: one
+mirror of the context upload, settled by the product owner: one
 ``tar.zst`` in both directions. With a path it holds exactly that
 declared artifact, without one it holds all of them under their declared
 paths; the announced ``sha256`` is the **archive's**, computed at egress
@@ -73,8 +73,8 @@ _BLOCK = 1 << 20
 class Delivery:
     """One built download archive, announced before its bytes.
 
-    ``sha256`` is the archive's own, "computed at egress while reading
-    from disk" (E45) — never a value copied out of the result document.
+    ``sha256`` is the archive's own, computed at egress while reading
+    from disk — never a value copied out of the result document.
     The per-file hashes the client checks are the ones it already holds
     from the result payload, which is what makes this hash a transport
     check rather than a second integrity claim.

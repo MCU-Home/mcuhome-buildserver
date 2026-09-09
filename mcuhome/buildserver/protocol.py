@@ -11,21 +11,19 @@ envelope in one product family::
     ← {"id": "7", "type": "error",        "error": {"code": "…", …}}
     ← {"type": "event", "event": "…",     "payload": {...}}
 
-**The envelope outlived the vocabulary it was built for.** It carried
-the one-shot job protocol of dashboard ADR 0006; that protocol was
-dismantled rather than migrated, and dashboard ADR 0012 decision 3
-keeps exactly this — the frame envelope, the transport under it and the
-bearer token in front of it — while the verbs inside became the session
-protocol of :mod:`mcuhome.buildserver.sessions`.
+**The envelope outlived the vocabulary it was built for.** It carried an
+earlier one-shot job protocol; that protocol was dismantled rather than
+migrated, keeping exactly this — the frame envelope, the transport under
+it and the bearer token in front of it — while the verbs inside became
+the session protocol of :mod:`mcuhome.buildserver.sessions`.
 
 **Why this module is a sibling of** ``mcuhome.ui.protocol``
 **rather than an import of it.** The dashboard and the build server are
-separate products with separate version numbers (ADR 0003 decision 1),
-and the build server is routinely installed where the dashboard is not —
-a workstation under a desk, a NAS, a WSL instance. Importing the
-dashboard's package here would make the fat half undeployable without
-the thin half, which is exactly the coupling ADR 0003 spent its length
-avoiding.
+separate products with separate version numbers, and the build server is
+routinely installed where the dashboard is not — a workstation under a
+desk, a NAS, a WSL instance. Importing the dashboard's package here would
+make the fat half undeployable without the thin half, which is exactly
+the coupling this separation avoids.
 
 What must not drift is the *envelope*, and that is guarded rather than
 assumed: ``tests/python/test_protocol.py`` compares this module's constants
@@ -79,7 +77,7 @@ TYPE_EVENT = "event"
 #: after the bytes arrived is not a limit.
 #:
 #: **It lives with the envelope rather than with the endpoint** because
-#: it is announced (E57): ``capabilities`` carries it in its ``ingress``
+#: it is announced: ``capabilities`` carries it in its ``ingress``
 #: block, so that a client can size its chunks instead of discovering
 #: this bound as a dropped connection — the overrun of a frame cap is
 #: not a typed refusal and can never be one. :mod:`mcuhome.buildserver.ws`
@@ -88,13 +86,12 @@ TYPE_EVENT = "event"
 #: an import cycle.
 MAX_FRAME_BYTES = 8 * 1024 * 1024
 
-#: The raw build log, as its **own** frame type (E46). It is a separate
-#: kind rather than an event with a name because contract §8 makes the
-#: two different things: events are a typed, registered, append-only
-#: vocabulary that a consumer matches on, while "standard output and
-#: standard error together are one raw, opaque log stream" that
-#: consumers "MUST NOT parse for machine decisions". Carrying the log as
-#: an event would have put an unparseable stream into the one channel
+#: The raw build log, as its **own** frame type. It is a separate kind
+#: rather than an event with a name: events are a typed, registered,
+#: append-only vocabulary that a consumer matches on, while standard
+#: output and standard error together are one raw, opaque log stream
+#: that consumers must not parse for machine decisions. Carrying the log
+#: as an event would have put an unparseable stream into the one channel
 #: that exists to be parsed.
 TYPE_LOG = "log"
 
@@ -254,7 +251,7 @@ def log_frame(payload: dict[str, Any]) -> dict[str, Any]:
     stream: a client that sees the numbers jump knows it lost lines
     rather than believing it read a complete log with a silent hole in
     it. There is deliberately no replay behind it — the events file is
-    the replay buffer (E46) and the log is not written to disk by this
+    the replay buffer and the log is not written to disk by this
     server at all.
     """
     return {"type": TYPE_LOG, "payload": payload}

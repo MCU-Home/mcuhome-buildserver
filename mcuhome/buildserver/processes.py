@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Child processes: the two impure functions both backend profiles use.
 
-Every backend of build-container contract §1.2 ends up starting a child
+Every backend ends up starting a child
 process. In the ``container`` profile that child is a ``docker`` client
 (:mod:`mcuhome.buildserver.container`); in the ``subprocess`` profile it
 is the program itself (:mod:`mcuhome.buildserver.program`). What the two
@@ -31,15 +31,15 @@ in the ``subprocess`` profile the immediate child is the program — the
 compile it starts (west, cmake, ninja, the compilers) hangs off it. A
 SIGKILL that reached only the program would leave that tree running,
 unreaped, against a session directory this server is about to delete;
-§1.2 makes cancellability one of the two promises the ``subprocess``
+Cancellability is one of the two promises the ``subprocess``
 profile keeps, and it is kept here or nowhere. The ``container`` profile
 is unaffected by construction: its build runs inside a container, which
 is stopped by removing it rather than by signalling anything on this
 side.
 
-**Merged output, always.** Contract §8 says the two streams *are* one
-stream: "standard output and standard error together are one raw, opaque
-log stream". A backend that split them would have to put them back
+**Merged output, always.** The two streams *are* one
+stream: standard output and standard error together are one raw, opaque
+log stream. A backend that split them would have to put them back
 together to relay them.
 
 **The environment is stated, never inherited.** Both functions take an
@@ -76,9 +76,10 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-#: The longest log line this server carries in one frame. Not a contract
-#: number: §8 makes the log stream raw and opaque, so this is only how
-#: much of one line is worth relaying before it stops being readable.
+#: The longest log line this server carries in one frame. Not a fixed
+#: number from any specification: the log stream is raw and opaque, so
+#: this is only how much of one line is worth relaying before it stops
+#: being readable.
 MAX_LOG_LINE = 64 * 1024
 
 #: How long the log pump may still run after the child has exited. The
@@ -291,7 +292,7 @@ async def run_command(argv: Sequence[str], *, env: Mapping[str, str] | None = No
     """Run *argv* to completion, capturing its merged output.
 
     Everything that is not a build — probing a runtime, inspecting an
-    image, asking a program to describe itself — is short, bounded and
+    image, reading its labels — is short, bounded and
     wants its output as a value, so it comes through here.
     """
     try:

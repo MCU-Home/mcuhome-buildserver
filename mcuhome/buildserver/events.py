@@ -2,41 +2,40 @@
 # SPDX-License-Identifier: Apache-2.0
 """The invocation's event stream: NDJSON on disk, read from the backend side.
 
-Build-container contract §8. The program appends one JSON object per
+The program appends one JSON object per
 line to the file the request document named — UTF-8, flushed after every
 line, append-only, never truncated — and every object carries an
 ``event`` name and a monotonic ``seq`` starting at 1.
 
-**Why a named file rather than NDJSON on stdout**, which is what
-contract v1 said as first drafted: file descriptor 1 belongs to west,
-cmake, ninja, gn and zap, so a program whose events share it corrupts
-its own stream and never notices locally. A named file removes the
-failure mode structurally, survives an out-of-memory kill readably, and
-gives a reconnecting client the resume-from-offset ADR 0019 §2 requires
-anyway.
+**Why a named file rather than NDJSON on stdout**: file descriptor 1
+belongs to west, cmake, ninja, gn and zap, so a program whose events
+share it corrupts its own stream and never notices locally. A named file
+removes the failure mode structurally, survives an out-of-memory kill
+readably, and gives a reconnecting client the resume-from-offset
+``attach-session`` needs anyway.
 
-**The file is the replay buffer, and there is no other one** (E46). It
+**The file is the replay buffer, and there is no other one.** It
 stays on disk for the life of the session, so ``attach-session``
 answers a client's "I last saw seq N" by reading it from N — no
 in-memory ring, nothing to size, and nothing that a reconnect can find
 already evicted.
 
-Two backend duties this module carries, both from §8:
+Two backend duties this module carries:
 
 * **Lines longer than 8192 bytes and non-objects are discarded and
   counted, never treated as an abort.** A program that writes rubbish
   into its own event stream has not failed its build, and a backend
   that stopped on one would turn a cosmetic defect into a lost
   invocation.
-* **Unknown names are relayed opaquely.** A backend "passes an event
+* **Unknown names are relayed opaquely.** The backend passes an event
   whose name it does not know through to its client verbatim, with its
   fields intact, and never drops it, never rewrites it and never treats
-  it as an error" — which is what lets a third-party program report its
+  it as an error — which is what lets a third-party program report its
   own phases under ``x-`` names through a server that has never heard
   of them.
 
-And one thing this module deliberately does not do: infer. "A backend
-MUST NOT infer anything from a name it did not receive" — an absent
+And one thing this module deliberately does not do: infer. The backend
+must not infer anything from a name it did not receive — an absent
 ``build.memory.region`` may mean the program emits no events at all, or
 that an incremental build relinked nothing. The result document is
 where the question of what was produced is answered.
@@ -58,8 +57,8 @@ __all__ = [
     "replay",
 ]
 
-#: §8, exactly: "Lines longer than 8192 bytes and non-objects are
-#: discarded and counted by the backend, never treated as an abort."
+#: Lines longer than 8192 bytes and non-objects are
+#: discarded and counted by the backend, never treated as an abort.
 MAX_LINE_BYTES = 8192
 
 #: Event names are dotted, ``[a-z][a-z0-9.-]*``, with ``x-`` for third
@@ -67,7 +66,7 @@ MAX_LINE_BYTES = 8192
 #: so one expression covers both.
 _NAME = re.compile(r"[a-z][a-z0-9.-]*\Z")
 
-#: The names contract v1 seeds the append-only registry with, together
+#: The names this server seeds the append-only registry with, together
 #: with the fields each carries beyond ``event`` and ``seq``. This
 #: server relays every event whatever its name, so the table is
 #: documentation and a test vector rather than a filter — but it is the
@@ -89,8 +88,8 @@ def event_name(line: dict[str, Any]) -> str | None:
 
     ``None`` is "discard and count": an object with no ``event``, with a
     non-string one, or with one outside the frozen grammar is not
-    something a backend can relay under a name, and §8 makes the answer
-    to unrelayable input a counter rather than an abort.
+    something a backend can relay under a name, and unrelayable input
+    answers with a counter rather than an abort.
     """
     found = line.get("event")
     if not isinstance(found, str) or _NAME.fullmatch(found) is None:
@@ -105,7 +104,7 @@ class EventReader:
     The reader holds a byte offset and a partial-line buffer, which is
     what makes it correct against a file being appended to while it is
     read: a poll that lands mid-line keeps the fragment and finishes it
-    on the next one. The file is never truncated by the program (§8), so
+    on the next one. The file is never truncated by the program, so
     an offset is a stable address into it.
     """
 
@@ -115,7 +114,7 @@ class EventReader:
     #: over one cursor — the replay makes its own reader.
     offset: int = 0
     #: How many lines were discarded for being too long or not objects.
-    #: Counted rather than reported per line, because §8 makes the count
+    #: Counted rather than reported per line, because the count is
     #: the whole of the backend's duty about them.
     dropped: int = 0
     _partial: bytes = field(default=b"", repr=False)
@@ -187,10 +186,10 @@ class EventReader:
 def replay(path: Path, *, from_seq: int) -> tuple[dict[str, Any], ...]:
     """Every event of one invocation from *from_seq* onwards.
 
-    The resume ADR 0019 §2 requires, served out of the file the program
-    wrote rather than out of memory (E46). ``seq`` is only required to
+    The resume ``attach-session`` requires, served out of the file the
+    program wrote rather than out of memory. ``seq`` is only required to
     be **monotonic**, not gapless — a dropped event leaves a gap, and
-    §8 says the gap is harmless — so the filter is ``>=`` and never
+    the gap is harmless — so the filter is ``>=`` and never
     "the Nth line".
 
     An event whose ``seq`` is not a whole number is relayed rather than

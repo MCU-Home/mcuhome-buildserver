@@ -28,12 +28,12 @@ classifiers = [
 # the arrangement it protected. This server no longer orchestrates
 # anything: a session's build environment is the workbench's — the same
 # object a local build gets — and the alternative to depending on it was
-# a second implementation of the whole driving half of the build
-# contract, which is what there was, and which two green suites could
+# a second implementation of the whole driving half of the build,
+# which is what there was, and which two green suites could
 # not keep in step.
 #
 # What has **not** reversed is the other edge. `mcuhome-compiler` is the
-# program that runs *inside* a build container; a build server that
+# program that runs *inside* a build environment; a build server that
 # imported it would carry a toolchain it exists to keep at arm's length,
 # and the container it drives would stop being the only thing that
 # compiles. The workbench reaches the compiler only through a dynamic
@@ -42,13 +42,13 @@ classifiers = [
 # syntax tree and at run time.
 #
 # `mcuhome-model` comes along behind the workbench and is still what the
-# frozen context-ID rule of ADR 0018 §6 lives in — one implementation
-# shared, never two that agree by inspection.
+# frozen context-ID rule (the build context format's §6) lives in — one
+# implementation shared, never two that agree by inspection.
 #
 # `ruamel.yaml` and `zstandard` are this server's own. `context.yaml`
 # arrives as YAML and `manifest.yaml` is written as YAML, so a parser
 # and an emitter are needed here; `zstandard` is the transport, because
-# the context archive is tar.zst (E41) and the streaming decompressor is
+# the context archive is tar.zst and the streaming decompressor is
 # what lets an ingress cap refuse a decompression bomb mid-stream
 # instead of after it has landed.
 dependencies = [
@@ -59,8 +59,8 @@ dependencies = [
 ]
 #
 # There is deliberately **no dependency on `mcuhome-ui`**. The two
-# are separate products with separate version numbers (ADR 0003 decision
-# 1), joined by one protocol; a build server that could not be deployed
+# are separate products with separate version numbers, joined by one
+# protocol; a build server that could not be deployed
 # without the dashboard package would make that untrue in the packaging
 # even where it is true in the code.
 

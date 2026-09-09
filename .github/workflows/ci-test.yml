@@ -9,16 +9,16 @@
 # mcu-home/mcuhome-sdk: pyproject declares mcuhome-workbench, which
 # brings mcuhome-model with it, and neither is published yet — so the
 # sibling checkouts satisfy the declaration. Plain checkouts, no deploy
-# key needed since the repositories went public (ADR 0024).
+# key needed since the repositories went public.
 #
 # test-e2e is one real remote build: this server as a process, a real
-# build container, `mcuhome device build --build-target remote` against
+# build environment, `mcuhome device build --build-target remote` against
 # it, and a signed image at the end. The unit suite fakes docker —
 # correctly, a build server is an orchestrator — and that is exactly why
 # three lease-versus-time defects and one address parsed as a URL
 # reached a real build before anything noticed. It needs four
 # repositories checked out (the command, the workbench, the SDK and this
-# server), a built SDK source archive, and the build-container image
+# server), a built SDK source archive, and the build-environment image
 # pulled — all preparation steps that belong to CI, done here before
 # scripts/test e2e is called with the archive directory. See
 # scripts/test.d/e2e's head comment for what the wrapper itself checks.
@@ -111,7 +111,7 @@ jobs:
   # Four repositories meet here because a remote build needs all four:
   # the command (mcu-home/mcuhome-cli), the client half of the session protocol
   # and the signing step (mcu-home/mcuhome-workbench), the SDK package and the
-  # build container (mcu-home/mcuhome-sdk), and this server. They are
+  # build environment (mcu-home/mcuhome-sdk), and this server. They are
   # checked out at `main` and this repository at the commit under test —
   # which is the arrangement the product owner chose over a shared
   # workflow the other three would call: what is being tested here is
@@ -133,8 +133,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # Pull the build container. It is public, but an authenticated
-      # pull does not share the anonymous rate limit.
+      # Pull the build environment image. It is public, but an
+      # authenticated pull does not share the anonymous rate limit.
       packages: read
     steps:
       - name: Checkout
@@ -192,7 +192,7 @@ jobs:
             -e ./.deps/mcuhome-cli \
             -e .
 
-      # The build container image is several gigabytes and the build
+      # The build environment image is several gigabytes and the build
       # tree lands beside it. The preinstalled Android/.NET/Haskell
       # toolchains are worth tens of gigabytes and nothing here uses one.
       - name: Make room on the runner

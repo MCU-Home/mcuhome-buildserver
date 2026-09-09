@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """The ``/ws`` endpoint and the command loop.
 
-This is the transport that dashboard ADR 0012 decision 3 carries
-forward from ADR 0006 while replacing the vocabulary that used to run
-over it: WebSocket plus a bearer token, this frame envelope, this
-connection handling. The verbs themselves live in
+This is the transport carried forward from an earlier protocol while
+replacing the vocabulary that used to run over it: WebSocket plus a
+bearer token, this frame envelope, this connection handling. The verbs
+themselves live in
 :mod:`mcuhome.buildserver.sessions`.
 
 The connection has the same shape as the dashboard's — one reader, one
@@ -22,8 +22,8 @@ client that stopped reading must not apply backpressure through the log
 reader and from there into the compiler. What makes the drop safe is
 that a progress stream carries resumable offsets, so a client that sees
 them jump asks for the gap instead of displaying a log with a silent
-hole in it. That property is the one thing ADR 0006's resumable log
-follow becomes in the session protocol, and the stream it applies to
+hole in it. That property is what an earlier resumable log-follow
+feature becomes in the session protocol, and the stream it applies to
 lands with the container backend.
 
 **Droppable is a property of the frame, not of the queue.** One outbox
@@ -82,7 +82,7 @@ class Connection:
     **The upload belongs to the connection and not to the session**, and
     the wire is what decides that: a BINARY frame carries no frame id and
     no session id, so the only thing that can say which archive its bytes
-    belong to is *when* they arrive (E41). One announced upload at a time
+    belong to is *when* they arrive. One announced upload at a time
     per connection is therefore the shape of the transport rather than a
     restriction on it, and a second concurrent announcement is refused
     instead of interleaved into the first.
@@ -289,8 +289,9 @@ class Connection:
         its SHA-256, and the order is the whole correlation rule: a
         BINARY frame carries no frame id and no session id, so the only
         thing that can say which archive its bytes belong to is *when*
-        they arrive (E41, mirrored by E45). One download at a time per
-        connection is what makes that rule hold, and it is held by
+        they arrive, the same rule the context upload follows. One
+        download at a time per connection is what makes that rule hold,
+        and it is held by
         :attr:`download_lock` rather than hoped for.
         """
         with path.open("rb") as handle:
@@ -410,7 +411,7 @@ async def _dispatch(state: Any, connection: Connection, command: Command) -> Non
         # frame on the outbox and written whatever had to follow it.
         # There is exactly one such verb — `get-artifact`, whose result
         # frame announces an archive that the BINARY frames behind it
-        # then deliver (E45) — and the ordering is the reason: a frame
+        # then deliver — and the ordering is the reason: a frame
         # this loop sent *after* the handler returned would arrive after
         # the bytes it was supposed to announce, and a BINARY frame
         # carries no id to repair that with.
@@ -475,7 +476,7 @@ async def websocket_handler(request: web.Request) -> web.StreamResponse:
         async for message in ws:
             if message.type is WSMsgType.BINARY:
                 # Binary frames are the body of an announced context
-                # upload and nothing else (E41). The check is the
+                # upload and nothing else. The check is the
                 # announcement rather than the frame, because a frame
                 # cannot say what it is: outside an upload this endpoint
                 # still speaks JSON text frames only.

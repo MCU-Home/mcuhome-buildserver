@@ -4,21 +4,21 @@
 
 Three things, in the order a session meets them.
 
-**Where it lives** is :class:`SessionPaths`. ADR 0019 decision 8 requires
-extraction "into a per-session directory the server owns", and ADR 0019's
-amendment requires that directory — the context and every artifact in
-it — to be destroyed at ``close-session``. So the directory belongs to
+**Where it lives** is :class:`SessionPaths`. Extraction happens into a
+per-session directory the server owns, and that directory — the context
+and every artifact in it — is destroyed at ``close-session``. So the
+directory belongs to
 the session record rather than to a verb, and every exit from a session
 goes through :meth:`SessionPaths.discard`.
 
 **What it declares** is :func:`parse_context_yaml`. ``context.yaml`` is
-the request document of ADR 0018's amendment: the format version, the
+the request document: the format version, the
 resolved pins — SDK package hash, target board — the Zephyr line the
-build container has to carry, and the constraint the SDK pin was
+build environment has to carry, and the constraint the SDK pin was
 resolved from. It is what carries the pins into a session, and it is the
 one file an extension may not touch. It does **not** name a container:
 choosing one of the required line, out of the images this server serves,
-is this server's job (E61).
+is this server's own job.
 
 **The freeze** is :func:`freeze_context`, the body of ``lock-context``.
 It hashes every content file, builds the ``files`` integrity list,
@@ -26,7 +26,7 @@ computes the context ID and writes ``manifest.yaml`` beside
 ``context.yaml``.
 
 **Every value the freeze computes comes from ``mcuhome-model`` and none
-of the rule is restated here** (ADR 0020 decision 4). The ID is
+of the rule is restated here.** The ID is
 ``mcuhome.model.context.context_id``, each file hash is
 ``mcuhome.model.hashes.sha256_file``, each integrity entry is a
 ``ContextFile`` and the manifest document is
@@ -42,8 +42,8 @@ deliberately does not carry, both consequences of that package being
 dependency-free by construction: a YAML parser and a YAML emitter. They
 are this repository's own ``ruamel.yaml``, declared in its
 ``pyproject.toml``; ``mcuhome.workbench.contextdir`` has the reference
-emitter and importing it is forbidden by the same ADR that forbids
-re-implementing the hash.
+emitter and importing it is forbidden for the same reason
+re-implementing the hash is.
 """
 
 from __future__ import annotations
@@ -157,10 +157,9 @@ def prepare_context_root(root: Path) -> Path:
     **A relative root is refused before any of that**, and it is refused
     here rather than resolved, because resolving it would answer a
     different question than the operator asked. Every path in an
-    invocation's request document descends from this one, and contract
-    §5.2 rule 4 is unambiguous: "a path value that is not absolute ⇒
-    ``unsupported.request``" — so a relative root produces a document
-    every conforming program must refuse. The same string is also a
+    invocation's request document descends from this one, and every one
+    of them must be absolute — a relative root would produce paths no
+    conforming program could use. The same string is also a
     ``docker run --volume`` source, where docker reads a name without a
     slash as a *named volume* rather than a bind mount and would hand
     the program an empty directory instead of the context. Silently
@@ -172,8 +171,8 @@ def prepare_context_root(root: Path) -> Path:
     if not root.is_absolute():
         raise UnsafeContextRoot(
             f"{root} is a relative path and --context-root has to be absolute. Every path "
-            "in a build container's request document descends from it, and the contract "
-            "requires all of them to be absolute; the same value is also a bind-mount "
+            "in a build environment's request document descends from it, and every one "
+            "of them must be absolute; the same value is also a bind-mount "
             "source, where a name without a leading slash is a named volume rather than a "
             "directory. Name the directory in full."
         )
@@ -231,14 +230,15 @@ class SessionPaths:
     to chance.
 
     The backend half arrived with the container backend, and every one
-    of its four children is named by build-container contract §4 or §5:
+    of its four children mirrors a directory the build environment
+    specification names:
 
-    * ``work/`` is the session's persistent working area, "exclusive to
-      this session". It is per session by construction here — one
-      directory named by session id — which is how §9.1's "one session
-      per ``work``" is kept without a check.
-    * ``sdk/`` is the SDK package unpacked for this session (§9.1's
-      verified SDK, E48). Per session rather than shared, which is what
+    * ``work/`` is the session's persistent working area, exclusive to
+      this session. It is per session by construction here — one
+      directory named by session id — which is how one session per
+      ``work`` is kept without a check.
+    * ``sdk/`` is the SDK package unpacked for this session, verified
+      before it is used. Per session rather than shared, which is what
       lets it be handed over *writable* when the ``sdk`` layer carries
       patches without an overlay and without anybody else's tree being
       at risk.
@@ -348,8 +348,8 @@ class ContextPins:
     """``context.yaml``, parsed — the pins a session was sent.
 
     Held on the session because the freeze needs them: ``manifest.yaml``
-    "repeats the pin blocks — ``mcuhome``, ``target`` — exactly as
-    ``context.yaml`` states them" (ADR 0018's amendment), so every field
+    repeats the pin blocks — ``mcuhome``, ``target`` — exactly as
+    ``context.yaml`` states them, so every field
     of them travels, hashed or not. The one field that does not travel is
     ``created``: it dates the request, and the manifest's own moment is
     the lock.
@@ -382,7 +382,7 @@ class ContextPins:
 
         Shaped like ``context.yaml``'s own blocks so that a client can
         compare what it sent against what was accepted without a mapping
-        table in between. The shape is normative since E60; what it
+        table in between. The shape is normative; what it
         carries follows the format, and under this one the environment is
         a pin the client wrote rather than an answer this server gives.
         """
@@ -477,7 +477,7 @@ def _string(data: dict[str, Any], *keys: str) -> str:
 def _informational(data: dict[str, Any], *keys: str) -> str:
     """A required string that may be empty.
 
-    For exactly the fields the contract calls informational —
+    For exactly the fields this format calls informational —
     ``mcuhome.constraint`` ("original intent — never hashed") and
     ``mcuhome.package.url`` ("hint only — never hashed"). A client that
     stated no constraint writes the empty specifier (PEP 440's own "any
@@ -525,7 +525,7 @@ def parse_context_yaml(path: Path, *, expected_version: int, max_bytes: int) -> 
     only true if the two are the same number by construction.
 
     Only ``context.yaml``'s **shape** is judged here. Whether the pins
-    are true is the cross-check of build-container contract §9.1, and
+    are true is a cross-check this server makes elsewhere, and
     two thirds of that check cannot be made on this server yet; see
     :func:`~mcuhome.buildserver.sessions.send_context`.
     """
@@ -594,7 +594,7 @@ def parse_context_yaml(path: Path, *, expected_version: int, max_bytes: int) -> 
 
 
 def _check_pin_spelling(pins: ContextPins) -> None:
-    """Refuse a hash rendered any way but the one legal one (§3.3.1).
+    """Refuse a hash rendered any way but the one legal one.
 
     "Uppercase or mixed-case hex, a missing prefix where one is
     required, an added prefix where none is, whitespace, a ``0x`` form,
@@ -611,7 +611,7 @@ def _check_pin_spelling(pins: ContextPins) -> None:
     checkers behind it are private, and ``validate_manifest`` needs a
     whole manifest, which a server holding freshly parsed pins does not
     have. Re-spelling the rules here instead would be a second
-    implementation of §3.3.1 in the repository that must not have one.
+    implementation of that check in the repository that must not have one.
     The ID it returns is discarded because the ID has exactly one moment,
     and this is not it.
 
@@ -647,10 +647,11 @@ def _check_pin_spelling(pins: ContextPins) -> None:
 def collect_context_files(root: Path) -> tuple[ContextFile, ...]:
     """Every content file of the context, hashed, sorted by path.
 
-    The integrity list of build-container contract §3.2. It excludes the
+    The integrity list the build context format's manifest carries as
+    ``files`` (§5). It excludes the
     two context documents: ``manifest.yaml`` structurally, because it is
     the document that carries the list, and ``context.yaml`` because
-    ADR 0018 §6 keeps ``created`` and ``mcuhome.constraint`` out of the
+    the context ID's own rule (§6) keeps ``created`` and ``mcuhome.constraint`` out of the
     hash by name — hashing the file they live in would readmit both
     through the back door, and two byte-identical configurations created
     a second apart would get two identities.
@@ -700,10 +701,10 @@ def count_context_files(root: Path) -> int:
 def derive_patch_layers(root: Path) -> tuple[str, ...]:
     """The layers this context patches, read off the paths present.
 
-    ADR 0019 §2: "After every extension the server re-derives the
+    After every extension the server re-derives the
     patch-layer set from the files *actually present* and re-runs policy
-    — patch semantics live entirely in the paths (ADR 0018 decision 2);
-    there is no declared patch list that could disagree." There is
+    — patch semantics live entirely in the paths;
+    there is no declared patch list that could disagree. There is
     nothing to compare against and that is the design: the paths are the
     declaration.
     """
@@ -720,7 +721,7 @@ def derive_patch_layers(root: Path) -> tuple[str, ...]:
 def recheck_patch_policy(root: Path, allowed_layers: frozenset[str]) -> tuple[str, ...]:
     """Re-run policy over the context as it now stands, and say what it patches.
 
-    The ADR's rule stated where the ADR states it — *after* the change,
+    The rule is applied where it is stated — *after* the change,
     over the files actually present. It cannot fail today, because every
     path that reached the context passed the same check on its way in
     (:func:`~mcuhome.buildserver.ingress.check_patch_layer`), and that
@@ -784,7 +785,7 @@ def freeze_context(
 
         The ID is **not** compared against a client's value, and never can
         be: ``lock-context``'s request carries ``session_id`` and nothing
-        else (E37). The comparison ADR 0019 requires happens on the client,
+        else. The comparison this design relies on happens on the client,
         which computes the ID from the bytes it sent and closes the session
         on a disagreement. This server never sees that value.
     """
@@ -829,13 +830,14 @@ def recheck_locked_context(paths: SessionPaths, pins: ContextPins, *, expected_i
     re-hashed and compared against ``manifest.yaml``'s ``files``. A file
     that is missing, one whose bytes hash to something else, and one
     present but absent from the list are one outcome and one refusal
-    naming every offending path — which is the same trio contract §7.3
-    defines for ``verify``, checked here on the *backend's* side of the
-    boundary, where it does not depend on the container being honest.
+    naming every offending path — exactly the checks an environment's
+    own ``verify`` could make and none the orchestrator does not already
+    know from its own bytes, checked here on the *backend's* side of the
+    boundary, where it does not depend on any environment being honest.
 
-    **The pins, cross-checked.** §9.1 makes the backend compare the
-    manifest's declared values "against the header the session was
-    admitted on", and ADR 0018's amendment states the duty normatively
+    **The pins, cross-checked.** This server compares the manifest's
+    declared values against the pins the session was
+    admitted on, stated as its own duty
     because ``verify_context`` cannot establish it: a self-consistently
     forged manifest verifies clean. This server wrote the manifest
     itself, so what this catches is a manifest that changed *after* it
@@ -1020,10 +1022,9 @@ def _write_manifest(manifest: ContextManifest, path: Path) -> None:
     # past ruamel's default width, so the emitter folds it onto a second
     # line — legal YAML that every conforming parser folds back, and
     # still the wrong thing to write here. ``manifest.yaml`` is read by
-    # build containers this project does not write, in languages this
-    # project does not choose (contract §1.1's third-party program), and
-    # build-container contract §3.3.1 has them refuse a digest rendered
-    # any other way rather than repair it. A one-line value cannot be
+    # build environments this project does not write, in languages this
+    # project does not choose, and this server refuses a digest rendered
+    # any other way rather than repairing it. A one-line value cannot be
     # read as two.
     yaml.width = 4096
     temporary = path.with_name(path.name + ".tmp")

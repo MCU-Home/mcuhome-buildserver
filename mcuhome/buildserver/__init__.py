@@ -1,14 +1,15 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""MCUHome build server — the fat half of ADR 0003's two-App topology.
+"""MCUHome build server — the fat half of the two-App topology: the
+dashboard never compiles, and this is the half that does.
 
 A headless aiohttp process that serves the **session protocol**: one
 session is one ephemeral build environment and one effective build
 context. It is an orchestrator and never itself the build environment
-(``build-container-contract.md`` §1.2) — it materializes paths, invokes
-the build program and reads its result. It has no user interface, no
+— it materializes paths, invokes the build environment's program for
+each step, and reads its result. It has no user interface, no
 configuration tree, no secrets store and no signing key: it knows the
-one device it is currently building and nothing else (ADR 0007).
+one device it is currently building and nothing else.
 
 **Every session builds in a container.** One container per session, no
 network, per-session limits, the session as the trust boundary — and

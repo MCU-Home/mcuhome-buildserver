@@ -5,13 +5,12 @@
 There is nothing to probe before binding any more. The build tool used
 to be a subprocess on this machine, examined at startup so that the
 log's first line said what this server could do; a build server is now
-an orchestrator that never is the build environment itself
-(build-container-contract.md §1.2), and what it can build is a
-per-session question answered by the ``capabilities`` verb against a
-build-container inventory. That inventory lands with the container
-backend, and until it does this server admits sessions and builds
-nothing — which the ``capabilities`` verb says in as many words by
-answering an empty ``containers`` list.
+an orchestrator that never is the build environment itself, and what it
+can build is a per-session question answered by the ``capabilities``
+verb against a build-environment inventory. That inventory lands with
+the container backend, and until it does this server admits sessions and
+builds nothing — which the ``capabilities`` verb says in as many words
+by answering an empty ``containers`` list.
 """
 
 from __future__ import annotations
@@ -38,8 +37,8 @@ def _announce(config: Config) -> None:
     logger.info("MCUHome build server %s", __version__)
     logger.info("listening on %s", config.site_summary())
     if config.token_generated:
-        # The code-server pattern (ADR 0009 decision 2, borrowed): a
-        # fresh container is usable in one step and never open. Printed
+        # The code-server pattern, borrowed: a fresh container is usable
+        # in one step and never open. Printed
         # once, at a level nobody filters out.
         logger.warning(
             "No bearer token was configured, so one was generated for this run:\n\n"

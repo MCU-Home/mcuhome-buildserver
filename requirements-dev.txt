@@ -26,19 +26,19 @@
 # workbench's rather than a second implementation of it. Neither is
 # published yet, so the editable lines below satisfy the declaration
 # from the sibling checkouts — the workbench from `mcuhome`, and the
-# vocabulary it depends on from `mcuhome-sdk` (ADR 0024).
+# vocabulary it depends on from `mcuhome-sdk`.
 #
 # `mcuhome-compiler` is deliberately **not** here. It is the program
-# that runs inside a build container, and installing it beside this
+# that runs inside a build environment, and installing it beside this
 # server would put a toolchain on a host whose whole point is not
 # having one. The workbench reaches it through a dynamic import for the
 # build methods that need one; nothing on this side does.
 #
 # There is deliberately no `mcuhome-ui` here, and no sibling
-# checkout of it either: the build server depends on the build-container
-# contract and on nothing else (ADR 0017 decision 3, dashboard ADR 0012).
-# The frame envelope the two products share is pinned by the contract,
-# not by importing one product into the other's test run.
+# checkout of it either: the build server and the dashboard share only
+# the session protocol's frame envelope, and that is pinned by a
+# cross-checking test (`tests/python/test_protocol.py`), not by
+# importing one product into the other's test run.
 #
 # Working on this repository ALONE (no sibling checkout): satisfy the
 # declaration from git instead — pip clones internally, you keep

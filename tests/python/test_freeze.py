@@ -3,7 +3,7 @@
 """``lock-context``: the freeze, the manifest, and the identity behind them.
 
 The context ID exists so that two independently written parties compute
-the same value (ADR 0018 §6, build-container contract §3.3). This file
+the same value (the build context format's §6). This file
 therefore checks two different things and never confuses them: that the
 server computes the ID *through* ``mcuhome-model`` rather than beside it,
 and that ``mcuhome-model``'s rule as installed here still produces the
@@ -72,11 +72,11 @@ def read_manifest(path) -> dict:
 
 
 async def test_the_lock_answers_the_context_id_and_nothing_else(client, package_source) -> None:
-    """E37, frozen by the product owner against the richer alternative.
+    """Frozen by the product owner against a richer alternative.
 
     The request carries ``session_id`` and nothing else, the response
-    carries the context ID and nothing else. The comparison ADR 0019
-    requires — both sides comparing values they computed independently —
+    carries the context ID and nothing else. The comparison this design
+    relies on — both sides comparing values they computed independently —
     therefore happens on the *client*, and this server never sees the
     client's value, so it can never raise that mismatch. The consequence
     is asserted here so nobody rediscovers it as a gap.
@@ -100,7 +100,7 @@ async def test_the_id_is_the_models_rule_over_the_bytes_received(client, package
     ``context_id`` over them itself. That is exactly the comparison the
     workbench is required to make, and it is what "both sides compute
     the same value" has to mean: the server may not re-implement the
-    rule (ADR 0020 decision 4), so the only thing worth asserting is
+    rule, so the only thing worth asserting is
     that the number it answers is the rule's.
     """
     files = {
@@ -127,7 +127,7 @@ async def test_the_id_is_the_models_rule_over_the_bytes_received(client, package
 async def test_an_extension_changes_the_identity(client, package_source) -> None:
     """The ID is hashed once, at the lock — over the *effective* context.
 
-    ADR 0018's amendment moved the hash from "re-hashed at build time"
+    The hash moved from "re-hashed at build time"
     to "hashed once, at ``lock-context``", and the point of that moment
     is that everything sent up to it is in the answer. A context that
     grew and kept its ID would attribute two different builds to one
@@ -151,12 +151,12 @@ async def test_an_extension_changes_the_identity(client, package_source) -> None
 
 
 async def test_an_empty_context_has_an_identity_and_may_be_locked(client, package_source) -> None:
-    """ "A context that was sent but is empty may be locked" (ADR 0019).
+    """ "A context that was sent but is empty may be locked".
 
     It has a well-defined ID — the ``files`` list is simply empty and
     the document still has the key — and the things a ``build`` needs
     beyond existence, ``keys/signing.pub`` above all, are checked by
-    ``build``, which is where the contract scopes them.
+    ``build``, which is where they belong.
 
     "Empty" is about *content*: the two documents that make a context a
     context — the pins and the generator declaration — are there, because
@@ -321,9 +321,10 @@ async def test_the_manifest_repeats_the_pins_and_adds_the_list_and_the_id(
 ) -> None:
     """ "It repeats rather than refers, so the lock result is readable on
     its own: the document that carries an identity carries the inputs
-    that identity was computed from" (ADR 0018's amendment).
+    that identity was computed from."
 
-    Six keys, exactly as build-container contract §3.2 draws them. The
+    Six keys, exactly as the build context format's manifest draws them
+    (§5). The
     sixth is ``build_environment``, and it is a **repeat**: the client
     pinned it, this server records what it was handed. That is the whole
     difference the format made here — the manifest gained nothing this
@@ -382,8 +383,8 @@ async def test_no_hash_in_the_manifest_is_wrapped_across_two_lines(
     """A ``sha256:`` digest is 71 characters and the emitter would fold it.
 
     Legal YAML, and still the wrong thing to write: ``manifest.yaml`` is
-    read by build containers this project does not write, in languages
-    it does not choose, and build-container contract §3.3.1 has them
+    read by build environments this project does not write, in languages
+    it does not choose, and this server has them
     **refuse** a digest rendered any other way rather than repair it. A
     one-line value cannot be read as two.
     """
@@ -411,7 +412,8 @@ async def test_neither_context_document_is_in_the_integrity_list(
     """Both exclusions, and they have different reasons.
 
     ``manifest.yaml`` is structural — it is the document that carries
-    the list. ``context.yaml`` is ADR 0018 §6: hashing it would readmit
+    the list. ``context.yaml`` is the context ID's own rule (§6): hashing
+    it would readmit
     ``created`` and ``mcuhome.constraint`` through the back door, so two
     byte-identical configurations created a second apart would get two
     identities, and one resolved pin reached under two constraints would
@@ -445,7 +447,7 @@ async def test_neither_context_document_is_in_the_integrity_list(
 async def test_a_patch_is_an_ordinary_entry_of_the_list(
     aiohttp_client, config, package_source
 ) -> None:
-    """ "There is no patch list in the manifest" (contract §3.1).
+    """ "There is no patch list in the manifest."
 
     A patch's layer is its subfolder and its order is its filename, so
     it needs no section of its own — it hashes into the identity like
@@ -535,11 +537,11 @@ async def test_the_lock_is_one_way_and_unlocks_the_working_commands(client, pack
 
 async def test_close_session_destroys_the_context(client, state, package_source) -> None:
     """ "The per-session directory — the context and every artifact in it
-    — is deleted at ``close-session``" (ADR 0019's amendment).
+    — is deleted at ``close-session``."
 
-    Which is also why ``get-artifact`` has to run before it. The
-    amendment removed decision 2's "and for a bounded grace period after
-    close" together with an undefined bound: nothing said how long,
+    Which is also why ``get-artifact`` has to run before it. An earlier
+    draft allowed "a bounded grace period after
+    close" together with an undefined bound; that was removed: nothing said how long,
     while the directory it kept alive holds a device's Matter
     commissioning credentials.
     """
@@ -589,8 +591,8 @@ def test_an_expired_lease_takes_the_context_with_it(tmp_path) -> None:
 def test_this_server_calls_the_workbench_and_never_the_compiler() -> None:
     """The edge that reversed, and the one that did not.
 
-    This server used to carry the *whole* driving half of the build
-    contract, so the rule was that it consumed the vocabulary
+    This server used to carry the *whole* driving half of the build,
+    so the rule was that it consumed the vocabulary
     (``mcuhome.model``) and neither of the halves built on it. It is an
     orchestrator no longer: a session's build environment is the
     workbench's, which is the entire point — a fix to how a container is
@@ -598,7 +600,7 @@ def test_this_server_calls_the_workbench_and_never_the_compiler() -> None:
 
     What has not moved, and is what this test is now for, is the other
     edge. ``mcuhome.compiler`` is the program that runs **inside** the
-    build container. A build server that imported it would be carrying a
+    build environment. A build server that imported it would be carrying a
     toolchain it exists to keep at arm's length, and the container it
     drives would no longer be the only thing that compiles.
     """
@@ -642,7 +644,7 @@ def test_importing_this_server_does_not_load_the_compiler() -> None:
 
 
 def test_the_context_id_vectors_hold_on_this_side() -> None:
-    """ADR 0020 §4's conformance obligation, discharged where it applies.
+    """A conformance obligation, discharged where it applies.
 
     The vectors are "the frozen rule stated as inputs and outputs rather
     than as code", and they exist for whoever writes the *second*
@@ -734,8 +736,8 @@ async def test_a_lock_cannot_slip_between_an_extension_and_its_bytes(
     neither ``manifest.yaml`` nor the context ID already answered. Both
     documents this contradicts say the same thing — "nothing may extend
     the context afterwards, so within a session ``manifest.yaml`` is
-    immutable" (contract §3.2) and "the lock is one-way" (ADR 0018's
-    amendment) — and it defeated the one comparison the protocol has,
+    immutable" and "the lock is one-way" — and it defeated the one
+    comparison the protocol has,
     since the workbench's ID and the server's would agree while the file
     that arrived afterwards was invisible to both.
 

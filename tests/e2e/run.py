@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """One real remote build, against this server, with everything real.
 
-The unit suite fakes docker at the seam the contract draws, because a
-build server is an orchestrator and there is no build to stand in for.
+The unit suite fakes docker at the seam the container profile draws,
+because a build server is an orchestrator and there is no build to
+stand in for.
 That is the right shape for testing a protocol and the wrong shape for
 finding what actually broke here: three of the four defects that reached
 a real remote build were about *time* — a lease that ran out under its

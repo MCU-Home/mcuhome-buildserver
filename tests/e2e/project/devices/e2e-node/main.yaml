@@ -2,7 +2,7 @@
 # looks like this.
 #
 # What the job tests is the chain — a command, the workbench, this
-# server, a build container, artifacts, host-side signing — not the
+# server, a build environment, artifacts, host-side signing — not the
 # firmware that comes out of it. So the configuration is the cheapest
 # one that still walks the whole chain: no transport and no Matter, which
 # means no OpenThread and no CHIP, which is the difference between three

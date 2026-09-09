@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The frame envelope, and its agreement with the dashboard's.
 
-The envelope is the half of dashboard ADR 0006 that dashboard ADR 0012
-decision 3 carries forward; only the vocabulary inside it was replaced.
+The envelope is the half of an earlier protocol that carried forward
+into this one; only the vocabulary inside it was replaced.
 So this file still tests the codec — with session verbs as its literals
 instead of job commands.
 """
@@ -102,8 +102,8 @@ class TestFieldAccessors:
     def test_optional_fields_fall_back(self) -> None:
         assert self.command().optional_int("context_format", 1) == 1
         assert self.command().optional_str("profile", "oneshot") == "oneshot"
-        # Not "manifest": open-session lost that operand with ADR 0019's
-        # amendment. The accessor stays — the codec is general, and the
+        # Not "manifest": open-session carries no such operand any more.
+        # The accessor stays — the codec is general, and the
         # verbs that carry objects are the ones still stubbed.
         assert self.command().optional_dict("params") == {}
         assert self.command(params={"mode": "clean"}).optional_dict("params") == {"mode": "clean"}

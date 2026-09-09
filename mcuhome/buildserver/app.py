@@ -20,12 +20,12 @@ whose lease or idle timeout ran out, and the startup check that the
 per-session directories are being created somewhere only this server can
 reach.
 
-**Negotiation is not REST here any more.** ``GET /capabilities`` was
-ADR 0006's pre-submission handshake; dashboard ADR 0012 decision 3
-replaces it with the session protocol's ``capabilities`` verb, which
-answers the same question with the vocabulary that can actually
-describe the answer — build-container images, patch policy, quota —
-over the same authenticated socket a client is about to use anyway.
+**Negotiation is not REST here any more.** ``GET /capabilities`` used to
+be a pre-submission handshake; it is replaced by the session protocol's
+``capabilities`` verb, which answers the same question with the
+vocabulary that can actually describe the answer — build-environment
+images, patch policy, quota — over the same authenticated socket a
+client is about to use anyway.
 """
 
 from __future__ import annotations
@@ -68,9 +68,9 @@ class ServerState:
     auth_throttle: AuthThrottle = field(default_factory=AuthThrottle)
     sessions: sessions.SessionManager = field(init=False)
     #: This server's half of a build: build-environment discovery, the
-    #: session's runtime, invocations and their streams. One per process, because the ``describe``
-    #: cache and the runtime registry are properties of the host rather
-    #: than of a session.
+    #: session's runtime, invocations and their streams. One per process,
+    #: because image discovery and the container runtime registry are
+    #: properties of the host rather than of a session.
     backend: SessionBackend = field(init=False)
 
     def __post_init__(self) -> None:

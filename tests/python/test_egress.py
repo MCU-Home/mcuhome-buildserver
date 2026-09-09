@@ -75,9 +75,9 @@ def _members(archive: Path) -> dict[str, bytes]:
 
 
 def test_the_archive_holds_the_artifacts_under_their_declared_paths(tmp_path: Path) -> None:
-    """E45, and the reason the paths are the declared ones: an archive of
-    one artifact and an archive of all of them place the same file at the
-    same name, so a client that asked twice gets the same layout."""
+    """The paths are the declared ones: an archive of one artifact and an
+    archive of all of them place the same file at the same name, so a
+    client that asked twice gets the same layout."""
     out = _out(tmp_path, **{"firmware.hex": b"hex", "sub/firmware.bin": b"bin"})
     delivery = artifacts.build_archive(
         out=out,

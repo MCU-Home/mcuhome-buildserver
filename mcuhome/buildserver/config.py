@@ -23,8 +23,8 @@ this is a Home Assistant App pair. What there is no way to ask for is a
 build server with authentication switched off.
 
 **The ingress caps and the per-session disk quota are options here for
-one reason: the config is the policy** (product owner, 2026-08-09). The
-hardening floor for shared servers requires five ingress caps enforced
+one reason: the config is the policy.** The hardening floor for shared
+servers requires five ingress caps enforced
 streaming and a per-session disk quota answered typed, and names no
 number for any of them; the numbers below are this server's defaults
 and an operator's to change. They are deliberately *not* constants in
@@ -96,9 +96,9 @@ DEFAULT_HOST = "0.0.0.0"  # noqa: S104 - see the module docstring
 
 #: The five ingress caps of the hardening floor for shared servers, in
 #: the order they are usually listed, and the per-session disk quota
-#: alongside them. Every number is a product-owner choice of
-#: 2026-08-09; no document derives them, so they are stated here once
-#: and cited nowhere as if they were normative.
+#: alongside them. Every number is a chosen default rather than a derived
+#: one: no document fixes them, so they are stated here once and cited
+#: nowhere as if they were normative.
 #:
 #: They are generous against a real context and mean against a bomb. A
 #: device model is kilobytes, a signing public key is under a hundred

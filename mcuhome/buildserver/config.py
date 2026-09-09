@@ -11,8 +11,8 @@ Two defaults are decisions rather than conveniences.
 
 **The bind address is ``0.0.0.0``.** The dashboard defaults to loopback
 because a dashboard on loopback is still a dashboard; a build server on
-loopback is a build server nobody can open a session against. ADR 0003
-makes it a separate machine by construction — that is the whole
+loopback is a build server nobody can open a session against. The
+two-App topology makes it a separate machine by construction — that is the whole
 topology — so the useful default is the one that works, and the safety
 comes from the other decision below rather than from the binding.
 
@@ -23,16 +23,16 @@ this is a Home Assistant App pair. What there is no way to ask for is a
 build server with authentication switched off.
 
 **The ingress caps and the per-session disk quota are options here for
-one reason: the config is the policy** (ADR 0019 decision 7, product
-owner 2026-08-09/E44). ADR 0019 decision 8 requires five ingress caps
-enforced streaming and a per-session disk quota answered typed, and
-names no number for any of them; the numbers below are this server's
-defaults and an operator's to change. They are deliberately *not*
-constants in the module that enforces them — a limit an operator cannot
-move is a limit they will work around by other means. The bound on
-``context.yaml`` is a sixth cap that no ADR asks for, and it is here
-rather than beside its enforcement for exactly that reason: it was a
-constant in :mod:`mcuhome.buildserver.contextstore` while the README
+one reason: the config is the policy** (product owner, 2026-08-09). The
+hardening floor for shared servers requires five ingress caps enforced
+streaming and a per-session disk quota answered typed, and names no
+number for any of them; the numbers below are this server's defaults
+and an operator's to change. They are deliberately *not* constants in
+the module that enforces them — a limit an operator cannot move is a
+limit they will work around by other means. The bound on
+``context.yaml`` is a sixth cap that nothing else asks for, and it is
+here rather than beside its enforcement for exactly that reason: it was
+a constant in :mod:`mcuhome.buildserver.contextstore` while the README
 advertised its value to operators who had no way to move it.
 """
 
@@ -46,7 +46,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from mcuhome.model.buildimage import ENVIRONMENT_IMAGE_REPOSITORY
+from mcuhome.model.buildenvironment import ENVIRONMENT_IMAGE_REPOSITORY
 
 from mcuhome.buildserver.environments import repository_of
 from mcuhome.buildserver.security import DEFAULT_PAIR_FILE, read_token_file
@@ -94,11 +94,11 @@ ENV_PREFIX = "MCUHOME_BUILDSERVER_"
 DEFAULT_PORT = 8100
 DEFAULT_HOST = "0.0.0.0"  # noqa: S104 - see the module docstring
 
-#: The five ingress caps of ADR 0019 decision 8, in the order that ADR
-#: lists them, and the per-session disk quota of the same decision. Every
-#: number is a product-owner choice of 2026-08-09 (E44); no document
-#: derives them, so they are stated here once and cited nowhere as if
-#: they were normative.
+#: The five ingress caps of the hardening floor for shared servers, in
+#: the order they are usually listed, and the per-session disk quota
+#: alongside them. Every number is a product-owner choice of
+#: 2026-08-09; no document derives them, so they are stated here once
+#: and cited nowhere as if they were normative.
 #:
 #: They are generous against a real context and mean against a bomb. A
 #: device model is kilobytes, a signing public key is under a hundred
@@ -112,8 +112,8 @@ DEFAULT_MAX_FILE_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_PATH_DEPTH = 16
 DEFAULT_SESSION_QUOTA_BYTES = 2 * 1024 * 1024 * 1024
 
-#: The sixth ingress cap, and the one ADR 0019 decision 8 does not list:
-#: how large ``context.yaml`` may be. It exists because a YAML parser is
+#: The sixth ingress cap, and one the hardening floor above does not
+#: list: how large ``context.yaml`` may be. It exists because a YAML parser is
 #: the single place in this server where a small input buys unbounded
 #: work, so the pin document gets a bound of its own instead of sharing
 #: the per-file cap with a multi-megabyte patch. It is here, next to the
@@ -131,7 +131,7 @@ DEFAULT_MAX_CONTEXT_YAML_BYTES = 64 * 1024
 DEFAULT_DOCKER = "docker"
 
 #: ``limits.deadline_seconds`` — relative to program start, advisory to
-#: the program and **enforced here** (§9.1). Ninety minutes: generous
+#: the program and **enforced here**. Ninety minutes: generous
 #: against a cold Matter build, mean against one that is not going to
 #: end. A program that honours the advisory value stops itself and says
 #: ``error.deadline.exceeded``; one that does not gets the liveness
@@ -145,9 +145,9 @@ DEFAULT_BUILD_DEADLINE_SECONDS = 5400
 #: cancel is not left guessing.
 DEFAULT_CANCEL_GRACE_SECONDS = 60
 
-#: The egress size cap of contract §9.3, per artifact, "applied during
+#: The egress size cap, per artifact, applied during
 #: enumeration, from the bytes on disk — an artifact entry declares no
-#: size". Separate from the ingress caps because it bounds the opposite
+#: size. Separate from the ingress caps because it bounds the opposite
 #: direction: what the least trusted component in the system may put on
 #: the wire towards other people's machines.
 DEFAULT_MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
@@ -181,7 +181,7 @@ DEFAULT_CONTAINER_PIDS = 4096
 #: generous against a real client (a single principal opens a handful of
 #: connections and pipelines a few commands on each) and mean against a
 #: flood, and they are options for the same reason every other limit here
-#: is (E44, the config is the policy).
+#: is: the config is the policy.
 DEFAULT_MAX_CONNECTIONS = 64
 DEFAULT_MAX_INFLIGHT_COMMANDS = 32
 
@@ -191,7 +191,7 @@ def default_context_root(env: Mapping[str, str]) -> Path:
 
     A build server holds a context only for the life of a session — it
     is deleted at ``close-session`` together with every artifact
-    (ADR 0019's amendment) — so this is *state*, not data to preserve,
+    — so this is *state*, not data to preserve,
     and the XDG state directory is where state belongs.
 
     The last fallback is the temporary directory rather than the account
@@ -247,11 +247,11 @@ class Config:
     #: configured one — see :func:`default_context_root`.
     context_root: Path = field(default_factory=lambda: default_context_root(os.environ))
 
-    #: The five ingress caps of ADR 0019 decision 8. All five are
-    #: enforced *while bytes are arriving*, never after buffering them;
-    #: the first three count **cumulatively across the base context and
-    #: every extension** (E44), because a session's footprint is what
-    #: they bound, not one archive's.
+    #: The five ingress caps of the hardening floor for shared servers.
+    #: All five are enforced *while bytes are arriving*, never after
+    #: buffering them; the first three count **cumulatively across the
+    #: base context and every extension**, because a session's footprint
+    #: is what they bound, not one archive's.
     max_compressed_bytes: int = DEFAULT_MAX_COMPRESSED_BYTES
     max_decompressed_bytes: int = DEFAULT_MAX_DECOMPRESSED_BYTES
     max_entries: int = DEFAULT_MAX_ENTRIES
@@ -260,18 +260,18 @@ class Config:
     #: Path segments, ``patches/zephyr/0001-fix.patch`` being three.
     max_path_depth: int = DEFAULT_MAX_PATH_DEPTH
     #: The sixth cap: how large ``context.yaml`` may be before it is
-    #: parsed at all. Not one of ADR 0019 decision 8's five, and here for
+    #: parsed at all. Not one of the hardening floor's five, and here for
     #: the same reason they are.
     max_context_yaml_bytes: int = DEFAULT_MAX_CONTEXT_YAML_BYTES
 
-    #: The per-session disk quota of the same decision — "typed
+    #: The per-session disk quota alongside them — "typed
     #: quota-exceeded instead of host exhaustion". It meters what a
     #: **client** put on this host: the context, and the SDK package
     #: deliberately not (that one is the operator's own file, and
     #: charging it would let a package's size decide whether a context
     #: fits). What a build writes into ``out`` is bounded by
     #: :attr:`max_artifact_bytes` per artifact at egress instead, which
-    #: is where contract §9.3 puts the cap and the only place a number
+    #: is where the cap belongs — the only place a number
     #: can be measured from the bytes on disk.
     session_quota_bytes: int = DEFAULT_SESSION_QUOTA_BYTES
 
@@ -345,11 +345,10 @@ class Config:
     sdk_sources: tuple[Path, ...] = ()
 
     #: An optional shared ccache, offered to every invocation
-    #: **read-only** (contract §10: "shared backends MUST offer a shared
-    #: cache read-only for untrusted work"). There is deliberately no
-    #: way to ask for a writable one: cache warming is "a deliberate
+    #: **read-only** for untrusted work. There is deliberately no
+    #: way to ask for a writable one: cache warming is a deliberate
     #: operator invocation with a writable cache and trusted contexts
-    #: only", which is a verb this server does not have, and an option
+    #: only, which is a verb this server does not have, and an option
     #: that made an untrusted build's cache writable would be the one
     #: setting that turns a shared cache into a shared attack surface.
     ccache_dir: Path | None = None
@@ -604,10 +603,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         metavar="LAYER",
         dest="allowed_patch_layers",
-        # Deliberately no `choices=`: contract v1 fixes four layer names
-        # and reserves the `x-` prefix for third-party ones, so the set
-        # of *nameable* layers is open while the set of *allowed* ones
-        # stays this option's answer. Validation is in `load_config`,
+        # Deliberately no `choices=`: this server's own layer names are
+        # the four above, and the `x-` prefix is reserved for
+        # third-party ones, so the set of *nameable* layers is open
+        # while the set of *allowed* ones stays this option's answer.
+        # Validation is in `load_config`,
         # which can say why an `x-` name is fine and `kernel` is not.
         help=(
             "session protocol v2: allow build contexts to carry patches for this "
@@ -813,7 +813,7 @@ def load_config(
         raise SystemExit(
             f"{', '.join(unknown_layers)}: not a patch layer this server knows "
             f"(known: {', '.join(PATCH_LAYERS)}; a third-party layer name must "
-            "carry the x- prefix the contract reserves for it)."
+            "carry the x- prefix reserved for it)."
         )
 
     context_root = path_option(args.context_root, "CONTEXT_ROOT")
@@ -891,8 +891,8 @@ def load_config(
         context_root=context_root,
         docker=args.docker or env.get(ENV_PREFIX + "DOCKER") or DEFAULT_DOCKER,
         # Order-preserving de-duplication: the search order is fixed
-        # (ADR 0019's amendment) and a directory listed twice must not
-        # move the one behind it.
+        # and a directory listed twice must not move the one behind
+        # it.
         sdk_sources=tuple(dict.fromkeys(sdk_sources)),
         ccache_dir=path_option(args.ccache_dir, "CCACHE_DIR"),
         container_memory=container_memory,

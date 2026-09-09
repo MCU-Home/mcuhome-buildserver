@@ -86,7 +86,7 @@ def hostile_model() -> bytes:
                 "blob_usage": "auto",
                 "blobs": {},
             },
-            "sources": {"sdk": "sdk/mcuhome-sdk", "build_environment": "; rm -rf /"},
+            "sources": {"sdk": "sdk/mcuhome-sdk", "container_image": "; rm -rf /"},
             "hardware": {"buses": [], "peripherals": []},
             "endpoints": [],
             "channels": [],

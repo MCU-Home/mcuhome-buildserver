@@ -49,8 +49,7 @@ from typing import Any
 
 import pytest
 import zstandard
-from mcuhome.model.buildenvironment import LABEL_PREFIX
-from mcuhome.model.buildimage import ENVIRONMENT_IMAGE_REPOSITORY
+from mcuhome.model.buildenvironment import ENVIRONMENT_IMAGE_REPOSITORY, LABEL_PREFIX
 from mcuhome.model.context import EnvironmentPin, PackagePin
 from mcuhome.workbench import buildenvsession, containerbuild, ociregistry
 
@@ -795,7 +794,6 @@ def device_model(
             },
             "sources": {
                 "sdk": "sdk/mcuhome-sdk",
-                "build_environment": "ghcr.io/mcu-home/build-container",
                 "build_workspace": "build-workspace/mcuhome-build-workspace",
                 "build_tools": "build-tools/mcuhome-build-tools",
             },

@@ -878,7 +878,7 @@ async def call(ws, command_type: str, payload: dict | None = None, frame_id: str
 def make_archive(
     entries: dict[str, bytes], *, extras: list[tarfile.TarInfo] | None = None
 ) -> bytes:
-    """A tar.zst carrying *entries*, the format E41 fixed for the wire.
+    """A tar.zst carrying *entries*, the format a context travels in.
 
     *extras* takes ready-made ``TarInfo`` objects, which is how the
     unsafe-entry tests state a symlink or a device node: those cannot be

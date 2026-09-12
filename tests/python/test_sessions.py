@@ -148,10 +148,10 @@ async def test_capabilities_answers_the_negotiation_surface(client, config) -> N
     # Sessions and nothing else: v1.0 has no work metering and no cost
     # classes, so there is no `quota.work` to answer.
     assert set(body["quota"]) == {"sessions"}
-    # E57: what one upload may cost here, announced rather than
-    # discovered by hitting it. The five caps of decision 8 plus the
-    # transport bound below the verbs, whose overrun is a dropped
-    # connection and can never be a typed refusal.
+    # What one upload may cost here, announced rather than discovered
+    # by hitting it: the five ingress caps plus the transport bound
+    # below the verbs, whose overrun is a dropped connection and can
+    # never be a typed refusal.
     assert body["ingress"] == {
         "compressed_bytes": config.max_compressed_bytes,
         "decompressed_bytes": config.max_decompressed_bytes,
@@ -183,7 +183,7 @@ async def test_capabilities_reports_version_and_uptime_behind_the_token(client) 
 async def test_the_announced_ingress_caps_come_from_the_configuration(
     aiohttp_client, config
 ) -> None:
-    """E44: the config **is** the policy, so the announcement follows it.
+    """The config **is** the policy, so the announcement follows it.
 
     An operator who lowered a cap has lowered what ``capabilities``
     says, and a client that sized its upload from the announcement is
@@ -223,10 +223,10 @@ async def test_the_announced_ingress_caps_come_from_the_configuration(
 def test_the_frame_bound_is_announced_from_the_one_the_endpoint_applies() -> None:
     """The announced number and the socket's ``max_msg_size`` are one value.
 
-    It moved to :mod:`~mcuhome.buildserver.protocol` for E57 — the verbs
-    announce it and the endpoint applies it, and the endpoint imports
-    the verbs, so a constant living in ``ws`` could only have been
-    announced by copying it.
+    It lives in :mod:`~mcuhome.buildserver.protocol` — the verbs
+    announce it and the endpoint applies it, and the endpoint imports the
+    verbs, so a constant living in ``ws`` could only have been announced
+    by copying it.
     """
     from mcuhome.buildserver import ws as ws_module
 
@@ -621,8 +621,8 @@ async def test_verify_and_build_before_the_lock_are_typed_refusals(client) -> No
 async def test_lock_context_without_a_context_is_refused_typed(client) -> None:
     """Nothing to freeze is not the same as a freeze that failed.
 
-    No ADR names a code for this case; ``context.missing`` is the
-    registry's own entry for "the command needs a context and
+    No code of its own was minted for this case; ``context.missing`` is
+    the registry's own entry for "the command needs a context and
     send-context has not happened", which is exactly what this is.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
@@ -740,7 +740,7 @@ async def test_cancel_of_an_unknown_invocation_is_typed(client) -> None:
 
 
 async def test_cancel_acknowledges_the_signal_not_the_stop(client, state) -> None:
-    """The E38 wire shape: the answer means "the stop signal is set".
+    """The wire shape: the answer means "the stop signal is set".
 
     Never "it stopped" — only the invocation's result document says
     that, with ``status: "cancelled"``. And idempotently: the second

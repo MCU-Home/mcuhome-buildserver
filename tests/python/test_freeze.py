@@ -72,7 +72,7 @@ def read_manifest(path) -> dict:
 
 
 async def test_the_lock_answers_the_context_id_and_nothing_else(client, package_source) -> None:
-    """Frozen by the product owner against a richer alternative.
+    """The minimal shape, chosen over a richer alternative.
 
     The request carries ``session_id`` and nothing else, the response
     carries the context ID and nothing else. The comparison this design

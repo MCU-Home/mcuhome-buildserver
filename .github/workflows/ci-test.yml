@@ -113,9 +113,9 @@ jobs:
   # and the signing step (mcu-home/mcuhome-workbench), the SDK package and the
   # build environment (mcu-home/mcuhome-sdk), and this server. They are
   # checked out at `main` and this repository at the commit under test —
-  # which is the arrangement the product owner chose over a shared
-  # workflow the other three would call: what is being tested here is
-  # building a firmware *through this server*. When the workbench and the
+  # which is deliberate, rather than a shared workflow the other three
+  # would call: what is being tested here is building a firmware
+  # *through this server*. When the workbench and the
   # compiler grow their own end-to-end job for the local methods, the
   # method will stop being the distinguishing thing and this can be
   # revisited.

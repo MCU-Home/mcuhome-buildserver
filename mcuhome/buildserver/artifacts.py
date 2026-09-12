@@ -17,13 +17,13 @@ segments are ``[A-Za-z0-9._-]+``. That is what makes this an audit
 rather than a repair: everything below refuses, and nothing below
 rewrites a path into one that would have been allowed.
 
-**Download is an archive, in the format the wire already speaks.** The
-mirror of the context upload, settled by the product owner: one
-``tar.zst`` in both directions. With a path it holds exactly that
-declared artifact, without one it holds all of them under their declared
-paths; the announced ``sha256`` is the **archive's**, computed at egress
-while the bytes are read off disk, and per-file integrity stays the
-client's own check against the result document it already holds.
+**Download is an archive, in the format the wire already speaks.** It
+is the mirror of the context upload: one ``tar.zst`` in both directions.
+With a path it holds exactly that declared artifact, without one it
+holds all of them under their declared paths; the announced ``sha256``
+is the **archive's**, computed at egress while the bytes are read off
+disk, and per-file integrity stays the client's own check against the
+result document it already holds.
 
 **And the second enforcement is the one that matters.** The orchestrator
 verifies when an invocation ends; :func:`build_archive` runs whenever a
@@ -167,11 +167,11 @@ def build_archive(
     on — carrying them across would be carrying a setuid bit across.
 
     The archive is built even when *artifacts* is empty, and it is then
-    a valid empty ``tar.zst``. That is E45 read together with §5.4: "an
-    absent list is an empty delivery, not a permissive one", so the
-    honest answer to "give me everything this invocation declared" when
-    it declared nothing is an archive with nothing in it, not a refusal
-    that would read as "the invocation is unknown".
+    a valid empty ``tar.zst``. An absent list is an empty delivery, not
+    a permissive one, so the honest answer to "give me everything this
+    invocation declared" when it declared nothing is an archive with
+    nothing in it, not a refusal that would read as "the invocation is
+    unknown".
 
     **Delivery re-verifies rather than trusting the earlier pass.**
     ``harden`` ran when the invocation ended and this runs when a client

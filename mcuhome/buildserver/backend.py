@@ -1284,13 +1284,14 @@ class SessionBackend:
     ) -> None:
         """Put one frame on every connection watching this session.
 
-        *drop_when_full* is the difference between the two streams and
-        it is E46's shape read against the transport's. Program events
-        and log lines are offered — dropping the oldest rather than
-        applying backpressure through the log reader and from there into
-        the compiler — and both survive it: the log carries a counter
-        that makes a gap visible, and the events file on disk **is** the
-        replay buffer, so ``attach-session`` can fetch the gap. The
+        *drop_when_full* is the difference between the two streams:
+        what the event stream guarantees, read against what the
+        transport can hold. Program events and log lines are offered —
+        dropping the oldest rather than applying backpressure through
+        the log reader and from there into the compiler — and both
+        survive it: the log carries a counter that makes a gap visible,
+        and the events file on disk **is** the replay buffer, so
+        ``attach-session`` can fetch the gap. The
         ``invocation.verdict`` frame is sent instead, because it is the
         one frame a client is waiting on and there is no second way to
         learn it: it is this server's own judgement and is in no events

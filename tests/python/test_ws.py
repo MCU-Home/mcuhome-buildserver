@@ -88,13 +88,13 @@ async def test_an_outbox_of_nothing_but_undroppable_frames_closes_the_connection
 
 
 async def test_the_verdict_frame_is_not_evicted_to_make_room_for_a_log_line() -> None:
-    """E46's one frame with no second way to be learned.
+    """The one frame with no second way to be learned.
 
     ``invocation.verdict`` is queued with :meth:`Connection.send` for
     exactly that reason — and being queued said nothing about being
     kept, because the eviction policy looked at the queue rather than at
-    the frame. Since E58 it is the *name* the policy protects, and it
-    protects only this server's verdict: the program's own
+    the frame. It is the *name* the policy protects now, and it protects
+    only this server's verdict: the program's own
     ``invocation.finished`` is a line in the events file and survives a
     drop, which is what makes every other event droppable.
     """

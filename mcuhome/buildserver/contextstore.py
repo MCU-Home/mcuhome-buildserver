@@ -858,10 +858,9 @@ def recheck_locked_context(paths: SessionPaths, pins: ContextPins, *, expected_i
     an id the client was never told.
 
     Contexts are small — a model, a key, a few patches — so this runs
-    before **every** working invocation rather than once at the lock.
-    That is the product owner's decision and it is the cheap half of a
-    guarantee whose expensive half (the container's own ``verify``) is
-    optional for callers.
+    before **every** working invocation rather than once at the lock:
+    it is the cheap half of a guarantee whose expensive half (the build
+    environment's own ``verify``) is optional for callers.
 
     Returns the recomputed id, so a caller never has two values to keep
     in step.

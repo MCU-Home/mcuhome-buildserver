@@ -2,14 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """The bearer token, where it comes from, and where it is left.
 
-WebSocket plus a bearer token was chosen over ESPHome's Noise handshake,
-for one reason recorded as the product owner's: **a WebSocket over HTTPS
-traverses firewalls, NAT and reverse proxies naturally**, and a build
-server outside the home network is the expected case rather than the
-exotic one. The cost of that choice is stated
-rather than hidden — a build server reachable from the internet **must**
-sit behind TLS, because a bearer token on a plaintext connection is a
-token that has been given away.
+WebSocket plus a bearer token was chosen over ESPHome's Noise handshake
+for one reason: **a WebSocket over HTTPS traverses firewalls, NAT and
+reverse proxies naturally**, and a build server outside the home network
+is the expected case rather than the exotic one. The cost of that choice
+is stated rather than hidden — a build server reachable from the
+internet **must** sit behind TLS, because a bearer token on a plaintext
+connection is a token that has been given away.
 
 The threat model is ESPHome's, verbatim and unchanged: **a compromised
 authenticated session is equivalent to shell access.** A build runs a

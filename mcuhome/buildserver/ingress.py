@@ -583,7 +583,7 @@ def _check_directory_target(path: str) -> None:
 
 
 def check_patch_layer(layer: str, allowed_layers: frozenset[str], *, where: str) -> None:
-    """The config is the policy: an unlisted layer is denied (decision 7).
+    """The config is the policy: an unlisted layer is denied.
 
     Deny-by-default, and the same answer for a layer this server knows
     but does not allow, for one it has never heard of, and for a

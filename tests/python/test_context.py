@@ -69,7 +69,7 @@ async def serve(aiohttp_client, config: Config, **overrides):
 
 
 # --------------------------------------------------------------------------
-# send-context: the wire E41 settled
+# send-context: the wire, and what it accepts
 # --------------------------------------------------------------------------
 
 
@@ -302,7 +302,7 @@ async def test_a_container_runtime_that_is_down_is_retryable(client, docker) -> 
 async def test_the_context_lands_in_a_directory_the_server_owns(
     client, state, package_source
 ) -> None:
-    """ "Into a per-session directory the server owns" (decision 8).
+    """Into a per-session directory the server owns.
 
     Named by session id under the configured context root, and not
     readable by anyone else on the host: the context carries a device's
@@ -325,7 +325,7 @@ async def test_the_context_lands_in_a_directory_the_server_owns(
 async def test_a_second_base_context_is_refused_rather_than_replacing_the_pins(
     client, package_source
 ) -> None:
-    """E43: ``context.exists``, and the message says which verb was meant.
+    """``context.exists``, and the message says which verb was meant.
 
     Not ``context.locked`` — nothing is frozen yet — and not a silent
     replacement: the pins were accepted and answered, and replacing them
@@ -619,7 +619,7 @@ def _decompressed(archive: bytes) -> int:
 async def test_every_budget_counts_across_the_base_context_and_its_extensions(
     aiohttp_client, config, budget, package_source
 ) -> None:
-    """E44: cumulative, because ``extend-context`` is repeatable.
+    """Cumulative, because ``extend-context`` is repeatable.
 
     A per-archive cap would bound nothing at all — a client would send
     the same bytes twice — so the budget belongs to the session and an
@@ -667,7 +667,7 @@ async def test_every_budget_counts_across_the_base_context_and_its_extensions(
 
 
 async def test_the_session_disk_quota_is_answered_typed(aiohttp_client, config) -> None:
-    """ "Typed quota-exceeded instead of host exhaustion" (decision 8).
+    """A typed quota-exceeded instead of host exhaustion.
 
     Retryable, unlike the ingress caps: a budget frees up when a session
     closes, while an archive that is too large stays too large.

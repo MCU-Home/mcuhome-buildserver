@@ -339,12 +339,12 @@ class Connection:
 
 
 #: The one event name that is never evicted even though its frame type
-#: is. E46 gives it to this server's own completion frame and E58 gives
-#: that frame a name of its own, which is what makes this guarantee
-#: exact: the verdict is this server's judgement, it is written to no
-#: events file, and a dropped one is lost for good. Everything else on
-#: the event stream — the program's ``invocation.finished`` included —
-#: can be fetched again from the events file through ``attach-session``.
+#: is. The completion frame is this server's own and carries a name of
+#: its own, which is what makes this guarantee exact: the verdict is
+#: this server's judgement, it is written to no events file, and a
+#: dropped one is lost for good. Everything else on the event stream —
+#: the program's ``invocation.finished`` included — can be fetched again
+#: from the events file through ``attach-session``.
 VERDICT_EVENT = "invocation.verdict"
 
 
@@ -353,8 +353,9 @@ def _droppable(frame: dict[str, Any] | bytes) -> bool:
 
     The two build streams and nothing else. A BINARY chunk is not a
     ``dict`` and never qualifies; a command's ``result`` or ``error``
-    answer is what a caller is blocked on; ``invocation.verdict`` is
-    the frame E46 exists to deliver.
+    answer is what a caller is blocked on; ``invocation.verdict`` is the
+    one frame with no second way to be learned (see
+    :data:`VERDICT_EVENT`).
     """
     if not isinstance(frame, dict):
         return False

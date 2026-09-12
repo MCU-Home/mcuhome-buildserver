@@ -209,11 +209,10 @@ REGISTRY: dict[str, ErrorCode] = _seed(
         summary="a working command arrived before lock-context; verify and build run only "
         "from the lock onwards",
     ),
-    # An extension that touches `context.yaml` needs a typed error and
-    # named no code for it; the product owner registered this one on
-    # 2026-08-09. It is deliberately
-    # NOT `context.unsafe-entry`: that code is about extraction *shape* —
-    # an absolute path, a `..`, a symlink — while a `context.yaml` in an
+    # An extension that touches `context.yaml` needs a typed error of
+    # its own, and it is deliberately NOT `context.unsafe-entry`: that
+    # code is about extraction *shape* — an absolute path, a `..`, a
+    # symlink — while a `context.yaml` in an
     # extension is a perfectly well-formed entry aimed at a forbidden
     # target. Telling a client its path was unsafe would send it looking
     # for the wrong mistake.
@@ -303,9 +302,9 @@ REGISTRY: dict[str, ErrorCode] = _seed(
         summary="the session has no invocation with this id; details carry the ids it does have",
     ),
     # builder.* — the thing that builds, whatever shape it takes. The
-    # spelling was settled by the product owner on 2026-08-09, before the
-    # first release made the registry append-only: the prefix names the
-    # ROLE, not the deployment. In the container profile, the build
+    # spelling was settled before the first release made the registry
+    # append-only: the prefix names the ROLE, not the deployment. In the
+    # container profile, the build
     # environment's container is the builder; the builder is not
     # necessarily a container — in the subprocess profile a machine that
     # builds without one has no container at all, and its build

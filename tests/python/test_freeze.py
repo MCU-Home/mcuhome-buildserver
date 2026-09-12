@@ -627,8 +627,9 @@ def test_importing_this_server_does_not_load_the_compiler() -> None:
 
     The syntax check above cannot see a dynamic import, and the
     workbench has one on purpose: it resolves ``mcuhome.compiler``
-    through ``importlib`` for the build methods that need a toolchain.
-    Reaching it from here would mean this server had asked for one.
+    through ``importlib`` where a command generates a Zephyr application
+    on this machine. Reaching it from here would mean this server had
+    asked for one.
     """
     import subprocess
     import sys

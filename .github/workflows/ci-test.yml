@@ -115,10 +115,8 @@ jobs:
   # checked out at `main` and this repository at the commit under test —
   # which is deliberate, rather than a shared workflow the other three
   # would call: what is being tested here is building a firmware
-  # *through this server*. When the workbench and the
-  # compiler grow their own end-to-end job for the local methods, the
-  # method will stop being the distinguishing thing and this can be
-  # revisited.
+  # *through this server*. When the workbench and the compiler grow
+  # their own end-to-end job for local builds, this can be revisited.
   #
   # The device is deliberately the cheapest one that still walks the
   # whole chain (tests/e2e/project/devices/e2e-node/main.yaml says why): no

@@ -31,8 +31,9 @@
 # `mcuhome-compiler` is deliberately **not** here. It is the program
 # that runs inside a build environment, and installing it beside this
 # server would put a toolchain on a host whose whole point is not
-# having one. The workbench reaches it through a dynamic import for the
-# build methods that need one; nothing on this side does.
+# having one. The workbench reaches it through a dynamic import, in the
+# commands that generate a Zephyr application on this machine; nothing
+# on this side does.
 #
 # There is deliberately no `mcuhome-ui` here, and no sibling
 # checkout of it either: the build server and the dashboard share only

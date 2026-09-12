@@ -1440,7 +1440,7 @@ async def open_session(state: Any, connection: Any, command: Command) -> dict[st
 
         {"profile": "oneshot",            # oneshot | dev | test
          "protocol_version": 2,           # required; mismatch is typed
-         "context_format": 1,             # the format the context will use
+         "context_format": 4,             # the format the context will use
          "seat": "seat-…"}                # optional; a turn this server held
 
     ``seat`` is the token a client was handed when this server had no
@@ -1774,7 +1774,7 @@ async def send_context(state: Any, connection: Any, command: Command) -> dict[st
 
         {"session_id": "s-…",
          "archive": {"size": 4711, "sha256": "<64 hex digits>"},
-         "container_image": ":0.1.10.dev2-r1"}          # optional
+         "container_image": ":0.1.0-r2"}                # optional
 
     followed by the tar.zst as BINARY frames (see
     :func:`_archive_announcement`). The result frame is the
@@ -1820,14 +1820,17 @@ async def send_context(state: Any, connection: Any, command: Command) -> dict[st
     answer it gives at runtime.
 
     That is also where ``version.builder-unsatisfiable`` becomes real.
-    The line is answered out of this host's **local** image inventory and
-    nothing is pulled, so a context requiring a line this server does not
-    serve is refused at the moment the pins arrive rather than minutes
-    into a build. And it is refused before the context is frozen, which
-    is the useful moment: the client can go to a server that serves the
-    line, without having paid for a lock.
+    The image is looked for in the repositories this operator allows and
+    chosen by the labels found there, and the bytes are fetched by that
+    digest unless the operator turned fetching off (``--no-auto-pull``),
+    in which case an image that is not already here is refused under the
+    same code. So a context whose package set no allowed image declares
+    is refused at the moment the pins arrive rather than minutes into a
+    build — and before the context is frozen, which is the useful
+    moment: the client can go to a server that serves the set, without
+    having paid for a lock.
 
-    **The cross-checks, as context format 2 leaves them.** The
+    **The cross-checks, as context format 4 leaves them.** The
     container check is gone as a *comparison* and survives as a
     *construction*: this server picks the image itself, so there is
     nothing left to disagree with, and what used to be checked is now

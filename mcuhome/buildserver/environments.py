@@ -23,15 +23,17 @@ moves and a digest would have to be re-listed on every release. A pin
 whose repository is not listed is refused before any ``docker`` command
 mentions it.
 
-**It is checked twice, against two different claims.** The reference in
-the context is what the client *says*; the image found on this host is
-what the digest *is*. They can disagree — an image is matched by digest
-alone, so a context may name an allowed repository while its digest
-belongs to some other image entirely — and a check that only read the
-client's spelling would be a check on a string the client chose.
+**One check, because one value arrives from outside.** The image pin a
+client sends with ``send-context`` is the only reference this server
+does not produce itself, and that is where the check sits. What comes
+after it is a construction rather than a claim: the image is searched
+for *in the allowed repositories*, matched by the labels found there,
+and then fetched by the digest whose labels were just read — so a
+candidate is from a listed repository by the way it was found, and
+there is no second spelling left for an allowlist to disagree with.
 
 This is also what makes fetching safe to offer at all. Without the
-allowlist, a server that pulls what a context pins would fetch and run
+allowlist, a server that pulls what a build pins would fetch and run
 arbitrary images from arbitrary registries on an operator's machine;
 with it, the reachable set is the operator's own list either way, and
 pulling becomes a convenience question rather than a trust one.
@@ -78,10 +80,11 @@ def repository_of(reference: str) -> str:
 def check_allowed(reference: str, *, allowed: Iterable[str], what: str) -> None:
     """Refuse *reference* unless its repository is one of *allowed*.
 
-    *what* names which of the two claims is being checked, because the
-    two refusals mean different things to whoever reads them: the
-    context named a repository this server does not serve, or the digest
-    it pinned turned out to belong to an image from one.
+    *what* names the value the refusal is about, so a reader learns
+    where the refused reference came from rather than only that it was
+    refused. The one caller passes the image pin the build carried;
+    the parameter stays a parameter because a second source of a
+    reference would need its own wording and not this one reused.
 
     Comparison is on the whole ``registry/path`` and is exact. No
     prefixes and no wildcards: ``ghcr.io/*`` would read as "images from

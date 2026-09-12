@@ -284,6 +284,44 @@ async def test_a_server_that_bounds_no_memory_states_none(aiohttp_client, config
     assert "memory_bytes" not in docker.invocations[-1].request["limits"]
 
 
+def test_a_budget_that_cannot_be_read_is_refused_at_startup() -> None:
+    """Not on the first build of the day, and not as an internal error.
+
+    Both figures stay strings in the configuration — fractions for the
+    CPU figure, a unit for the memory one — and become numbers when a
+    step is started. Read only there, ``--container-cpus two`` passed
+    startup and then failed whichever client's build happened to be
+    first, as an internal error nobody could act on. So
+    :func:`~mcuhome.buildserver.config.load_config` reads both, with
+    the very parse the step uses for the memory figure.
+    """
+    from mcuhome.buildserver.config import load_config
+
+    token = ["--token", "x" * 32]
+    for broken in ("two", "banana", "nan", "inf", "-1"):
+        with pytest.raises(SystemExit):
+            load_config([*token, "--container-cpus", broken], env={})
+    for broken in ("two", "banana", "8gg", "0", "-1", "inf"):
+        with pytest.raises(SystemExit):
+            load_config([*token, "--container-memory", broken], env={})
+    # The environment form is the same option and is read the same way.
+    with pytest.raises(SystemExit):
+        load_config(token, env={"MCUHOME_BUILDSERVER_CONTAINER_CPUS": "two"})
+    with pytest.raises(SystemExit):
+        load_config(token, env={"MCUHOME_BUILDSERVER_CONTAINER_MEMORY": "banana"})
+
+    # And nothing readable was made refusable on the way: the two
+    # figures, the empty memory string that removes the limit, the two
+    # absences, and the zero CPU figure that has always meant "no CPU
+    # bound" where the step reads it.
+    config = load_config([*token, "--container-cpus", "2.5", "--container-memory", "6g"], env={})
+    assert (config.container_cpus, config.container_memory) == ("2.5", "6g")
+    assert load_config([*token, "--container-memory", ""], env={}).container_memory is None
+    bare = load_config(token, env={})
+    assert bare.container_cpus is None
+    assert load_config([*token, "--container-cpus", "0"], env={}).container_cpus == "0"
+
+
 # --------------------------------------------------------------------------
 # The request document (§6.1)
 # --------------------------------------------------------------------------

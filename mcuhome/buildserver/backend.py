@@ -1717,6 +1717,13 @@ def session_limits(config: Config) -> BuildLimits:
     either with the flags that already exist; ``--container-memory ""``
     is the operator saying the host is not to be bounded by memory, and
     it is honoured as stated rather than replaced by a measurement.
+
+    Both figures were already read once, at startup
+    (:func:`~mcuhome.buildserver.config.load_config`), so a running
+    server cannot reach the refusals below with a configuration that
+    came from a command line or an environment. They stay because a
+    ``Config`` can also be built in code, and a figure that cannot be
+    read must not turn into a container without a limit.
     """
     machine = buildenvsession.host_limits()
     cpus = machine.cpus

@@ -39,6 +39,7 @@ advertised its value to operators who had no way to move it.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import secrets
 import tempfile
@@ -47,6 +48,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from mcuhome.model.buildenvironment import ENVIRONMENT_IMAGE_REPOSITORY
+from mcuhome.model.errors import MCUHomeError
+from mcuhome.workbench.buildenvsession import memory_bytes
 
 from mcuhome.buildserver.environments import repository_of
 from mcuhome.buildserver.security import DEFAULT_PAIR_FILE, read_token_file
@@ -530,6 +533,55 @@ def _text_option(
     return (found or "").strip() or None
 
 
+def _check_container_budget(cpus: str | None, memory: str | None) -> None:
+    """Refuse a CPU or memory figure that cannot be read, at startup.
+
+    Both stay strings in the configuration — the CPU figure because
+    fractions are allowed, the memory figure because it carries a unit
+    — and both are turned into numbers only when a step is started
+    (:func:`~mcuhome.buildserver.backend.session_limits`). Read only
+    there, a typo passes startup and surfaces as an internal error on
+    the first build, to whichever client happened to send it. So the
+    same reading happens here, where it costs nothing and the operator
+    who wrote the value is still watching.
+
+    The memory figure is parsed by the very function the step uses, so
+    the two can never disagree about what ``8g`` means. Absence is not
+    an error for either: no CPU figure is this host's CPUs, and no
+    memory figure — ``--container-memory ""`` — is the operator saying
+    "not bounded by memory here". A stated ``0`` keeps its runtime
+    meaning for CPUs (no CPU bound); a negative budget is nonsense in
+    either unit and says so.
+    ``nan`` and ``inf`` are refused with the unreadable figures rather
+    than with the negative ones: they parse as floats and would reach a
+    container as a budget nobody can act on.
+    """
+    if cpus is not None:
+        try:
+            value = float(cpus)
+        except ValueError:
+            value = math.nan
+        if not math.isfinite(value):
+            raise SystemExit(
+                f"--container-cpus must be a number of cores, not {cpus!r}. Fractions are "
+                "allowed — 2, 1.5."
+            )
+        if value < 0:
+            raise SystemExit(f"--container-cpus must not be negative, and {cpus!r} is.")
+    try:
+        memory_bytes(memory, option="--container-memory")
+    except (MCUHomeError, ArithmeticError, ValueError) as unreadable:
+        # The parse itself refuses a figure it cannot read or one that
+        # is not positive; `inf` and a float too large to be an integer
+        # arrive as ArithmeticError and ValueError from the conversion
+        # behind it, and mean the same thing to an operator.
+        raise SystemExit(
+            f"--container-memory must be an amount of memory, not {memory!r}. It takes a byte "
+            "count or a number with a unit — 512m, 8g, 2048k — the way a container runtime "
+            "spells it; the empty string removes the limit."
+        ) from unreadable
+
+
 def _env_int(env: Mapping[str, str], name: str) -> int | None:
     raw = env.get(ENV_PREFIX + name)
     if raw is None or not raw.strip():
@@ -878,6 +930,7 @@ def load_config(
         args.container_memory, env, "CONTAINER_MEMORY", DEFAULT_CONTAINER_MEMORY
     )
     container_cpus = _text_option(args.container_cpus, env, "CONTAINER_CPUS", None)
+    _check_container_budget(container_cpus, container_memory)
 
     config = Config(
         host=args.host or env.get(ENV_PREFIX + "HOST") or DEFAULT_HOST,

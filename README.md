@@ -104,10 +104,15 @@ wrapper in `scripts/test.d/` or `scripts/lint.d/`. The wrappers select
 runs, one job per check.
 
 Needs Python ≥3.13; `requirements-dev.txt` installs it together with sibling
-checkouts of `mcuhome-sdk` (`packaging/model`) and `mcuhome-workbench`, the
-build environment this server orchestrates — see the file for the git-URL
-form when this is the only checkout. `scripts/test e2e` additionally needs a
-container runtime and the pinned build-environment image.
+checkouts of `mcuhome-sdk` (`packaging/model`) and `mcuhome-workbench`, whose
+container profile this server drives a build with — see the file for the
+git-URL form when this is the only checkout. `scripts/test e2e` additionally
+needs a container runtime, `mcuhome.model.context` importable from `.venv`,
+the `mcuhome` command in it (the harness drives the real client), and an SDK
+archive directory — its first argument or `MCUHOME_E2E_SDK_DIR`, built with
+`mcuhome-sdk/scripts/build_sdk_archive.py`. It pins no image: the
+environment is resolved from the allowed repositories and fetched if this
+host does not hold it.
 
 ```sh
 python3 -m venv .venv && .venv/bin/pip install \

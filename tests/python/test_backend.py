@@ -29,7 +29,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from mcuhome.workbench import buildenvsession, buildprocess, containerbuild
+from mcuhome.workbench import api, buildenvsession, buildprocess, containerbuild
 from ruamel.yaml import YAML
 
 from mcuhome.buildserver import sessions
@@ -84,7 +84,7 @@ async def open_session(ws) -> str:
 
 async def locked(ws, config, **files: bytes) -> tuple[str, str]:
     """A session with a frozen, buildable context. Returns ids."""
-    sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+    sha256 = write_sdk_package(config.build.sdk_sources[0], "2.4.0")
     session_id = await open_session(ws)
     sent = await send_archive(ws, "send-context", session_id, buildable_context(sha256, **files))
     assert sent["type"] == "result", sent
@@ -236,14 +236,14 @@ async def test_the_step_is_started_with_this_servers_hard_limits(client, config,
 
     started = docker.step
     assert started[started.index("--memory") + 1] == "8589934592"
-    assert started[started.index("--pids-limit") + 1] == str(config.container_pids) == "4096"
+    assert started[started.index("--pids-limit") + 1] == str(config.build.pids) == "4096"
     assert float(started[started.index("--cpus") + 1]) > 0
 
 
 async def test_an_operator_moves_both_halves_of_the_budget_at_once(
     aiohttp_client, config, docker
 ) -> None:
-    """``--container-cpus`` and ``--container-memory``, in both places.
+    """``--build-cpus`` and ``--build-memory``, in both places.
 
     The same two numbers are the recommendation in the request document
     and the hard limits on the container, and they have to be the same
@@ -253,7 +253,7 @@ async def test_an_operator_moves_both_halves_of_the_budget_at_once(
     """
     from mcuhome.buildserver.app import ServerState, create_app
 
-    state = ServerState(replace(config, container_cpus="2.5", container_memory="6g"))
+    state = ServerState(replace(config, build=replace(config.build, cpus=2.5, memory="6g")))
     client = await aiohttp_client(create_app(state))
     async with client.ws_connect("/ws", headers=auth()) as ws:
         await built(ws, state.config)
@@ -275,7 +275,7 @@ async def test_a_server_that_bounds_no_memory_states_none(aiohttp_client, config
     """
     from mcuhome.buildserver.app import ServerState, create_app
 
-    state = ServerState(replace(config, container_memory=""))
+    state = ServerState(replace(config, build=replace(config.build, memory="")))
     client = await aiohttp_client(create_app(state))
     async with client.ws_connect("/ws", headers=auth()) as ws:
         await built(ws, state.config)
@@ -289,7 +289,7 @@ def test_a_budget_that_cannot_be_read_is_refused_at_startup() -> None:
 
     Both figures stay strings in the configuration — fractions for the
     CPU figure, a unit for the memory one — and become numbers when a
-    step is started. Read only there, ``--container-cpus two`` passed
+    step is started. Read only there, ``--build-cpus two`` passed
     startup and then failed whichever client's build happened to be
     first, as an internal error nobody could act on. So
     :func:`~mcuhome.buildserver.config.load_config` reads both, with
@@ -297,29 +297,29 @@ def test_a_budget_that_cannot_be_read_is_refused_at_startup() -> None:
     """
     from mcuhome.buildserver.config import load_config
 
-    token = ["--token", "x" * 32]
+    token = ["--server-token", "x" * 32]
     for broken in ("two", "banana", "nan", "inf", "-1"):
-        with pytest.raises(SystemExit):
-            load_config([*token, "--container-cpus", broken], env={})
+        with pytest.raises(api.ConfigError):
+            load_config([*token, "--build-cpus", broken], env={})
     for broken in ("two", "banana", "8gg", "0", "-1", "inf"):
-        with pytest.raises(SystemExit):
-            load_config([*token, "--container-memory", broken], env={})
+        with pytest.raises(api.ConfigError):
+            load_config([*token, "--build-memory", broken], env={})
     # The environment form is the same option and is read the same way.
-    with pytest.raises(SystemExit):
-        load_config(token, env={"MCUHOME_BUILDSERVER_CONTAINER_CPUS": "two"})
-    with pytest.raises(SystemExit):
-        load_config(token, env={"MCUHOME_BUILDSERVER_CONTAINER_MEMORY": "banana"})
+    with pytest.raises(api.ConfigError):
+        load_config(token, env={"MCUHOME_BUILD_CPUS": "two"})
+    with pytest.raises(api.ConfigError):
+        load_config(token, env={"MCUHOME_BUILD_MEMORY": "banana"})
 
     # And nothing readable was made refusable on the way: the two
     # figures, the empty memory string that removes the limit, the two
     # absences, and the zero CPU figure that has always meant "no CPU
     # bound" where the step reads it.
-    config = load_config([*token, "--container-cpus", "2.5", "--container-memory", "6g"], env={})
-    assert (config.container_cpus, config.container_memory) == ("2.5", "6g")
-    assert load_config([*token, "--container-memory", ""], env={}).container_memory is None
+    config = load_config([*token, "--build-cpus", "2.5", "--build-memory", "6g"], env={})
+    assert (config.build.cpus, config.build.memory) == (2.5, "6g")
+    assert load_config([*token, "--build-memory", ""], env={}).build.memory is None
     bare = load_config(token, env={})
-    assert bare.container_cpus is None
-    assert load_config([*token, "--container-cpus", "0"], env={}).container_cpus == "0"
+    assert bare.build.cpus is None
+    assert load_config([*token, "--build-cpus", "0"], env={}).build.cpus == "0"
 
 
 # --------------------------------------------------------------------------
@@ -402,7 +402,7 @@ async def test_the_mode_a_client_asks_for_does_not_travel(client, config, docker
 
 @pytest.fixture
 def cached(config, tmp_path):
-    return replace(config, ccache_dir=tmp_path / "ccache")
+    return replace(config, build=replace(config.build, cache_shared=tmp_path / "ccache"))
 
 
 async def test_the_shared_cache_is_offered_read_only(aiohttp_client, cached, docker) -> None:
@@ -418,14 +418,14 @@ async def test_the_shared_cache_is_offered_read_only(aiohttp_client, cached, doc
     # The directory is the operator's to create: the tier is offered
     # read-only, so an empty one behaves exactly like no mount, and a
     # server that made it would be claiming a cache nobody warmed.
-    cached.ccache_dir.mkdir(parents=True, exist_ok=True)
+    cached.build.cache_shared.mkdir(parents=True, exist_ok=True)
     state = ServerState(cached)
     client = await aiohttp_client(create_app(state))
     async with client.ws_connect("/ws", headers=auth()) as ws:
         await built(ws, cached)
 
     mounted = _volumes(docker.step)
-    assert f"{cached.ccache_dir}:/mcuhome/cache/shared:ro" in mounted
+    assert f"{cached.build.cache_shared}:/mcuhome/cache/shared:ro" in mounted
 
 
 async def test_without_a_configured_cache_only_the_local_tier_exists(
@@ -941,11 +941,11 @@ async def test_nothing_filesystem_heavy_runs_on_the_event_loop(
 ) -> None:
     """The SDK and the artifact archive, both off the loop.
 
-    ``acquire_sdk`` hashes a package, streams a full zstd decompression
-    to disk and untars it; ``build_archive`` tars and compresses a
-    build's artifacts and then re-reads the spool. Either on the event
-    loop stalls every other session, every other connection and the
-    WebSocket heartbeat — which drops unrelated clients after thirty
+    ``fetch_sdk_package`` hashes a package, streams a full zstd
+    decompression to disk and untars it; ``build_archive`` tars and
+    compresses a build's artifacts and then re-reads the spool. Either on
+    the event loop stalls every other session, every other connection and
+    the WebSocket heartbeat — which drops unrelated clients after thirty
     seconds.
     """
     from mcuhome.buildserver import artifacts, backend
@@ -960,7 +960,7 @@ async def test_nothing_filesystem_heavy_runs_on_the_event_loop(
         return wrapper
 
     monkeypatch.setattr(
-        backend.packagefetch, "acquire_sdk", record("sdk", backend.packagefetch.acquire_sdk)
+        backend.workbench, "fetch_sdk_package", record("sdk", backend.workbench.fetch_sdk_package)
     )
     monkeypatch.setattr(artifacts, "build_archive", record("archive", artifacts.build_archive))
 
@@ -1669,7 +1669,7 @@ async def test_a_pin_no_source_holds_is_sdk_unavailable(client, config) -> None:
     point its fetcher wherever it liked.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
-        sha256 = write_sdk_package(config.sdk_sources[0], "9.9.9")
+        sha256 = write_sdk_package(config.build.sdk_sources[0], "9.9.9")
         session_id = await open_session(ws)
         await send_archive(ws, "send-context", session_id, buildable_context(sha256))
         await call(ws, "lock-context", {"session_id": session_id}, frame_id="l")
@@ -1682,7 +1682,7 @@ async def test_a_pin_no_source_holds_is_sdk_unavailable(client, config) -> None:
     # searched directories are this machine's layout and stay off the
     # wire.
     assert "sources" not in error["details"]
-    assert str(config.sdk_sources[0]) not in str(frame)
+    assert str(config.build.sdk_sources[0]) not in str(frame)
 
 
 async def test_a_package_with_the_right_name_and_wrong_bytes_is_refused(client, config) -> None:
@@ -1694,11 +1694,11 @@ async def test_a_package_with_the_right_name_and_wrong_bytes_is_refused(client, 
     can make.
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
-        sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+        sha256 = write_sdk_package(config.build.sdk_sources[0], "2.4.0")
         session_id = await open_session(ws)
         await send_archive(ws, "send-context", session_id, buildable_context(sha256))
         await call(ws, "lock-context", {"session_id": session_id}, frame_id="l")
-        (config.sdk_sources[0] / "mcuhome-sdk-2.4.0.tar.zst").write_bytes(b"not the package")
+        (config.build.sdk_sources[0] / "mcuhome-sdk-2.4.0.tar.zst").write_bytes(b"not the package")
         frame = await call(ws, "build", {"session_id": session_id}, frame_id="b")
 
     assert frame["error"]["code"] == "sdk.unavailable"
@@ -1782,7 +1782,7 @@ async def test_an_image_whose_generation_this_server_does_not_speak_is_refused(
     registry.labels_ = environment_labels(generation="4")
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
-        sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+        sha256 = write_sdk_package(config.build.sdk_sources[0], "2.4.0")
         frame = await send_archive(ws, "send-context", session_id, buildable_context(sha256))
 
     assert frame["error"]["code"] == "version.builder-unavailable"
@@ -1802,7 +1802,7 @@ async def test_an_environment_that_does_not_accept_this_context_is_refused(
     registry.labels_ = environment_labels(constraint="custom-tool:~=1.0")
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
-        sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+        sha256 = write_sdk_package(config.build.sdk_sources[0], "2.4.0")
         context = buildable_context(sha256, **{"build-context.json": BUILD_CONTEXT_BYTES})
         frame = await send_archive(ws, "send-context", session_id, context)
 
@@ -1937,7 +1937,7 @@ async def test_a_container_image_this_server_cannot_read_is_refused_at_the_frame
     """
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
-        sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+        sha256 = write_sdk_package(config.build.sdk_sources[0], "2.4.0")
         frame = await send_archive(
             ws,
             "send-context",
@@ -1961,7 +1961,7 @@ async def test_a_fetch_that_fails_is_retryable_and_says_so(client, config, docke
     docker.present = set()  # nothing on this host, and nothing pullable
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
-        sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+        sha256 = write_sdk_package(config.build.sdk_sources[0], "2.4.0")
         frame = await send_archive(ws, "send-context", session_id, buildable_context(sha256))
 
     error = frame["error"]
@@ -2009,8 +2009,8 @@ async def test_a_package_this_host_cannot_resolve_is_a_package_refusal(
     image declares this set" would go looking through repositories for a
     set that was never resolved in the first place.
     """
-    write_sdk_package(config.sdk_sources[0], "2.4.0")
-    index = config.sdk_sources[0] / "index.json"
+    write_sdk_package(config.build.sdk_sources[0], "2.4.0")
+    index = config.build.sdk_sources[0] / "index.json"
     index.write_text(json.dumps({"packages": {}}), encoding="utf-8")
 
     async with client.ws_connect("/ws", headers=auth()) as ws:
@@ -2030,8 +2030,8 @@ async def test_a_package_index_naming_other_bytes_is_refused_as_a_package(
     "this source does not have it": it is an answer an operator has to
     see, and it is about a package rather than about an image.
     """
-    write_sdk_package(config.sdk_sources[0], "2.4.0")
-    index = config.sdk_sources[0] / "index.json"
+    write_sdk_package(config.build.sdk_sources[0], "2.4.0")
+    index = config.build.sdk_sources[0] / "index.json"
     document = json.loads(index.read_text(encoding="utf-8"))
     document["packages"][TOOLS_PACKAGE][ENVIRONMENT_VERSION]["sha256"] = "1" * 64
     index.write_text(json.dumps(document), encoding="utf-8")
@@ -2061,7 +2061,7 @@ async def test_no_image_declares_the_set_names_every_candidate_and_its_reason(
 
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
-        sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+        sha256 = write_sdk_package(config.build.sdk_sources[0], "2.4.0")
         frame = await send_archive(ws, "send-context", session_id, buildable_context(sha256))
 
     error = frame["error"]
@@ -2089,7 +2089,7 @@ async def test_the_allowlist_is_walked_in_order_and_the_first_match_wins(
 
     mirror = "registry.example.test/mcuhome/build-environment"
     registry.repositories = {mirror: IMAGE_LABELS, IMAGE: IMAGE_LABELS}
-    state = ServerState(replace(config, allowed_environments=(mirror, IMAGE)))
+    state = ServerState(replace(config, allowed_container_repositories=(mirror, IMAGE)))
     client = await aiohttp_client(create_app(state))
     # The bytes the first repository answers with are on this host, so
     # nothing is fetched and the choice is the only thing under test.
@@ -2102,7 +2102,7 @@ async def test_the_allowlist_is_walked_in_order_and_the_first_match_wins(
 
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
-        sha256 = write_sdk_package(state.config.sdk_sources[0], "2.4.0")
+        sha256 = write_sdk_package(state.config.build.sdk_sources[0], "2.4.0")
         frame = await send_archive(ws, "send-context", session_id, buildable_context(sha256))
 
     assert frame["type"] == "result", frame
@@ -2123,7 +2123,7 @@ async def test_a_context_without_a_generator_declaration_is_refused(client, conf
     accept" declaration is checked against: read as empty, the check
     would silently pass for a context no environment ever agreed to.
     """
-    sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+    sha256 = write_sdk_package(config.build.sdk_sources[0], "2.4.0")
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         frame = await send_archive(
@@ -2147,7 +2147,7 @@ async def test_an_unreadable_generator_declaration_is_refused_too(client, config
     reader that recovered from it would be inventing the one value the
     check is made of.
     """
-    sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+    sha256 = write_sdk_package(config.build.sdk_sources[0], "2.4.0")
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         frame = await send_archive(

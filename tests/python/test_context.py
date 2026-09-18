@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 import zstandard
+from mcuhome.workbench import api
 
 from mcuhome.buildserver import contextstore, protocol, sessions
 from mcuhome.buildserver.app import ServerState, create_app
@@ -907,13 +908,14 @@ def test_the_configuration_accepts_the_four_names_and_the_x_prefix() -> None:
     from mcuhome.buildserver.config import load_config
 
     config = load_config(
-        ["--allow-patch-layer", "mcuboot", "--allow-patch-layer", "x-acme"], env={}
+        ["--server-allowed-patch-layers", "mcuboot", "--server-allowed-patch-layers", "x-acme"],
+        env={},
     )
     assert config.allowed_patch_layers == ("mcuboot", "x-acme")
-    with pytest.raises(SystemExit):
-        load_config(["--allow-patch-layer", "kernel"], env={})
-    with pytest.raises(SystemExit):
-        load_config(["--allow-patch-layer", "X-Acme"], env={})
+    with pytest.raises(api.ConfigError):
+        load_config(["--server-allowed-patch-layers", "kernel"], env={})
+    with pytest.raises(api.ConfigError):
+        load_config(["--server-allowed-patch-layers", "X-Acme"], env={})
 
 
 def test_the_caps_and_the_context_root_are_configuration() -> None:
@@ -926,20 +928,20 @@ def test_the_caps_and_the_context_root_are_configuration() -> None:
     """
     from mcuhome.buildserver.config import load_config
 
-    config = load_config(["--max-entries", "7", "--context-root", "/srv/ctx"], env={})
+    config = load_config(["--server-max-entries", "7", "--server-context-root", "/srv/ctx"], env={})
     assert config.max_entries == 7
     assert config.context_root == Path("/srv/ctx")
     assert config.max_context_yaml_bytes == 64 * 1024, "the sixth cap has a default like the rest"
-    config = load_config([], env={"MCUHOME_BUILDSERVER_SESSION_QUOTA_BYTES": "4096"})
+    config = load_config([], env={"MCUHOME_SERVER_SESSION_QUOTA_BYTES": "4096"})
     assert config.session_quota_bytes == 4096
-    config = load_config(["--max-context-yaml-bytes", "128"], env={})
+    config = load_config(["--server-max-context-yaml-bytes", "128"], env={})
     assert config.max_context_yaml_bytes == 128
-    config = load_config([], env={"MCUHOME_BUILDSERVER_MAX_CONTEXT_YAML_BYTES": "256"})
+    config = load_config([], env={"MCUHOME_SERVER_MAX_CONTEXT_YAML_BYTES": "256"})
     assert config.max_context_yaml_bytes == 256
-    with pytest.raises(SystemExit):
-        load_config(["--max-file-bytes", "0"], env={})
-    with pytest.raises(SystemExit):
-        load_config(["--max-context-yaml-bytes", "0"], env={})
+    with pytest.raises(api.ConfigError):
+        load_config(["--server-max-file-bytes", "0"], env={})
+    with pytest.raises(api.ConfigError):
+        load_config(["--server-max-context-yaml-bytes", "0"], env={})
 
 
 def test_the_context_root_falls_back_to_state_and_then_to_the_temporary_dir() -> None:
@@ -1960,7 +1962,7 @@ def test_a_relative_context_root_is_refused_at_startup(tmp_path: Path, monkeypat
     # the working directory, and the point of the refusal is that nobody
     # chose that directory.
     monkeypatch.chdir(tmp_path)
-    configured = load_config(["--context-root", "relative/sessions"], env={})
+    configured = load_config(["--server-context-root", "relative/sessions"], env={})
     assert not configured.context_root.is_absolute()
     with pytest.raises(UnsafeContextRoot) as refusal:
         prepare_context_root(configured.context_root)

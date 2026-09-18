@@ -128,7 +128,7 @@ async def test_no_marker_from_a_context_ever_reaches_a_command(hostile, config, 
     this server interpolates into anything it runs, and the way to keep
     that true is to look at every argv after a whole build.
     """
-    sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+    sha256 = write_sdk_package(config.build.sdk_sources[0], "2.4.0")
     async with hostile.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         sent = await send_archive(ws, "send-context", session_id, hostile_context(sha256))
@@ -160,15 +160,15 @@ async def test_every_command_is_the_program_the_operator_configured(
     A build names an environment, and that image is started — under the
     allowlist, which is the gate that makes it an operator's decision.
     What a build must never do is choose the **program**: that is
-    ``--docker``, and it is the operator's alone.
+    ``--build-container-program``, and it is the operator's alone.
     """
-    sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+    sha256 = write_sdk_package(config.build.sdk_sources[0], "2.4.0")
     async with hostile.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         await send_archive(ws, "send-context", session_id, hostile_context(sha256))
 
     assert docker.calls
-    assert {argv[0] for argv in docker.calls} == {config.docker}
+    assert {argv[0] for argv in docker.calls} == {config.build.container_program}
 
 
 async def test_nothing_from_a_context_is_ever_run_directly(hostile, config, docker) -> None:
@@ -180,7 +180,7 @@ async def test_nothing_from_a_context_is_ever_run_directly(hostile, config, dock
     own verbs. A context that could reach past that would be a context
     choosing what runs on the host.
     """
-    sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+    sha256 = write_sdk_package(config.build.sdk_sources[0], "2.4.0")
     async with hostile.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         await send_archive(ws, "send-context", session_id, hostile_context(sha256))
@@ -203,7 +203,7 @@ async def test_the_image_a_build_names_still_has_to_pass_the_allowlist(
     refusal is exactly as early either way: before any registry or
     runtime is asked anything.
     """
-    sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+    sha256 = write_sdk_package(config.build.sdk_sources[0], "2.4.0")
     context = make_archive(
         {
             "build-context.json": BUILD_CONTEXT_BYTES,
@@ -231,7 +231,7 @@ async def test_a_pinned_environment_is_the_only_executable_input(hostile, config
     with one of its verbs, naming either nothing or the allowlisted image
     the build resolved to.
     """
-    sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+    sha256 = write_sdk_package(config.build.sdk_sources[0], "2.4.0")
     async with hostile.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         await send_archive(ws, "send-context", session_id, hostile_context(sha256))

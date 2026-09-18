@@ -17,6 +17,7 @@ from pathlib import Path
 
 import aiohttp
 import pytest
+from mcuhome.workbench import api
 
 from mcuhome.buildserver.config import load_config, resolve_token
 from mcuhome.buildserver.security import (
@@ -68,21 +69,21 @@ class TestTokenResolution:
     def test_the_command_line_wins(self, tmp_path: Path) -> None:
         path = tmp_path / "token"
         path.write_text("from-file\n", encoding="utf-8")
-        token, generated = resolve_token("from-cli", path, {"MCUHOME_BUILDSERVER_TOKEN": "env"})
+        token, generated = resolve_token("from-cli", path)
         assert (token, generated) == ("from-cli", False)
 
     def test_then_the_environment_then_the_file(self, tmp_path: Path) -> None:
         path = tmp_path / "token"
         path.write_text("from-file\n", encoding="utf-8")
-        assert resolve_token(None, path, {"MCUHOME_BUILDSERVER_TOKEN": "env"})[0] == "env"
-        assert resolve_token(None, path, {})[0] == "from-file"
+        assert resolve_token("env", path)[0] == "env"
+        assert resolve_token(None, path)[0] == "from-file"
 
     def test_none_configured_generates_one(self) -> None:
-        token, generated = resolve_token(None, None, {})
+        token, generated = resolve_token(None, None)
         assert generated is True
         assert len(token) >= 32
         # There is no configuration in which the server runs without one.
-        assert resolve_token(None, None, {})[0] != token
+        assert resolve_token(None, None)[0] != token
 
     def test_a_missing_token_file_is_not_a_crash(self, tmp_path: Path) -> None:
         assert read_token_file(tmp_path / "nope") is None
@@ -113,13 +114,12 @@ class TestConfig:
 
     def test_the_environment_configures_everything(self) -> None:
         config = load_config(
-            [],
+            ["--server-token", "shhh"],
             env={
-                "MCUHOME_BUILDSERVER_HOST": "127.0.0.1",
-                "MCUHOME_BUILDSERVER_PORT": "9000",
-                "MCUHOME_BUILDSERVER_TOKEN": "shhh",
-                "MCUHOME_BUILDSERVER_ALLOWED_ORIGINS": "https://ha.local, https://nas.local",
-                "MCUHOME_BUILDSERVER_LOG_LEVEL": "DEBUG",
+                "MCUHOME_SERVER_HOST": "127.0.0.1",
+                "MCUHOME_SERVER_PORT": "9000",
+                "MCUHOME_SERVER_ALLOWED_ORIGINS": "https://ha.local, https://nas.local",
+                "MCUHOME_SERVER_LOG_LEVEL": "DEBUG",
             },
         )
         assert (config.host, config.port, config.token) == ("127.0.0.1", 9000, "shhh")
@@ -129,33 +129,34 @@ class TestConfig:
 
     def test_the_command_line_beats_the_environment(self) -> None:
         config = load_config(
-            ["--port", "1234", "--log-level", "DEBUG"],
+            ["--server-port", "1234", "--server-log-level", "DEBUG", "--server-token", "t"],
             env={
-                "MCUHOME_BUILDSERVER_PORT": "9000",
-                "MCUHOME_BUILDSERVER_TOKEN": "t",
-                "MCUHOME_BUILDSERVER_LOG_LEVEL": "ERROR",
+                "MCUHOME_SERVER_PORT": "9000",
+                "MCUHOME_SERVER_LOG_LEVEL": "ERROR",
             },
         )
         assert (config.port, config.log_level) == (1234, "DEBUG")
 
     def test_no_pair_file_means_no_pair_file(self) -> None:
-        assert load_config(["--no-pair-file"], env={}).pair_file is None
+        assert load_config(["--no-server-publish-pair-file"], env={}).pair_file is None
         assert load_config([], env={}).pair_file is not None
 
     def test_the_connection_caps_come_from_cli_and_environment(self) -> None:
-        config = load_config(["--max-connections", "3", "--max-inflight-commands", "7"], env={})
+        config = load_config(
+            ["--server-max-connections", "3", "--server-max-inflight-commands", "7"], env={}
+        )
         assert (config.max_connections, config.max_inflight_commands) == (3, 7)
         config = load_config(
             [],
             env={
-                "MCUHOME_BUILDSERVER_MAX_CONNECTIONS": "9",
-                "MCUHOME_BUILDSERVER_MAX_INFLIGHT_COMMANDS": "11",
+                "MCUHOME_SERVER_MAX_CONNECTIONS": "9",
+                "MCUHOME_SERVER_MAX_INFLIGHT_COMMANDS": "11",
             },
         )
         assert (config.max_connections, config.max_inflight_commands) == (9, 11)
         # Non-positive is refused, like every other limit here.
-        with pytest.raises(SystemExit):
-            load_config(["--max-connections", "0"], env={})
+        with pytest.raises(api.ConfigError):
+            load_config(["--server-max-connections", "0"], env={})
 
 
 # --------------------------------------------------------------------------

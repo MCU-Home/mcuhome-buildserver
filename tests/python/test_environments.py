@@ -25,6 +25,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
+from mcuhome.workbench import api
 
 from mcuhome.buildserver import environments, sessions
 from mcuhome.buildserver.app import ServerState, create_app
@@ -127,34 +128,49 @@ def test_a_reference_that_does_not_parse_is_refused_as_itself() -> None:
 
 def test_the_default_list_is_mcuhomes_own_build_environment() -> None:
     """A server nobody configured serves the images it exists to run, and no others."""
-    assert load_config(["--token", "x" * 32], env={}).allowed_environments == (IMAGE,)
+    assert load_config(["--server-token", "x" * 32], env={}).allowed_container_repositories == (
+        IMAGE,
+    )
 
 
 def test_stating_the_option_replaces_the_default_rather_than_adding_to_it() -> None:
     """An operator who lists their own images must be able to stop serving ours."""
-    config = load_config(["--token", "x" * 32, "--allow-environment", ELSEWHERE], env={})
-    assert config.allowed_environments == (ELSEWHERE,)
+    config = load_config(
+        ["--server-token", "x" * 32, "--server-allowed-container-repositories", ELSEWHERE], env={}
+    )
+    assert config.allowed_container_repositories == (ELSEWHERE,)
 
 
 def test_the_option_refuses_a_tag_or_a_digest() -> None:
     for entry in (f"{IMAGE}:zephyr-4.4.0-r10", f"{IMAGE}@{IMAGE_DIGEST}"):
-        with pytest.raises(SystemExit):
-            load_config(["--token", "x" * 32, "--allow-environment", entry], env={})
+        with pytest.raises(api.ConfigError):
+            load_config(
+                ["--server-token", "x" * 32, "--server-allowed-container-repositories", entry],
+                env={},
+            )
 
 
 def test_the_option_wants_the_registry_named() -> None:
     """Silently normalizing would make the list read back differently than it compares."""
-    with pytest.raises(SystemExit):
-        load_config(["--token", "x" * 32, "--allow-environment", "other/environment"], env={})
+    with pytest.raises(api.ConfigError):
+        load_config(
+            [
+                "--server-token",
+                "x" * 32,
+                "--server-allowed-container-repositories",
+                "other/environment",
+            ],
+            env={},
+        )
 
 
 def test_auto_pull_is_on_by_default_and_switchable_both_ways() -> None:
-    assert load_config(["--token", "x" * 32], env={}).auto_pull is True
-    assert load_config(["--token", "x" * 32, "--no-auto-pull"], env={}).auto_pull is False
+    assert load_config(["--server-token", "x" * 32], env={}).auto_pull is True
     assert (
-        load_config(["--token", "x" * 32], env={"MCUHOME_BUILDSERVER_AUTO_PULL": "no"}).auto_pull
+        load_config(["--server-token", "x" * 32, "--no-server-auto-pull"], env={}).auto_pull
         is False
     )
+    assert load_config(["--server-token", "x" * 32, "--server-auto-pull"], env={}).auto_pull is True
 
 
 # --------------------------------------------------------------------------
@@ -173,7 +189,7 @@ async def test_a_send_context_naming_an_unlisted_repository_is_refused(
     inside the context, which would change nothing about what is being
     built and everything about which bytes it is built in.
     """
-    sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+    sha256 = write_sdk_package(config.build.sdk_sources[0], "2.4.0")
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         frame = await send_archive(
@@ -196,7 +212,7 @@ async def test_the_refusal_happens_before_docker_is_asked_anything(client, confi
     running it*. Nothing may reach the runtime first, which is why the
     assertion is on the whole call list and not on a subset of it.
     """
-    sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+    sha256 = write_sdk_package(config.build.sdk_sources[0], "2.4.0")
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         frame = await send_archive(
@@ -222,9 +238,9 @@ async def test_an_operator_who_lists_another_repository_can_serve_it(
     """
     registry.repositories = {ELSEWHERE: IMAGE_LABELS}
     docker.images[f"{ELSEWHERE}@{IMAGE_DIGEST}"] = {"Id": "sha256:" + "c" * 64}
-    state = ServerState(replace(config, allowed_environments=(ELSEWHERE,)))
+    state = ServerState(replace(config, allowed_container_repositories=(ELSEWHERE,)))
     client = await aiohttp_client(create_app(state))
-    sha256 = write_sdk_package(config.sdk_sources[0], "2.4.0")
+    sha256 = write_sdk_package(config.build.sdk_sources[0], "2.4.0")
     async with client.ws_connect("/ws", headers=auth()) as ws:
         session_id = await open_session(ws)
         frame = await send_archive(ws, "send-context", session_id, mcuhome_context(sha256))

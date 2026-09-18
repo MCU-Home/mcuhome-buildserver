@@ -249,14 +249,16 @@ async def test_the_patch_policy_comes_from_the_configuration(aiohttp_client, con
 
 
 def test_the_allow_patch_layer_option_and_its_environment_form() -> None:
+    from mcuhome.workbench import api
+
     from mcuhome.buildserver.config import load_config
 
-    config = load_config(["--allow-patch-layer", "sdk"], env={})
+    config = load_config(["--server-allowed-patch-layers", "sdk"], env={})
     assert config.allowed_patch_layers == ("sdk",)
-    config = load_config([], env={"MCUHOME_BUILDSERVER_ALLOW_PATCH_LAYERS": "sdk,zephyr"})
+    config = load_config([], env={"MCUHOME_SERVER_ALLOWED_PATCH_LAYERS": "sdk,zephyr"})
     assert config.allowed_patch_layers == ("sdk", "zephyr")
-    with pytest.raises(SystemExit):
-        load_config([], env={"MCUHOME_BUILDSERVER_ALLOW_PATCH_LAYERS": "kernel"})
+    with pytest.raises(api.ConfigError):
+        load_config([], env={"MCUHOME_SERVER_ALLOWED_PATCH_LAYERS": "kernel"})
 
 
 # --------------------------------------------------------------------------

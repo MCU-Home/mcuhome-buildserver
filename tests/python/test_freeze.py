@@ -29,6 +29,7 @@ from ruamel.yaml import YAML
 
 from mcuhome.buildserver import app as app_module
 from mcuhome.buildserver import config as config_module
+from mcuhome.buildserver import options as options_module
 from mcuhome.buildserver import sessions
 from mcuhome.buildserver.errors import SessionError
 from tests.python.conftest import (
@@ -1011,7 +1012,7 @@ def test_the_lease_can_hold_a_build_that_uses_its_whole_deadline(tmp_path) -> No
     after 60 — the deadline could never fire, and the work was thrown
     away by the lease instead.
     """
-    deadline = config_module.DEFAULT_BUILD_DEADLINE_SECONDS
+    deadline = options_module.DEFAULT_BUILD_DEADLINE_SECONDS
     assert sessions.ttl_for(deadline) > deadline
 
     # An operator who raises the deadline gets a lease that still holds
@@ -1030,12 +1031,15 @@ def test_the_idle_half_is_the_operators_and_reaches_the_manager(tmp_path) -> Non
     minutes of silence.
     """
     parsed = config_module.load_config(
-        ["--session-idle-timeout-seconds", "15", "--context-root", str(tmp_path)], env={}
+        ["--server-session-idle-timeout-seconds", "15", "--server-context-root", str(tmp_path)],
+        env={},
     )
     assert parsed.session_idle_timeout_seconds == 15
 
-    variable = config_module.ENV_PREFIX + "SESSION_IDLE_TIMEOUT_SECONDS"
-    from_env = config_module.load_config(["--context-root", str(tmp_path)], env={variable: "20"})
+    variable = "MCUHOME_SERVER_SESSION_IDLE_TIMEOUT_SECONDS"
+    from_env = config_module.load_config(
+        ["--server-context-root", str(tmp_path)], env={variable: "20"}
+    )
     assert from_env.session_idle_timeout_seconds == 20
 
     state = app_module.ServerState(config=parsed)
@@ -1054,23 +1058,25 @@ def test_admission_is_the_operators_and_reaches_the_manager(tmp_path) -> None:
     """
     parsed = config_module.load_config(
         [
-            "--max-sessions",
+            "--server-max-sessions",
             "1",
-            "--seat-retry-seconds",
+            "--server-seat-retry-seconds",
             "30",
-            "--seat-retry-max-seconds",
+            "--server-seat-retry-max-seconds",
             "300",
-            "--max-seats",
+            "--server-max-seats",
             "8",
-            "--context-root",
+            "--server-context-root",
             str(tmp_path),
         ],
         env={},
     )
     assert (parsed.max_sessions, parsed.max_seats) == (1, 8)
 
-    variable = config_module.ENV_PREFIX + "MAX_SESSIONS"
-    from_env = config_module.load_config(["--context-root", str(tmp_path)], env={variable: "2"})
+    variable = "MCUHOME_SERVER_MAX_SESSIONS"
+    from_env = config_module.load_config(
+        ["--server-context-root", str(tmp_path)], env={variable: "2"}
+    )
     assert from_env.max_sessions == 2
 
     state = app_module.ServerState(config=parsed)

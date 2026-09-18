@@ -72,10 +72,11 @@ class TestTokenResolution:
         token, generated = resolve_token("from-cli", path)
         assert (token, generated) == ("from-cli", False)
 
-    def test_then_the_environment_then_the_file(self, tmp_path: Path) -> None:
+    def test_then_the_file_the_configuration_names(self, tmp_path: Path) -> None:
+        """Two channels and no third: the flag, then server.token_file."""
         path = tmp_path / "token"
         path.write_text("from-file\n", encoding="utf-8")
-        assert resolve_token("env", path)[0] == "env"
+        assert resolve_token("stated", path)[0] == "stated"
         assert resolve_token(None, path)[0] == "from-file"
 
     def test_none_configured_generates_one(self) -> None:

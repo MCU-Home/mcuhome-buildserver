@@ -327,7 +327,7 @@ SEAT_ID_BYTES = 12
 #: ``attach-session`` worth having, and it stays true: a session is taken
 #: away only when a *third party* wants the slot, and only after this
 #: much quiet. What it stops being is unconditional. With
-#: ``--max-sessions 1`` a client
+#: ``server.max_sessions`` of 1 a client
 #: that died without closing its session used to hold the whole server
 #: for the full idle timeout, measured at ten minutes of a build server
 #: doing nothing while a client polled its seat.
@@ -1822,7 +1822,7 @@ async def send_context(state: Any, connection: Any, command: Command) -> dict[st
     That is also where ``version.builder-unsatisfiable`` becomes real.
     The image is looked for in the repositories this operator allows and
     chosen by the labels found there, and the bytes are fetched by that
-    digest unless the operator turned fetching off (``--no-auto-pull``),
+    digest unless the operator turned fetching off (``server.auto_pull``),
     in which case an image that is not already here is refused under the
     same code. So a context whose package set no allowed image declares
     is refused at the moment the pins arrive rather than minutes into a

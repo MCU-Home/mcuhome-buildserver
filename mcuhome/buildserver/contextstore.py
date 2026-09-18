@@ -170,7 +170,7 @@ def prepare_context_root(root: Path) -> Path:
     """
     if not root.is_absolute():
         raise UnsafeContextRoot(
-            f"{root} is a relative path and --context-root has to be absolute. Every path "
+            f"{root} is a relative path and server.context_root has to be absolute. Every path "
             "in a build environment's request document descends from it, and every one "
             "of them must be absolute; the same value is also a bind-mount "
             "source, where a name without a leading slash is a named volume rather than a "
@@ -204,14 +204,14 @@ def _check_trusted(path: Path) -> None:
             f"{path} is owned by uid {stat_result.st_uid} and this server runs as "
             f"{ours}. Per-session directories under it hold a device's commissioning "
             "credentials, and whoever owns their parent can replace them; point "
-            "--context-root somewhere this server owns."
+            "server.context_root somewhere this server owns."
         )
     if stat_result.st_mode & 0o002 and not stat_result.st_mode & 0o1000:
         raise UnsafeContextRoot(
             f"{path} is world-writable (mode {stat_result.st_mode & 0o7777:04o}) and carries "
             "no sticky bit, so anyone on this host can replace the per-session directories "
             "underneath it — and those hold a device's commissioning credentials. Tighten "
-            "it, or point --context-root elsewhere."
+            "it, or point server.context_root elsewhere."
         )
 
 
@@ -503,7 +503,7 @@ def parse_context_yaml(path: Path, *, expected_version: int, max_bytes: int) -> 
 
     Hardened three ways beyond "load some YAML", all decided together
     with the ingress caps. The document is bounded (*max_bytes*, the
-    operator's ``--max-context-yaml-bytes``) before it is parsed at all.
+    operator's ``server.max_context_yaml_bytes``) before it is parsed at all.
     It is **safe-loaded**, so no tag can construct a Python object. And
     it may carry neither duplicate keys nor anchors: a duplicate key
     makes the document mean two things at once, and an anchor lets a

@@ -558,11 +558,23 @@ def _check_budget(build: api.BuildOptions) -> None:
 
     ``nan`` and ``inf`` are the two figures the declaration's own
     "greater than zero" does not catch: they parse as floats and would
-    reach a container as a budget nobody can act on.
+    reach a container as a budget nobody can act on. A memory figure so
+    large that it has no whole number arrives as an arithmetic error
+    from the conversion behind the parse, and means the same thing to an
+    operator as a figure that could not be read at all.
     """
     if build.cpus is not None and not math.isfinite(build.cpus):
         raise api.ConfigError(
             f"build.cpus must be a number of cores, not {build.cpus!r}.",
             hint="fractions are allowed — 2, 1.5",
         )
-    build.limits()
+    try:
+        build.limits()
+    except (ArithmeticError, ValueError) as unreadable:
+        raise api.ConfigError(
+            f"build.memory must be an amount of memory, not {build.memory!r}.",
+            hint=(
+                "it takes a byte count or a number with a unit — 512m, 8g, 2048k — "
+                "the way a container runtime spells it"
+            ),
+        ) from unreadable

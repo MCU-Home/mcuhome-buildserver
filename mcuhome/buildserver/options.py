@@ -692,8 +692,19 @@ def _parse(option: api.Option, raw: object, *, env: Mapping[str, str]) -> object
     if option.name == "build.memory":
         # The one string option whose shape can be checked before the
         # run: a memory limit that was misread would either strangle
-        # every build or bound nothing at all.
-        api.parse_memory(text, key=option.flag)
+        # every build or bound nothing at all. A figure with no whole
+        # number behind it (`inf`) arrives as an arithmetic error from
+        # the conversion and means the same thing to an operator.
+        try:
+            api.parse_memory(text, key=option.flag)
+        except (ArithmeticError, ValueError) as unreadable:
+            raise api.ConfigError(
+                f"{option.flag} takes an amount of memory, not {text!r}.",
+                hint=(
+                    "a byte count or a number with a unit — 512m, 8g, 2048k — the way "
+                    "a container runtime spells it"
+                ),
+            ) from unreadable
     return text
 
 

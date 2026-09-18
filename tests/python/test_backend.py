@@ -310,16 +310,20 @@ def test_a_budget_that_cannot_be_read_is_refused_at_startup() -> None:
     with pytest.raises(api.ConfigError):
         load_config(token, env={"MCUHOME_BUILD_MEMORY": "banana"})
 
+    # A CPU figure of zero is refused with them now: `build.cpus` is
+    # declared as a number greater than zero, and a budget of no cores is
+    # a statement nothing can act on. Stating nothing is how a host says
+    # "all of them".
+    with pytest.raises(api.ConfigError):
+        load_config([*token, "--build-cpus", "0"], env={})
+
     # And nothing readable was made refusable on the way: the two
-    # figures, the empty memory string that removes the limit, the two
-    # absences, and the zero CPU figure that has always meant "no CPU
-    # bound" where the step reads it.
+    # figures, the empty memory string, and the two absences.
     config = load_config([*token, "--build-cpus", "2.5", "--build-memory", "6g"], env={})
     assert (config.build.cpus, config.build.memory) == (2.5, "6g")
     assert load_config([*token, "--build-memory", ""], env={}).build.memory is None
     bare = load_config(token, env={})
     assert bare.build.cpus is None
-    assert load_config([*token, "--build-cpus", "0"], env={}).build.cpus == "0"
 
 
 # --------------------------------------------------------------------------

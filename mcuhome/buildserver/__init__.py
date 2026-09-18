@@ -20,7 +20,8 @@ answers ``session.not-implemented``.
 Module map:
 
 ==========================================  ===================================
-:mod:`mcuhome.buildserver.config`           runtime configuration (CLI + env)
+:mod:`mcuhome.buildserver.options`          the options this server declares
+:mod:`mcuhome.buildserver.config`           the configuration ladder, resolved
 :mod:`mcuhome.buildserver.server`           process entry point
 :mod:`mcuhome.buildserver.app`              application factory, shared state,
                                             the backend, ``/health``

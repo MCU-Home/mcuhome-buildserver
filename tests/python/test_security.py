@@ -106,17 +106,35 @@ class TestPairing:
         assert not target.parent.exists()
 
 
+@pytest.fixture
+def host(tmp_path: Path) -> dict[str, str]:
+    """An environment with a system and a user layer of its own.
+
+    Every case below states one, so that none of them reads the
+    configuration of the machine it happens to run on — a host with a
+    ``/etc/mcuhome/configuration.yaml`` would otherwise decide what this
+    suite sees.
+    """
+    (tmp_path / "etc" / "mcuhome").mkdir(parents=True)
+    (tmp_path / "home" / "mcuhome").mkdir(parents=True)
+    return {
+        "XDG_CONFIG_DIRS": str(tmp_path / "etc"),
+        "XDG_CONFIG_HOME": str(tmp_path / "home"),
+    }
+
+
 class TestConfig:
-    def test_defaults_bind_a_network_interface_with_a_token(self) -> None:
-        config = load_config([], env={})
+    def test_defaults_bind_a_network_interface_with_a_token(self, host) -> None:
+        config = load_config([], env=host)
         assert config.host == "0.0.0.0"  # noqa: S104 - the point of the assertion
         assert config.token
         assert config.token_generated is True
 
-    def test_the_environment_configures_everything(self) -> None:
+    def test_the_environment_configures_everything(self, host) -> None:
         config = load_config(
             ["--server-token", "shhh"],
             env={
+                **host,
                 "MCUHOME_SERVER_HOST": "127.0.0.1",
                 "MCUHOME_SERVER_PORT": "9000",
                 "MCUHOME_SERVER_ALLOWED_ORIGINS": "https://ha.local, https://nas.local",
@@ -128,28 +146,30 @@ class TestConfig:
         assert config.log_level == "DEBUG"
         assert config.token_generated is False
 
-    def test_the_command_line_beats_the_environment(self) -> None:
+    def test_the_command_line_beats_the_environment(self, host) -> None:
         config = load_config(
             ["--server-port", "1234", "--server-log-level", "DEBUG", "--server-token", "t"],
             env={
+                **host,
                 "MCUHOME_SERVER_PORT": "9000",
                 "MCUHOME_SERVER_LOG_LEVEL": "ERROR",
             },
         )
         assert (config.port, config.log_level) == (1234, "DEBUG")
 
-    def test_no_pair_file_means_no_pair_file(self) -> None:
-        assert load_config(["--no-server-publish-pair-file"], env={}).pair_file is None
-        assert load_config([], env={}).pair_file is not None
+    def test_no_pair_file_means_no_pair_file(self, host) -> None:
+        assert load_config(["--no-server-publish-pair-file"], env=host).pair_file is None
+        assert load_config([], env=host).pair_file is not None
 
-    def test_the_connection_caps_come_from_cli_and_environment(self) -> None:
+    def test_the_connection_caps_come_from_cli_and_environment(self, host) -> None:
         config = load_config(
-            ["--server-max-connections", "3", "--server-max-inflight-commands", "7"], env={}
+            ["--server-max-connections", "3", "--server-max-inflight-commands", "7"], env=host
         )
         assert (config.max_connections, config.max_inflight_commands) == (3, 7)
         config = load_config(
             [],
             env={
+                **host,
                 "MCUHOME_SERVER_MAX_CONNECTIONS": "9",
                 "MCUHOME_SERVER_MAX_INFLIGHT_COMMANDS": "11",
             },
@@ -157,7 +177,7 @@ class TestConfig:
         assert (config.max_connections, config.max_inflight_commands) == (9, 11)
         # Non-positive is refused, like every other limit here.
         with pytest.raises(api.ConfigError):
-            load_config(["--server-max-connections", "0"], env={})
+            load_config(["--server-max-connections", "0"], env=host)
 
 
 # --------------------------------------------------------------------------

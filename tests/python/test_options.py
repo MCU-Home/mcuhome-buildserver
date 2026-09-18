@@ -20,7 +20,7 @@ from mcuhome.workbench import api
 
 from mcuhome.buildserver import options, server
 from mcuhome.buildserver.backend import SessionBackend
-from mcuhome.buildserver.config import Config, load_config
+from mcuhome.buildserver.config import FROM_STDIN, Config, load_config
 
 README = Path(__file__).resolve().parents[2] / "README.md"
 
@@ -232,6 +232,38 @@ def test_every_retired_variable_is_refused_by_name(variable: str, host) -> None:
     assert refusal.value.hint
 
 
+@pytest.mark.parametrize("variable", sorted(options.CLOSED_VARIABLES))
+def test_every_variable_this_server_does_not_read_is_refused(variable: str, host) -> None:
+    """Nothing an operator exports goes quiet.
+
+    A ``MCUHOME_*`` name this server ignores is a policy that did not
+    take effect, and nobody finds that out until a build does something
+    nobody asked for.
+    """
+    with pytest.raises(api.ConfigError) as refusal:
+        load_config([], env={**host, variable: "1"})
+    assert variable in refusal.value.message
+    assert refusal.value.hint
+
+
+def test_every_closed_channel_has_a_refusal_behind_it() -> None:
+    """An option whose variable nobody reads names the channels that work."""
+    for option in options.SERVER_OPTIONS:
+        if option.environment:
+            continue
+        derived = "MCUHOME_" + option.name.upper().replace(".", "_")
+        assert derived in options.CLOSED_VARIABLES, f"{option.name}: {derived} goes quiet"
+        assert option.flag in options.CLOSED_VARIABLES[derived]
+
+
+def test_the_token_variable_is_refused_though_it_never_existed(host) -> None:
+    """The one refusal that is not about a spelling this server retired."""
+    with pytest.raises(api.ConfigError) as refusal:
+        load_config([], env={**host, "MCUHOME_SERVER_TOKEN": TOKEN})
+    assert "--server-token -" in refusal.value.hint
+    assert "server.token_file" in refusal.value.hint
+
+
 def test_a_retired_spelling_names_a_successor_that_exists() -> None:
     """A refusal that named a flag nobody has would teach the wrong thing."""
     spellings = {option.flag for option in options.DECLARED_OPTIONS if option.flag}
@@ -433,6 +465,12 @@ def test_an_allowlist_with_nothing_in_it_is_refused(tmp_path: Path, host) -> Non
 # --------------------------------------------------------------------------
 
 
+def test_printing_the_configuration_asks_for_no_token(host) -> None:
+    """Otherwise `--print-config --server-token -` sits on standard input."""
+    config = load_config(["--print-config", "--server-token", FROM_STDIN], env=host, stdin=None)
+    assert (config.token, config.token_generated) == ("", False)
+
+
 def test_print_config_answers_every_option_and_binds_nothing(capsys, host, monkeypatch) -> None:
     monkeypatch.setattr("os.environ", host)
     assert server.main(["--print-config"]) == 0
@@ -485,9 +523,13 @@ def test_the_readme_documents_every_option() -> None:
             assert stated in row, f"{option.name}: the README states another default"
 
 
-def test_the_readme_lists_every_retired_spelling() -> None:
+def test_the_readme_lists_every_refused_spelling() -> None:
     text = README.read_text(encoding="utf-8")
-    for spelling in (*options.RETIRED_FLAGS, *options.RETIRED_VARIABLES):
+    for spelling in (
+        *options.RETIRED_FLAGS,
+        *options.RETIRED_VARIABLES,
+        *options.CLOSED_VARIABLES,
+    ):
         assert f"| `{spelling}` |" in text, f"{spelling} is in no README table"
 
 

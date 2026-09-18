@@ -368,7 +368,7 @@ def load_config(
     tokens = list(sys.argv[1:] if argv is None else argv)
     # Before the parse, so a retired spelling is answered with the name
     # it has today rather than with `unrecognized arguments`.
-    declared.refuse_retired_spellings(tokens, env)
+    declared.refuse_unread_spellings(tokens, env)
     args = build_parser().parse_args(tokens)
 
     project = _project_light(args.server_config)
@@ -423,6 +423,12 @@ def load_config(
         settings=settings,
         print_config=bool(args.print_config),
     )
+    if args.print_config:
+        # A run that only prints the configuration binds nothing, so it
+        # needs no token — and asking for one first would leave
+        # `--print-config --server-token -` sitting on standard input
+        # waiting for a secret nobody meant to give it.
+        return config
     token, generated = resolve_token(args.server_token, value("token_file"), stdin=stdin)
     return replace(config, token=token, token_generated=generated)
 

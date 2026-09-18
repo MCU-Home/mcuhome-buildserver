@@ -216,7 +216,12 @@ a boolean in an environment variable, and a channel that cannot be read is
 worse than one that was never offered. Both are set in a configuration file or
 with their own flags, and a boolean always has both — `--server-auto-pull` and
 `--no-server-auto-pull` — because "not used" and "turned off" are different
-statements.
+statements. Exporting the name a boolean key would derive is refused rather
+than ignored (*Variables this server does not read*, below).
+
+A list option is one key and nearest-wins: the layer that states
+`server.allowed_container_repositories` replaces the list below it rather than
+adding to it, and repeating the flag within one invocation is what appends.
 
 ### What it shares with a build on a workstation
 
@@ -363,6 +368,19 @@ differs from a command line a person types: it is started once, deliberately,
 from a unit file or a container definition, and a variable that was quietly
 ignored would be an operator's token, allowlist or cache not in effect.
 
+### Variables this server does not read
+
+Three names a key derives and no channel reads. They are refused for the same
+reason the retired ones are — a `MCUHOME_` name that is exported and ignored is
+a policy that did not take effect — and the message names the channels that do
+work.
+
+| Exported | Why, and what does work |
+|---|---|
+| `MCUHOME_SERVER_TOKEN` | there is no variable for the token, and there will not be: a secret in a variable is in the environment of every child process this server starts. `--server-token -` or `server.token_file` |
+| `MCUHOME_SERVER_AUTO_PULL` | a boolean cannot be read out of a variable yet: a configuration file, or `--server-auto-pull` / `--no-server-auto-pull` |
+| `MCUHOME_SERVER_PUBLISH_PAIR_FILE` | the same: a configuration file, or `--server-publish-pair-file` / `--no-server-publish-pair-file` |
+
 ### Seeing what is in effect
 
 ```sh
@@ -370,7 +388,15 @@ mcuhome-buildserver --print-config
 ```
 
 answers every option, its value, and the layer and the file, variable or flag
-it came from — and exits without binding anything.
+it came from — and exits without binding anything. It resolves no token, so it
+can be run on a server whose token is piped in without waiting for one.
+
+Two things it cannot show. A registry nobody configured is `[]` with the origin
+`default`: the trust anchor this server falls back to for MCUHome's own
+registry is not a configured value and is therefore in no layer. And the
+memory budget an unset `build.memory` produces is the machine's available
+memory, decided when a step starts rather than here — the one figure the
+document cannot state in advance.
 
 ## Security
 

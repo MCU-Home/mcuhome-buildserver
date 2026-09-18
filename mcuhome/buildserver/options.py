@@ -79,13 +79,14 @@ __all__ = [
     "DEFAULT_SESSION_QUOTA_BYTES",
     "PROGRAM_DEFAULTS",
     "PROGRAM_NAME",
+    "CLOSED_VARIABLES",
     "RETIRED_FLAGS",
     "RETIRED_VARIABLES",
     "SERVER_OPTIONS",
     "add_option_flags",
     "arguments",
     "offered_options",
-    "refuse_retired_spellings",
+    "refuse_unread_spellings",
 ]
 
 #: How this program names itself where a resolved value has to say who
@@ -528,6 +529,37 @@ RETIRED_VARIABLES: dict[str, str] = {
     ),
 }
 
+#: Variables a key of this server *derives* and nothing reads. They are
+#: refused by name for the reason the retired ones are: a ``MCUHOME_*``
+#: name an operator exports and this server ignores is a policy that
+#: quietly did not take effect, and nobody finds that out until a build
+#: does something nobody asked for.
+#:
+#: Two reasons a name lands here, and they are different. The token's is
+#: permanent: a secret in a variable is in the environment of every
+#: child process this server starts, so the option does not exist and the
+#: variable never will. The two booleans' is not: the configuration layer
+#: has no spelling for a boolean in a variable yet, so their environment
+#: channel is closed and these two entries come out the day it opens.
+CLOSED_VARIABLES: dict[str, str] = {
+    "MCUHOME_SERVER_TOKEN": (
+        "There is no environment variable for the token, and there will not be: a "
+        "secret in a variable is in the environment of every child process this "
+        "server starts. Pipe it in with `--server-token -`, or name the file that "
+        "holds it with server.token_file."
+    ),
+    "MCUHOME_SERVER_AUTO_PULL": (
+        "server.auto_pull is a boolean, and a boolean cannot be read out of a "
+        "variable yet. Set it in a configuration file, or use --server-auto-pull / "
+        "--no-server-auto-pull."
+    ),
+    "MCUHOME_SERVER_PUBLISH_PAIR_FILE": (
+        "server.publish_pair_file is a boolean, and a boolean cannot be read out of "
+        "a variable yet. Set it in a configuration file, or use "
+        "--server-publish-pair-file / --no-server-publish-pair-file."
+    ),
+}
+
 
 def successor(stated: str) -> str:
     """How a refusal names what *stated* is today.
@@ -548,14 +580,16 @@ def successor(stated: str) -> str:
     return f"It is {stated!r} now{where}."
 
 
-def refuse_retired_spellings(tokens: Sequence[str], env: Mapping[str, str]) -> None:
-    """Refuse a spelling this server used to have, naming what it is now.
+def refuse_unread_spellings(tokens: Sequence[str], env: Mapping[str, str]) -> None:
+    """Refuse a spelling this server does not read, naming what it does.
 
-    Both halves are checked before anything is parsed, so a retired flag
-    is answered with the name it has today rather than with
-    ``unrecognized arguments``. A flag written with its value attached
-    (``--docker=podman``) is the same spelling and is refused the same
-    way.
+    Three of them: a flag that was renamed, a variable that was renamed,
+    and a variable a key derives that no channel reads
+    (:data:`CLOSED_VARIABLES`). All three are checked before anything is
+    parsed, so a retired flag is answered with the name it has today
+    rather than with ``unrecognized arguments``. A flag written with its
+    value attached (``--docker=podman``) is the same spelling and is
+    refused the same way.
     """
     written = {token.partition("=")[0] for token in tokens if token.startswith("--")}
     for spelling in RETIRED_FLAGS:
@@ -568,10 +602,22 @@ def refuse_retired_spellings(tokens: Sequence[str], env: Mapping[str, str]) -> N
         if env.get(variable, "").strip():
             raise api.ConfigError(
                 f"{variable} is set, and this server does not read it any more.",
-                hint=successor(RETIRED_VARIABLES[variable])
-                + f" Unset {variable} so it cannot mislead the next person who reads "
-                "this server's environment.",
+                hint=successor(RETIRED_VARIABLES[variable]) + _unset(variable),
             )
+    for variable, why in CLOSED_VARIABLES.items():
+        if env.get(variable, "").strip():
+            raise api.ConfigError(
+                f"{variable} is set, and this server does not read it.",
+                hint=why + _unset(variable),
+            )
+
+
+def _unset(variable: str) -> str:
+    """The second half of every variable refusal: take the name away."""
+    return (
+        f" Unset {variable} so it cannot mislead the next person who reads this "
+        "server's environment."
+    )
 
 
 # ---------------------------------------------------------------------

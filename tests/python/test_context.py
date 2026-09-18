@@ -234,7 +234,7 @@ async def test_a_locally_present_image_under_another_digest_still_needs_fetching
 async def test_a_server_that_does_not_fetch_refuses_without_trying(
     aiohttp_client, config, docker, package_source
 ) -> None:
-    """``--no-auto-pull``: the images here are placed by an operator.
+    """``server.auto_pull`` off: the images here are placed by an operator.
 
     Not retryable, because nothing about waiting changes an operator's
     standing decision — and the refusal names the environment that was
@@ -1991,7 +1991,7 @@ def test_a_context_root_under_a_world_writable_directory_refuses_to_serve(tmp_pa
     shared.chmod(0o777)  # chmod rather than mkdir(mode=…), which the umask trims
     with pytest.raises(UnsafeContextRoot) as refusal:
         prepare_context_root(shared / "sessions")
-    assert "--context-root" in str(refusal.value)
+    assert "server.context_root" in str(refusal.value)
     assert not (shared / "sessions").exists(), "nothing was created under it"
 
     shared.chmod(0o1777)

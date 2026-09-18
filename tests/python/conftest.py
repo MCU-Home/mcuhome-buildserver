@@ -51,7 +51,7 @@ import pytest
 import zstandard
 from mcuhome.model.buildenvironment import ENVIRONMENT_IMAGE_REPOSITORY, LABEL_PREFIX
 from mcuhome.model.context import EnvironmentPin, PackagePin
-from mcuhome.workbench import buildenvsession, containerbuild, ociregistry
+from mcuhome.workbench import api, buildenvsession, containerbuild, ociregistry
 
 from mcuhome.buildserver import container
 from mcuhome.buildserver.app import ServerState, create_app
@@ -167,19 +167,24 @@ def config(tmp_path: Path) -> Config:
     a server nobody deploys. Tests that want to see a cap fire build
     their own :class:`Config` with that one number lowered.
 
-    ``sdk_sources`` names the package directory :func:`package_source`
-    fills: the SDK archive a context pins, and the index that says what
-    the two environment packages are. A server with nothing in it
-    refuses a build with ``sdk.unavailable``, which is the honest
-    default and what the tests of that refusal use.
+    The three package-source keys name the directory
+    :func:`package_source` fills: the SDK archive a context pins, and the
+    index that says what the two environment packages are. A kind is
+    never looked for under another kind's key, so a directory holding
+    all three is named in all three. A server with nothing in it refuses
+    a build with ``sdk.unavailable``, which is the honest default and
+    what the tests of that refusal use.
     """
+    packages = (tmp_path / "packages",)
     return Config(
         host="127.0.0.1",
         port=0,
         token=TOKEN,
         pair_file=None,
         context_root=tmp_path / "sessions",
-        sdk_sources=(tmp_path / "packages",),
+        build=api.BuildOptions(
+            sdk_sources=packages, workspace_sources=packages, tools_sources=packages
+        ),
     )
 
 
@@ -626,8 +631,8 @@ def registry(monkeypatch) -> ScriptedRegistry:
     published there today.
     """
     scripted = ScriptedRegistry()
-    monkeypatch.setattr(ociregistry.Registry, "tags", scripted.tags)
-    monkeypatch.setattr(ociregistry.Registry, "facts", scripted.facts)
+    monkeypatch.setattr(ociregistry.ImageRegistry, "tags", scripted.tags)
+    monkeypatch.setattr(ociregistry.ImageRegistry, "facts", scripted.facts)
     return scripted
 
 
@@ -732,7 +737,7 @@ def package_source(config: Config) -> Path:
     where the tools family is resolved to a concrete package. Tests that
     also need an SDK package add one with :func:`write_sdk_package`.
     """
-    directory = config.sdk_sources[0]
+    directory = config.build.sdk_sources[0]
     write_package_index(directory)
     return directory
 

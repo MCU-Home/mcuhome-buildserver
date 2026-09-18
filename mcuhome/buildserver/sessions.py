@@ -1402,7 +1402,7 @@ def capabilities_payload(state: Any, containers: list[dict[str, Any]]) -> dict[s
         # Which repositories an environment may be taken from here. It is
         # the operator's boundary and the one part of image selection a
         # client can act on before it uploads anything.
-        "environments": {"allowed": list(config.allowed_environments)},
+        "environments": {"allowed": list(config.allowed_container_repositories)},
         # The server's patch configuration IS the policy; unlisted layers
         # are denied by default. Advertised per layer so the
         # workbench refuses a patched context before uploading it.

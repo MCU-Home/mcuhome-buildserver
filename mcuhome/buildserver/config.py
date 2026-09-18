@@ -1,39 +1,40 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Runtime configuration: command line, environment, defaults.
+"""Runtime configuration: one ladder, the same one every MCUHome program reads.
 
-Every option has an environment form prefixed ``MCUHOME_BUILDSERVER_``
-and the command line wins, which is the same rule the dashboard follows:
-the environment is what an App's ``run`` script and a ``docker run``
-use, the command line is what a person uses.
+The options themselves are declared in
+:mod:`mcuhome.buildserver.options`; this module resolves them and turns
+the answer into the :class:`Config` the server runs on. The layers are
+the workbench's, ascending — later wins — and every value carries the
+one it came from:
 
-Two defaults are decisions rather than conveniences.
+``default`` → ``program`` → system file → user file → this server's own
+configuration file → environment → arguments.
 
-**The bind address is ``0.0.0.0``.** The dashboard defaults to loopback
-because a dashboard on loopback is still a dashboard; a build server on
-loopback is a build server nobody can open a session against. The
-two-App topology makes it a separate machine by construction — that is the whole
-topology — so the useful default is the one that works, and the safety
-comes from the other decision below rather than from the binding.
+``program`` is what this server states for a shared key before any file
+is read (the memory budget); the two system-wide files are the ones every
+MCUHome program on this host reads, so a machine configures its package
+directories, its container program and its registries once; and the file
+``--server-config`` names stands where a project's file stands for a
+workstation — a build server has no project, and this is the nearest
+thing it has to one.
+
+Three defaults are decisions rather than conveniences, and they are
+stated where the options are declared: the bind address is ``0.0.0.0``,
+the memory budget is ``8g`` in the program layer, and the ingress caps
+and the per-session disk quota are options because **the config is the
+policy** — a limit an operator cannot move is a limit they will work
+around by other means.
 
 **A token is not optional.** There is no configuration in which this
 server listens without one. Configure it and it is used; do not, and one
 is generated at startup, logged once, and written to the pairing file if
 this is a Home Assistant App pair. What there is no way to ask for is a
-build server with authentication switched off.
-
-**The ingress caps and the per-session disk quota are options here for
-one reason: the config is the policy.** The hardening floor for shared
-servers requires five ingress caps enforced
-streaming and a per-session disk quota answered typed, and names no
-number for any of them; the numbers below are this server's defaults
-and an operator's to change. They are deliberately *not* constants in
-the module that enforces them — a limit an operator cannot move is a
-limit they will work around by other means. The bound on
-``context.yaml`` is a sixth cap that nothing else asks for, and it is
-here rather than beside its enforcement for exactly that reason: it was
-a constant in :mod:`mcuhome.buildserver.contextstore` while the README
-advertised its value to operators who had no way to move it.
+build server with authentication switched off. There is deliberately no
+environment variable for it either: a secret in a variable is in the
+environment of every child process this server starts, so the channels
+are ``--server-token`` (which takes ``-`` to read it from standard
+input) and ``server.token_file``.
 """
 
 from __future__ import annotations
@@ -42,15 +43,17 @@ import argparse
 import math
 import os
 import secrets
+import sys
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any, TextIO
 
 from mcuhome.model.buildenvironment import ENVIRONMENT_IMAGE_REPOSITORY
-from mcuhome.model.errors import MCUHomeError
-from mcuhome.workbench.buildenvsession import memory_bytes
+from mcuhome.workbench import api
 
+from mcuhome.buildserver import options as declared
 from mcuhome.buildserver.environments import repository_of
 from mcuhome.buildserver.security import DEFAULT_PAIR_FILE, read_token_file
 from mcuhome.buildserver.sessions import (
@@ -65,128 +68,17 @@ from mcuhome.buildserver.sessions import (
 )
 
 __all__ = [
-    "DEFAULT_BUILD_DEADLINE_SECONDS",
-    "DEFAULT_CANCEL_GRACE_SECONDS",
-    "DEFAULT_CONTAINER_MEMORY",
-    "DEFAULT_CONTAINER_PIDS",
-    "DEFAULT_DOCKER",
-    "DEFAULT_HOST",
-    "DEFAULT_MAX_ARTIFACT_BYTES",
-    "DEFAULT_MAX_COMPRESSED_BYTES",
-    "DEFAULT_MAX_CONNECTIONS",
-    "DEFAULT_MAX_CONTEXT_YAML_BYTES",
-    "DEFAULT_MAX_DECOMPRESSED_BYTES",
-    "DEFAULT_MAX_ENTRIES",
-    "DEFAULT_MAX_FILE_BYTES",
-    "DEFAULT_MAX_INFLIGHT_COMMANDS",
-    "DEFAULT_MAX_PATH_DEPTH",
-    "DEFAULT_PORT",
-    "DEFAULT_SESSION_QUOTA_BYTES",
-    "ENV_PREFIX",
+    "FROM_STDIN",
     "Config",
     "build_parser",
+    "config_document",
     "default_context_root",
     "load_config",
     "resolve_token",
 ]
 
-ENV_PREFIX = "MCUHOME_BUILDSERVER_"
-
-#: One past the dashboard's 8099, so both Apps can run on one host with
-#: no configuration at all.
-DEFAULT_PORT = 8100
-DEFAULT_HOST = "0.0.0.0"  # noqa: S104 - see the module docstring
-
-#: The five ingress caps of the hardening floor for shared servers, in
-#: the order they are usually listed, and the per-session disk quota
-#: alongside them. Every number is a chosen default rather than a derived
-#: one: no document fixes them, so they are stated here once and cited
-#: nowhere as if they were normative.
-#:
-#: They are generous against a real context and mean against a bomb. A
-#: device model is kilobytes, a signing public key is under a hundred
-#: bytes and a patch is rarely more than a few hundred kilobytes, so a
-#: context that approaches 64 MiB compressed is already not a context in
-#: the sense the format means.
-DEFAULT_MAX_COMPRESSED_BYTES = 64 * 1024 * 1024
-DEFAULT_MAX_DECOMPRESSED_BYTES = 256 * 1024 * 1024
-DEFAULT_MAX_ENTRIES = 4096
-DEFAULT_MAX_FILE_BYTES = 64 * 1024 * 1024
-DEFAULT_MAX_PATH_DEPTH = 16
-DEFAULT_SESSION_QUOTA_BYTES = 2 * 1024 * 1024 * 1024
-
-#: The sixth ingress cap, and one the hardening floor above does not
-#: list: how large ``context.yaml`` may be. It exists because a YAML parser is
-#: the single place in this server where a small input buys unbounded
-#: work, so the pin document gets a bound of its own instead of sharing
-#: the per-file cap with a multi-megabyte patch. It is here, next to the
-#: other six numbers, for the reason the module docstring gives for all
-#: of them — a cap that is advertised to operators and unreachable by
-#: them is the worst of both. Product-owner decision of 2026-08-09,
-#: together with safe-load, no duplicate keys and no anchors; the number
-#: is this server's default and an operator's to change.
-DEFAULT_MAX_CONTEXT_YAML_BYTES = 64 * 1024
-
-#: The container runtime this server drives. A name rather than a path,
-#: looked up on the server's own ``PATH``: an operator who wants
-#: ``podman`` says so, and an operator who wants a wrapper script names
-#: it here rather than shadowing ``docker`` for the whole account.
-DEFAULT_DOCKER = "docker"
-
-#: ``limits.deadline_seconds`` — relative to program start, advisory to
-#: the program and **enforced here**. Ninety minutes: generous
-#: against a cold Matter build, mean against one that is not going to
-#: end. A program that honours the advisory value stops itself and says
-#: ``error.deadline.exceeded``; one that does not gets the liveness
-#: ladder of :mod:`mcuhome.buildserver.backend`.
-DEFAULT_BUILD_DEADLINE_SECONDS = 5400
-
-#: ``limits.cancel_grace_seconds`` — how long a cooperative program has
-#: to notice the cancel sentinel and write a ``cancelled`` result before
-#: the hard path starts. Sixty seconds, which is long enough to finish
-#: writing an artifact and short enough that a client waiting on a
-#: cancel is not left guessing.
-DEFAULT_CANCEL_GRACE_SECONDS = 60
-
-#: The egress size cap, per artifact, applied during
-#: enumeration, from the bytes on disk — an artifact entry declares no
-#: size. Separate from the ingress caps because it bounds the opposite
-#: direction: what the least trusted component in the system may put on
-#: the wire towards other people's machines.
-DEFAULT_MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
-
-#: The memory one build step of a session may use, in ``docker run
-#: --memory`` spelling. It is **both halves of the budget**: the number
-#: is written into the request document as the recommendation the build
-#: environment sizes itself from (build environment specification §6.1)
-#: and set on the container as the hard limit the runtime holds it to.
-#: There is a number here rather than a hope because without one a
-#: single build's linker takes the host down and every other session
-#: with it. Eight gibibytes is generous against a cold Matter build and
-#: mean against a runaway; the empty string is an operator saying this
-#: host is not to be bounded by memory.
-DEFAULT_CONTAINER_MEMORY = "8g"
-
-#: ``docker run --pids-limit`` for the same container. A build legitimately
-#: spawns hundreds of short-lived children — which is why ``--init`` is
-#: there at all — and a fork bomb spawns them faster; four thousand is
-#: past any real toolchain and short of a host that stops scheduling.
-#: It is the one limit that is only ever hard: no document asks an
-#: environment how many processes it means to have.
-DEFAULT_CONTAINER_PIDS = 4096
-
-#: Concurrent ``/ws`` connections this server accepts, and in-flight
-#: command tasks one connection may run at once. Both are **hardening,
-#: not a trust boundary**: the bearer token already equals shell access
-#: (security.py), so a token holder can do worse than open sockets — the
-#: point is only that an authenticated flood cannot grow the connection
-#: set or the per-connection task set without bound. The numbers are
-#: generous against a real client (a single principal opens a handful of
-#: connections and pipelines a few commands on each) and mean against a
-#: flood, and they are options for the same reason every other limit here
-#: is: the config is the policy.
-DEFAULT_MAX_CONNECTIONS = 64
-DEFAULT_MAX_INFLIGHT_COMMANDS = 32
+#: What a flag writes to mean "the value is on standard input".
+FROM_STDIN = "-"
 
 
 def default_context_root(env: Mapping[str, str]) -> Path:
@@ -205,7 +97,7 @@ def default_context_root(env: Mapping[str, str]) -> Path:
     be a session tree appearing under somebody's home when the operator
     thought they were running a system service, so the fallback is a
     location that is obviously ephemeral instead of one that looks
-    deliberate. ``--context-root`` is how an operator says.
+    deliberate. ``server.context_root`` is how an operator says.
     """
     state = env.get("XDG_STATE_HOME")
     if state and state.strip():
@@ -221,21 +113,22 @@ def default_context_root(env: Mapping[str, str]) -> Path:
 class Config:
     """Everything the server needs before it binds a socket."""
 
-    host: str = DEFAULT_HOST
-    port: int = DEFAULT_PORT
+    host: str = declared.DEFAULT_HOST
+    port: int = declared.DEFAULT_PORT
     #: Never ``None``: :func:`load_config` generates one when it must.
     token: str = ""
-    #: Where the token is published for a same-host App pair, or ``None``.
+    #: Where the token is published for a same-host App pair, or ``None``
+    #: where ``server.publish_pair_file`` is off.
     pair_file: Path | None = DEFAULT_PAIR_FILE
 
     allowed_origins: tuple[str, ...] = ()
     log_level: str = "INFO"
 
     #: The ``/ws`` connection and per-connection concurrency caps. See the
-    #: module-level defaults: hardening against an authenticated flood,
-    #: not a trust boundary, since the token already equals shell.
-    max_connections: int = DEFAULT_MAX_CONNECTIONS
-    max_inflight_commands: int = DEFAULT_MAX_INFLIGHT_COMMANDS
+    #: declarations: hardening against an authenticated flood, not a
+    #: trust boundary, since the token already equals shell.
+    max_connections: int = declared.DEFAULT_MAX_CONNECTIONS
+    max_inflight_commands: int = declared.DEFAULT_MAX_INFLIGHT_COMMANDS
 
     #: Session protocol v2: the patch layers a build context may carry
     #: patches for. **The config is the policy** — empty by default, and
@@ -255,17 +148,17 @@ class Config:
     #: buffering them; the first three count **cumulatively across the
     #: base context and every extension**, because a session's footprint
     #: is what they bound, not one archive's.
-    max_compressed_bytes: int = DEFAULT_MAX_COMPRESSED_BYTES
-    max_decompressed_bytes: int = DEFAULT_MAX_DECOMPRESSED_BYTES
-    max_entries: int = DEFAULT_MAX_ENTRIES
+    max_compressed_bytes: int = declared.DEFAULT_MAX_COMPRESSED_BYTES
+    max_decompressed_bytes: int = declared.DEFAULT_MAX_DECOMPRESSED_BYTES
+    max_entries: int = declared.DEFAULT_MAX_ENTRIES
     #: Per file, so one entry cannot spend the whole cumulative budget.
-    max_file_bytes: int = DEFAULT_MAX_FILE_BYTES
+    max_file_bytes: int = declared.DEFAULT_MAX_FILE_BYTES
     #: Path segments, ``patches/zephyr/0001-fix.patch`` being three.
-    max_path_depth: int = DEFAULT_MAX_PATH_DEPTH
+    max_path_depth: int = declared.DEFAULT_MAX_PATH_DEPTH
     #: The sixth cap: how large ``context.yaml`` may be before it is
     #: parsed at all. Not one of the hardening floor's five, and here for
     #: the same reason they are.
-    max_context_yaml_bytes: int = DEFAULT_MAX_CONTEXT_YAML_BYTES
+    max_context_yaml_bytes: int = declared.DEFAULT_MAX_CONTEXT_YAML_BYTES
 
     #: The per-session disk quota alongside them — "typed
     #: quota-exceeded instead of host exhaustion". It meters what a
@@ -276,39 +169,25 @@ class Config:
     #: :attr:`max_artifact_bytes` per artifact at egress instead, which
     #: is where the cap belongs — the only place a number
     #: can be measured from the bytes on disk.
-    session_quota_bytes: int = DEFAULT_SESSION_QUOTA_BYTES
+    session_quota_bytes: int = declared.DEFAULT_SESSION_QUOTA_BYTES
 
-    #: The container runtime, and the numbers that bound one invocation.
-    #: All of them are configuration for the same reason the ingress caps
-    #: are — the config is the policy, and a number an operator cannot
-    #: move is a number they will work around.
-    docker: str = DEFAULT_DOCKER
-    build_deadline_seconds: int = DEFAULT_BUILD_DEADLINE_SECONDS
-    cancel_grace_seconds: int = DEFAULT_CANCEL_GRACE_SECONDS
-    #: The idle half of the session lease (:data:`_SESSION_OPTIONS`). The
-    #: hard half is not here: it is derived from the build deadline.
+    #: The numbers that bound one invocation. All of them are
+    #: configuration for the same reason the ingress caps are — the
+    #: config is the policy, and a number an operator cannot move is a
+    #: number they will work around.
+    build_deadline_seconds: int = declared.DEFAULT_BUILD_DEADLINE_SECONDS
+    cancel_grace_seconds: int = declared.DEFAULT_CANCEL_GRACE_SECONDS
+    #: The idle half of the session lease. The hard half is not here: it
+    #: is derived from the build deadline.
     session_idle_timeout_seconds: int = int(DEFAULT_IDLE_TIMEOUT)
     #: How many sessions may be open at once, and how a client that finds
-    #: them all taken is made to wait (:data:`_ADMISSION_OPTIONS`).
+    #: them all taken is made to wait.
     max_sessions: int = DEFAULT_MAX_OPEN_SESSIONS
     seat_retry_seconds: int = int(DEFAULT_SEAT_RETRY_SECONDS)
     seat_retry_max_seconds: int = int(DEFAULT_SEAT_RETRY_MAX_SECONDS)
     max_seats: int = DEFAULT_MAX_SEATS
     reconnect_grace_seconds: int = int(DEFAULT_RECONNECT_GRACE)
-    max_artifact_bytes: int = DEFAULT_MAX_ARTIFACT_BYTES
-
-    #: What one build step of a session is given, and held to. The CPU
-    #: and memory figures are **both** halves of the budget: they travel
-    #: in the request document as the recommendation the environment
-    #: sizes itself from and are set on the container as the hard limits
-    #: the runtime enforces, because an environment cannot be trusted to
-    #: stay inside a recommendation — it may have a bug and run amok.
-    #: ``container_cpus`` unset means this host's CPU count
-    #: (:func:`~mcuhome.buildserver.backend.session_limits`), which is
-    #: what a build gets when nobody said otherwise.
-    container_memory: str | None = DEFAULT_CONTAINER_MEMORY
-    container_cpus: str | None = None
-    container_pids: int | None = DEFAULT_CONTAINER_PIDS
+    max_artifact_bytes: int = declared.DEFAULT_MAX_ARTIFACT_BYTES
 
     #: The build environments this server is willing to run, as
     #: repositories — no tag, no digest. It is **two things at once** and
@@ -316,12 +195,12 @@ class Config:
     #: for in when a context brings no pin, walked in order, and the
     #: boundary a pin that names a repository has to be inside. Without
     #: it a client's pin would decide which of this host's images gets
-    #: started with a session's mounts under it.
-    #: Defaults to MCUHome's own build environment, which is what this
-    #: server exists to run; stating the option at all replaces that
-    #: default rather than adding to it, because an operator who lists
-    #: their own images must also be able to stop serving ours.
-    allowed_environments: tuple[str, ...] = (ENVIRONMENT_IMAGE_REPOSITORY,)
+    #: started with a session's mounts under it. That is why it is
+    #: ``server.allowed_container_repositories`` and not the workbench's
+    #: ``build.container_repositories``, which is a search list and
+    #: refuses nothing; the search list this server hands the workbench
+    #: is this one.
+    allowed_container_repositories: tuple[str, ...] = (ENVIRONMENT_IMAGE_REPOSITORY,)
 
     #: Fetch an allowed build environment this host does not have yet.
     #: On by default: the environment is pinned to a digest and its
@@ -332,626 +211,358 @@ class Config:
     #: gigabyte of transfer on a client's say-so.
     auto_pull: bool = True
 
-    #: The operator's own **mirror** of the packages a session needs, in
-    #: search order: directories holding ``mcuhome-sdk-<version>.tar.zst``
-    #: and the package index beside it. Searched first, and a server that
-    #: holds what its sessions pin never opens a socket for them.
-    #:
-    #: Empty by default, and that is not the same as having no source:
-    #: behind these directories is MCUHome's own package registry,
-    #: checked against the trust anchor the workbench ships and against
-    #: nothing else. There is deliberately no option for that registry —
-    #: no second domain, no other anchor — because a build server is an
-    #: operator's machine and not a project, and a trust root that could
-    #: be pointed elsewhere by a flag would be a trust decision made
-    #: where nobody looks.
-    sdk_sources: tuple[Path, ...] = ()
+    #: The ``build`` section of the same resolution: the container
+    #: program, the budgets one step is held to, the operator's package
+    #: directories per package kind, and the shared compiler cache. Every
+    #: one of them is the key a workstation uses for the same thing.
+    build: api.BuildOptions = field(default_factory=api.BuildOptions)
 
-    #: An optional shared ccache, offered to every invocation
-    #: **read-only** for untrusted work. There is deliberately no
-    #: way to ask for a writable one: cache warming is a deliberate
-    #: operator invocation with a writable cache and trusted contexts
-    #: only, which is a verb this server does not have, and an option
-    #: that made an untrusted build's cache writable would be the one
-    #: setting that turns a shared cache into a shared attack surface.
-    ccache_dir: Path | None = None
+    #: What the configuration says about package registries, by base
+    #: domain: their mirrors, their trust anchor, whether an unsigned
+    #: source is accepted. A server has no project, so this map is where
+    #: the answers a project keeps in its own file come from.
+    registries: tuple[api.RegistrySettings, ...] = ()
+
+    #: The file ``--server-config`` named, if any. Its directory is this
+    #: server's project-light root: where ``secrets/trust-anchor/`` is
+    #: looked up for a registry the map does not give an anchor for.
+    config_file: Path | None = None
+
+    #: The whole resolution, for the document ``--print-config`` answers.
+    #: ``None`` for a configuration built in code rather than resolved.
+    settings: api.Settings | None = field(default=None, compare=False, repr=False)
 
     #: True when :func:`load_config` had to invent the token, so that
     #: startup can print it exactly once.
     token_generated: bool = field(default=False, compare=False)
 
+    #: What the invocation asked for rather than what it configured:
+    #: print the resolved configuration and exit.
+    print_config: bool = field(default=False, compare=False)
+
+    @property
+    def project_root(self) -> Path:
+        """Where this server's own trust anchors are looked for.
+
+        The directory its configuration file lies in — the one place a
+        server has that answers what a project's root answers for a
+        workstation. Without such a file there is nothing to point at
+        and the context root stands in: it is the directory this server
+        was given to own.
+        """
+        return self.context_root if self.config_file is None else self.config_file.parent
+
     def site_summary(self) -> str:
         return f"http://{self.host}:{self.port} (bearer token required)"
 
 
-#: The six ingress caps, as ``(option, attribute, default, help)``. One
-#: table drives the command line, the environment and the defaults, so a
-#: cap cannot exist in one of the three and not the others — which is
-#: also why ``--max-context-yaml-bytes`` is an entry here rather than a
-#: constant in the module that enforces it.
-_CAP_OPTIONS: tuple[tuple[str, str, int, str], ...] = (
-    (
-        "--max-compressed-bytes",
-        "max_compressed_bytes",
-        DEFAULT_MAX_COMPRESSED_BYTES,
-        "the archive bytes a session may upload in total",
-    ),
-    (
-        "--max-decompressed-bytes",
-        "max_decompressed_bytes",
-        DEFAULT_MAX_DECOMPRESSED_BYTES,
-        "the cumulative unpacked bytes a session may produce",
-    ),
-    (
-        "--max-entries",
-        "max_entries",
-        DEFAULT_MAX_ENTRIES,
-        "the archive entries a session may deliver in total",
-    ),
-    ("--max-file-bytes", "max_file_bytes", DEFAULT_MAX_FILE_BYTES, "the size of one context file"),
-    (
-        "--max-path-depth",
-        "max_path_depth",
-        DEFAULT_MAX_PATH_DEPTH,
-        "the path segments one context entry may have",
-    ),
-    (
-        "--max-context-yaml-bytes",
-        "max_context_yaml_bytes",
-        DEFAULT_MAX_CONTEXT_YAML_BYTES,
-        "the size of the context.yaml pin document, bounded before it is parsed",
-    ),
-)
-
-#: The backend's own numbers, as ``(option, attribute, default, help)``.
-#: Same table shape as the caps and for the same reason: one table
-#: drives the command line, the environment and the defaults, so a knob
-#: cannot exist in one of the three and not the others.
-_BACKEND_OPTIONS: tuple[tuple[str, str, int, str], ...] = (
-    (
-        "--build-deadline-seconds",
-        "build_deadline_seconds",
-        DEFAULT_BUILD_DEADLINE_SECONDS,
-        "how long one invocation may run before this server stops it",
-    ),
-    (
-        "--cancel-grace-seconds",
-        "cancel_grace_seconds",
-        DEFAULT_CANCEL_GRACE_SECONDS,
-        "how long a cancelled invocation has to stop itself before the hard path",
-    ),
-    (
-        "--max-artifact-bytes",
-        "max_artifact_bytes",
-        DEFAULT_MAX_ARTIFACT_BYTES,
-        "egress cap: the size of one artifact this server will serve",
-    ),
-    (
-        "--container-pids",
-        "container_pids",
-        DEFAULT_CONTAINER_PIDS,
-        "docker run --pids-limit for the session container",
-    ),
-)
-
-#: The session lease's own numbers, same table shape and same reason.
-#: Only the idle timeout is here: the hard lease follows the build
-#: deadline (:func:`mcuhome.buildserver.sessions.ttl_for`), so it is
-#: derived rather than configured, and a knob that could contradict the
-#: deadline is a knob that can end a build that is still running.
-#:
-#: The idle timeout cannot be derived that way, because it measures
-#: something else: how long a session may sit with nothing happening.
-#: What "nothing" means is the operator's judgement — a workshop machine
-#: wants minutes, a shared server wants less — and a test wants seconds,
-#: which is the case that made this configurable: the defects that cost
-#: this project a build were lease-versus-time defects, and reproducing
-#: one must not require a build long enough to outlast ten minutes.
-_SESSION_OPTIONS: tuple[tuple[str, str, int, str], ...] = (
-    (
-        "--session-idle-timeout-seconds",
-        "session_idle_timeout_seconds",
-        int(DEFAULT_IDLE_TIMEOUT),
-        "how long a session may sit idle — no command, no running invocation — before it is closed",
-    ),
-)
-
-#: Admission: how many turns there are, and how a client that finds none
-#: free is made to wait. Same table shape and same reason again.
-#:
-#: The cap was a constant with no option in front of it, which made four
-#: concurrent sessions — four containers at ``--container-memory`` each —
-#: a number an operator could not lower on a machine that cannot feed
-#: them. Sizing it
-#: from real load is a later version's job; a static number is what an
-#: operator can reason about, and a dynamic one that guessed wrong would
-#: be a build killed for arithmetic.
-#:
-#: The two seat times are the operator's judgement in the same way the
-#: idle timeout is: a private server sets the base high, because a queue
-#: there is rare and a chatty client buys nothing, and a public one sets
-#: it low. The grace on top of an appointment is *not* here — it absorbs
-#: jitter around a time this server itself named, and the base is the
-#: knob for wanting a longer leash.
-_ADMISSION_OPTIONS: tuple[tuple[str, str, int, str], ...] = (
-    (
-        "--max-sessions",
-        "max_sessions",
-        DEFAULT_MAX_OPEN_SESSIONS,
-        "how many sessions may be open at once",
-    ),
-    (
-        "--seat-retry-seconds",
-        "seat_retry_seconds",
-        int(DEFAULT_SEAT_RETRY_SECONDS),
-        "base wait a refused client is told to keep before presenting its seat again",
-    ),
-    (
-        "--seat-retry-max-seconds",
-        "seat_retry_max_seconds",
-        int(DEFAULT_SEAT_RETRY_MAX_SECONDS),
-        "ceiling on that wait, however deep the queue is",
-    ),
-    (
-        "--max-seats",
-        "max_seats",
-        DEFAULT_MAX_SEATS,
-        "how many waiting turns this server holds before it stops issuing them",
-    ),
-    (
-        "--reconnect-grace-seconds",
-        "reconnect_grace_seconds",
-        int(DEFAULT_RECONNECT_GRACE),
-        "how long a session whose client is gone is kept before a waiting one may have it",
-    ),
-)
-
-_LIMIT_ATTRIBUTES: tuple[str, ...] = (
-    tuple(entry[1] for entry in _CAP_OPTIONS)
-    + ("session_quota_bytes", "max_connections", "max_inflight_commands")
-    + tuple(entry[1] for entry in _BACKEND_OPTIONS)
-    + tuple(entry[1] for entry in _SESSION_OPTIONS)
-    + tuple(entry[1] for entry in _ADMISSION_OPTIONS)
-)
-
-
-def _text_option(
-    configured: str | None, env: Mapping[str, str], name: str, default: str | None
-) -> str | None:
-    """A string option in which ``""`` is a value and absence is not.
-
-    ``--container-memory ""`` means "no ceiling", so the empty string
-    cannot ride on the ``or`` chain the other string options use: there,
-    absence and emptiness are the same thing and both take the default,
-    which would silently keep a limit an operator asked to remove.
-    """
-    found = configured
-    if found is None:
-        found = env.get(ENV_PREFIX + name)
-    if found is None:
-        found = default
-    return (found or "").strip() or None
-
-
-def _check_container_budget(cpus: str | None, memory: str | None) -> None:
-    """Refuse a CPU or memory figure that cannot be read, at startup.
-
-    Both stay strings in the configuration — the CPU figure because
-    fractions are allowed, the memory figure because it carries a unit
-    — and both are turned into numbers only when a step is started
-    (:func:`~mcuhome.buildserver.backend.session_limits`). Read only
-    there, a typo passes startup and surfaces as an internal error on
-    the first build, to whichever client happened to send it. So the
-    same reading happens here, where it costs nothing and the operator
-    who wrote the value is still watching.
-
-    The memory figure is parsed by the very function the step uses, so
-    the two can never disagree about what ``8g`` means. Absence is not
-    an error for either: no CPU figure is this host's CPUs, and no
-    memory figure — ``--container-memory ""`` — is the operator saying
-    "not bounded by memory here". A stated ``0`` keeps its runtime
-    meaning for CPUs (no CPU bound); a negative budget is nonsense in
-    either unit and says so.
-    ``nan`` and ``inf`` are refused with the unreadable figures rather
-    than with the negative ones: they parse as floats and would reach a
-    container as a budget nobody can act on.
-    """
-    if cpus is not None:
-        try:
-            value = float(cpus)
-        except ValueError:
-            value = math.nan
-        if not math.isfinite(value):
-            raise SystemExit(
-                f"--container-cpus must be a number of cores, not {cpus!r}. Fractions are "
-                "allowed — 2, 1.5."
-            )
-        if value < 0:
-            raise SystemExit(f"--container-cpus must not be negative, and {cpus!r} is.")
-    try:
-        memory_bytes(memory, option="--container-memory")
-    except (MCUHomeError, ArithmeticError, ValueError) as unreadable:
-        # The parse itself refuses a figure it cannot read or one that
-        # is not positive; `inf` and a float too large to be an integer
-        # arrive as ArithmeticError and ValueError from the conversion
-        # behind it, and mean the same thing to an operator.
-        raise SystemExit(
-            f"--container-memory must be an amount of memory, not {memory!r}. It takes a byte "
-            "count or a number with a unit — 512m, 8g, 2048k — the way a container runtime "
-            "spells it; the empty string removes the limit."
-        ) from unreadable
-
-
-def _env_int(env: Mapping[str, str], name: str) -> int | None:
-    raw = env.get(ENV_PREFIX + name)
-    if raw is None or not raw.strip():
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        raise SystemExit(f"{ENV_PREFIX + name} must be a whole number, not {raw!r}.") from None
-
-
-def _env_flag(env: Mapping[str, str], name: str) -> bool | None:
-    """A yes/no environment variable, or ``None`` when it is not set."""
-    raw = env.get(ENV_PREFIX + name)
-    if raw is None or not raw.strip():
-        return None
-    value = raw.strip().lower()
-    if value in ("1", "true", "yes", "on"):
-        return True
-    if value in ("0", "false", "no", "off"):
-        return False
-    raise SystemExit(f"{ENV_PREFIX + name} must be yes or no, not {raw!r}.")
-
-
 def build_parser() -> argparse.ArgumentParser:
+    """Every flag this server takes, one per declared option plus its own."""
     parser = argparse.ArgumentParser(
-        prog="mcuhome-buildserver",
+        prog=declared.PROGRAM_NAME,
         description=(
             "Headless MCUHome build service. Drives build environments over the "
             "session protocol and is never one itself; never stores a configuration "
             "tree and never holds a signing key."
         ),
     )
-    parser.add_argument("--host", metavar="ADDRESS", help=f"bind address (default {DEFAULT_HOST})")
-    parser.add_argument("--port", type=int, metavar="PORT", help=f"port (default {DEFAULT_PORT})")
     parser.add_argument(
-        "--token",
+        "--server-config",
+        type=Path,
+        metavar="FILE",
+        dest="server_config",
+        help=(
+            f"this server's own configuration file, an {api.PROJECT_CONFIG_FILE} read "
+            "where a project's file is read: above the environment and below the "
+            "flags, and after the system and user files"
+        ),
+    )
+    parser.add_argument(
+        "--server-token",
         metavar="TOKEN",
+        dest="server_token",
         help=(
-            "bearer token clients must present; prefer the environment variable or "
-            "--token-file, since a command line is visible to every process on the machine"
+            "the bearer token clients must present; `-` reads it from standard input, "
+            "which is how a token stays out of the process list of every other user "
+            "on the machine"
         ),
     )
     parser.add_argument(
-        "--token-file", type=Path, metavar="PATH", help="read the bearer token from this file"
+        "--print-config",
+        action="store_true",
+        dest="print_config",
+        help="print the resolved configuration, with the layer every value came from, and exit",
     )
-    parser.add_argument(
-        "--pair-file",
-        type=Path,
-        metavar="PATH",
-        help=(
-            "publish the token here for a same-host dashboard to find "
-            f"(default {DEFAULT_PAIR_FILE}, written only if its directory exists)"
-        ),
-    )
-    parser.add_argument(
-        "--no-pair-file",
-        dest="pair_file",
-        action="store_const",
-        const=Path("-"),
-        help="never publish the token to a file",
-    )
-    parser.add_argument(
-        "--allowed-origin",
-        action="append",
-        metavar="ORIGIN",
-        dest="allowed_origins",
-        help="accepted browser origin for the WebSocket upgrade (repeatable)",
-    )
-    parser.add_argument(
-        "--allow-patch-layer",
-        action="append",
-        metavar="LAYER",
-        dest="allowed_patch_layers",
-        # Deliberately no `choices=`: this server's own layer names are
-        # the four above, and the `x-` prefix is reserved for
-        # third-party ones, so the set of *nameable* layers is open
-        # while the set of *allowed* ones stays this option's answer.
-        # Validation is in `load_config`,
-        # which can say why an `x-` name is fine and `kernel` is not.
-        help=(
-            "session protocol v2: allow build contexts to carry patches for this "
-            f"layer ({', '.join(PATCH_LAYERS)}, or a third-party x-* name; "
-            "repeatable). Unlisted layers are denied — the config is the policy"
-        ),
-    )
-    parser.add_argument(
-        "--context-root",
-        type=Path,
-        metavar="PATH",
-        help=(
-            "directory the per-session context directories are created in "
-            "(default: the XDG state directory)"
-        ),
-    )
-    for option, attribute, default, what in _CAP_OPTIONS:
-        parser.add_argument(
-            option,
-            type=int,
-            metavar="N",
-            dest=attribute,
-            help=f"ingress cap: {what} (default {default})",
-        )
-    parser.add_argument(
-        "--session-quota-bytes",
-        type=int,
-        metavar="N",
-        dest="session_quota_bytes",
-        help=(
-            "per-session disk quota in bytes, answered typed rather than by host "
-            f"exhaustion (default {DEFAULT_SESSION_QUOTA_BYTES})"
-        ),
-    )
-    parser.add_argument(
-        "--max-connections",
-        type=int,
-        metavar="N",
-        dest="max_connections",
-        help=(
-            "concurrent /ws connections this server accepts before it refuses the "
-            f"upgrade (default {DEFAULT_MAX_CONNECTIONS}); hardening, not a trust boundary"
-        ),
-    )
-    parser.add_argument(
-        "--max-inflight-commands",
-        type=int,
-        metavar="N",
-        dest="max_inflight_commands",
-        help=(
-            "in-flight command tasks one /ws connection may run at once "
-            f"(default {DEFAULT_MAX_INFLIGHT_COMMANDS})"
-        ),
-    )
-    parser.add_argument(
-        "--docker",
-        metavar="PROGRAM",
-        help=f"container runtime to drive (default {DEFAULT_DOCKER})",
-    )
-    parser.add_argument(
-        "--sdk-source",
-        action="append",
-        type=Path,
-        metavar="PATH",
-        dest="sdk_sources",
-        help=(
-            "directory holding mcuhome-sdk-<version>.tar.zst packages; repeatable and "
-            "searched in the order given, before MCUHome's own package registry. The url "
-            "in a context is a hint and is never fetched: a package is found by name and "
-            "accepted by the hash the context pins"
-        ),
-    )
-    parser.add_argument(
-        "--allow-environment",
-        action="append",
-        metavar="REPOSITORY",
-        dest="allowed_environments",
-        help=(
-            "build-environment repository this server may run, without tag or digest "
-            "(repeatable, searched in the order given). Stating it replaces the default, "
-            f"which is MCUHome's own build environment ({ENVIRONMENT_IMAGE_REPOSITORY}). "
-            "A build pinning any other repository is refused before any registry is asked"
-        ),
-    )
-    parser.add_argument(
-        "--no-auto-pull",
-        action="store_false",
-        dest="auto_pull",
-        default=None,
-        help=(
-            "never fetch a build environment; serve only images already on this host. "
-            "The allowlist above applies either way"
-        ),
-    )
-    parser.add_argument(
-        "--ccache-dir",
-        type=Path,
-        metavar="PATH",
-        help=(
-            "shared compiler cache, offered to every invocation read-only "
-            "(there is no writable mode: cache warming is not a verb this server has)"
-        ),
-    )
-    parser.add_argument(
-        "--container-memory",
-        metavar="SIZE",
-        help=(
-            "how much memory one build step may use, in docker's own spelling "
-            f"(default {DEFAULT_CONTAINER_MEMORY}). Told to the build environment in its "
-            "request document and enforced as docker run --memory; the empty string "
-            "removes the limit"
-        ),
-    )
-    parser.add_argument(
-        "--container-cpus",
-        metavar="N",
-        help=(
-            "how much CPU one build step may use, as a number of cores (fractions "
-            "allowed). Told to the build environment in its request document and "
-            "enforced as docker run --cpus; default: every CPU of this host"
-        ),
-    )
-    for option, attribute, default, what in (
-        *_BACKEND_OPTIONS,
-        *_SESSION_OPTIONS,
-        *_ADMISSION_OPTIONS,
-    ):
-        parser.add_argument(
-            option,
-            type=int,
-            metavar="N",
-            dest=attribute,
-            help=f"{what} (default {default})",
-        )
-    parser.add_argument(
-        "--log-level",
-        metavar="LEVEL",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="logging verbosity (default INFO)",
-    )
+    declared.add_option_flags(parser, declared.offered_options())
     return parser
 
 
 def resolve_token(
-    configured: str | None, token_file: Path | None, env: Mapping[str, str]
+    stated: str | None, token_file: Path | None, *, stdin: TextIO | None = None
 ) -> tuple[str, bool]:
     """Find the bearer token, or make one. Returns ``(token, generated)``.
 
-    A generated token is returned rather than logged, because logging it
-    must happen exactly once and at a level the operator actually sees —
-    which is the caller's decision, not this function's.
+    Two channels and no third: what ``--server-token`` carried, and the
+    file ``server.token_file`` names. A generated token is returned
+    rather than logged, because logging it must happen exactly once and
+    at a level the operator actually sees — which is the caller's
+    decision, not this function's.
     """
-    if configured:
-        return configured, False
-    from_env = env.get(ENV_PREFIX + "TOKEN")
-    if from_env and from_env.strip():
-        return from_env.strip(), False
-    candidates = [token_file] if token_file else []
-    env_file = env.get(ENV_PREFIX + "TOKEN_FILE")
-    if env_file:
-        candidates.append(Path(env_file))
-    for path in candidates:
-        existing = read_token_file(path)
+    value = _stated_or_piped(stated, stdin=stdin)
+    if value:
+        return value, False
+    if token_file is not None:
+        existing = read_token_file(token_file)
         if existing:
             return existing, False
     return secrets.token_urlsafe(32), True
 
 
-def load_config(
-    argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = None
-) -> Config:
-    """Build a :class:`Config` from the command line and the environment."""
-    env = os.environ if env is None else env
-    args = build_parser().parse_args(list(argv) if argv is not None else None)
+def _stated_or_piped(stated: str | None, *, stdin: TextIO | None = None) -> str:
+    """What ``--server-token`` carried, reading ``-`` from standard input.
 
-    def path_option(value: Path | None, name: str) -> Path | None:
-        if value is not None:
-            return value
-        raw = env.get(ENV_PREFIX + name)
-        return Path(raw) if raw else None
-
-    pair_file = path_option(args.pair_file, "PAIR_FILE")
-    if pair_file is None:
-        pair_file = DEFAULT_PAIR_FILE
-    elif str(pair_file) == "-":
-        pair_file = None
-
-    origins = list(args.allowed_origins or ())
-    if env.get(ENV_PREFIX + "ALLOWED_ORIGINS"):
-        origins += [
-            item.strip() for item in env[ENV_PREFIX + "ALLOWED_ORIGINS"].split(",") if item.strip()
-        ]
-
-    patch_layers = list(args.allowed_patch_layers or ())
-    if env.get(ENV_PREFIX + "ALLOW_PATCH_LAYERS"):
-        patch_layers += [
-            item.strip()
-            for item in env[ENV_PREFIX + "ALLOW_PATCH_LAYERS"].split(",")
-            if item.strip()
-        ]
-    unknown_layers = sorted(name for name in patch_layers if not is_patch_layer_name(name))
-    if unknown_layers:
-        raise SystemExit(
-            f"{', '.join(unknown_layers)}: not a patch layer this server knows "
-            f"(known: {', '.join(PATCH_LAYERS)}; a third-party layer name must "
-            "carry the x- prefix reserved for it)."
+    The value is read whole, the line ending a shell added is dropped,
+    and an empty read is refused rather than passed on as an empty
+    secret. A run that would sit waiting for a value nobody is going to
+    type is a run that looks like it hung, so a terminal is refused too.
+    """
+    if stated is None:
+        return ""
+    if stated != FROM_STDIN:
+        return stated.strip()
+    source = sys.stdin if stdin is None else stdin
+    if source is None or source.isatty():
+        raise api.ConfigError(
+            "--server-token - reads the token from standard input, and nothing is piped in.",
+            hint='pipe it:\n    printf %s "$TOKEN" | mcuhome-buildserver --server-token -',
         )
+    value = source.read().rstrip("\r\n")
+    if not value:
+        raise api.ConfigError(
+            "--server-token - read an empty token from standard input.",
+            hint="the token has to arrive on standard input, without a trailing newline",
+        )
+    return value
 
-    context_root = path_option(args.context_root, "CONTEXT_ROOT")
-    if context_root is None:
-        context_root = default_context_root(env)
 
-    sdk_sources = [Path(entry) for entry in (args.sdk_sources or ())]
-    if env.get(ENV_PREFIX + "SDK_SOURCES"):
-        sdk_sources += [
-            Path(item.strip())
-            for item in env[ENV_PREFIX + "SDK_SOURCES"].split(",")
-            if item.strip()
-        ]
+def config_document(config: Config) -> dict[str, Any]:
+    """What ``--print-config`` answers: every option, its value, its layer."""
+    return {"ok": True, "config": {} if config.settings is None else config.settings.to_dict()}
 
-    environments = list(args.allowed_environments or ())
-    if env.get(ENV_PREFIX + "ALLOW_ENVIRONMENTS"):
-        environments += [
-            item.strip()
-            for item in env[ENV_PREFIX + "ALLOW_ENVIRONMENTS"].split(",")
-            if item.strip()
-        ]
-    # An empty list is the operator asking this server to run nothing,
-    # which is a configuration mistake rather than a hardening step —
-    # every build would refuse and the message would name an empty
-    # allowlist. Saying so at startup beats saying it once per client.
-    for entry in environments:
+
+def load_config(
+    argv: Sequence[str] | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+    stdin: TextIO | None = None,
+    on_warning: Callable[[api.Diagnostic], None] | None = None,
+) -> Config:
+    """Resolve the ladder and answer the configuration this server runs on.
+
+    Raises :class:`~mcuhome.workbench.api.ConfigError` for anything an
+    operator has to fix — a retired spelling, a value that does not fit
+    its declaration, an allowlist entry that is not a repository. The
+    refusal names the file and line where a file supplied the value.
+    """
+    env = os.environ if env is None else env
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    # Before the parse, so a retired spelling is answered with the name
+    # it has today rather than with `unrecognized arguments`.
+    declared.refuse_retired_spellings(tokens, env)
+    args = build_parser().parse_args(tokens)
+
+    project = _project_light(args.server_config)
+    offered = declared.offered_options()
+    settings = api.resolve_settings(
+        project=project,
+        env=env,
+        args=declared.arguments(args, offered, env=env),
+        program=declared.PROGRAM_DEFAULTS,
+        declared_options=declared.DECLARED_OPTIONS,
+        on_warning=on_warning,
+    )
+    build = api.resolve_build_options(settings)
+    _check_budget(build)
+
+    def value(leaf: str) -> Any:
+        return settings.value(f"server.{leaf}")
+
+    context_root = value("context_root")
+    pair_file = value("pair_file") if value("publish_pair_file") else None
+    config = Config(
+        host=value("host"),
+        port=value("port"),
+        pair_file=pair_file,
+        allowed_origins=tuple(dict.fromkeys(value("allowed_origins"))),
+        log_level=value("log_level"),
+        max_connections=value("max_connections"),
+        max_inflight_commands=value("max_inflight_commands"),
+        allowed_patch_layers=_patch_layers(value("allowed_patch_layers")),
+        context_root=Path(context_root) if context_root else default_context_root(env),
+        max_compressed_bytes=value("max_compressed_bytes"),
+        max_decompressed_bytes=value("max_decompressed_bytes"),
+        max_entries=value("max_entries"),
+        max_file_bytes=value("max_file_bytes"),
+        max_path_depth=value("max_path_depth"),
+        max_context_yaml_bytes=value("max_context_yaml_bytes"),
+        session_quota_bytes=value("session_quota_bytes"),
+        build_deadline_seconds=value("build_deadline_seconds"),
+        cancel_grace_seconds=value("cancel_grace_seconds"),
+        session_idle_timeout_seconds=value("session_idle_timeout_seconds"),
+        max_sessions=value("max_sessions"),
+        seat_retry_seconds=value("seat_retry_seconds"),
+        seat_retry_max_seconds=value("seat_retry_max_seconds"),
+        max_seats=value("max_seats"),
+        reconnect_grace_seconds=value("reconnect_grace_seconds"),
+        max_artifact_bytes=value("max_artifact_bytes"),
+        allowed_container_repositories=_repositories(settings),
+        auto_pull=value("auto_pull"),
+        build=build,
+        registries=_registries(settings),
+        config_file=None if project is None else project.config_file,
+        settings=settings,
+        print_config=bool(args.print_config),
+    )
+    token, generated = resolve_token(args.server_token, value("token_file"), stdin=stdin)
+    return replace(config, token=token, token_generated=generated)
+
+
+def _project_light(stated: Path | None) -> api.Project | None:
+    """The server's own configuration file, as the layer a project's file is.
+
+    A build server has no project, and this file is the nearest thing it
+    has to one: the same areas, the same keys, the same spellings — and
+    the same place in the ladder. Its directory is what this server
+    answers where a workstation answers its project root, which is what
+    makes ``secrets/trust-anchor/<base-domain>.json`` mean here what it
+    means there.
+
+    That is also why the file carries the name a project's file carries.
+    A named file that is not there is refused rather than skipped: a
+    person who named one meant it.
+    """
+    if stated is None:
+        return None
+    file = Path(stated)
+    if file.name != api.PROJECT_CONFIG_FILE:
+        raise api.ConfigError(
+            f"--server-config takes a file called {api.PROJECT_CONFIG_FILE}, not {file.name!r}.",
+            hint=(
+                "this server reads its own file where a project's file is read, under "
+                f"that file's name, and the directory holding it is where trust anchors "
+                f"are looked for. Rename it:\n    mv {file} {file.parent / api.PROJECT_CONFIG_FILE}"
+            ),
+        )
+    if not file.is_file():
+        raise api.ConfigError(
+            f"The configuration file named by --server-config is not there: {file}.",
+            hint=(
+                "create it, or leave the flag out to run on the system and user configuration alone"
+            ),
+        )
+    return api.Project(root=file.parent, discovered=False)
+
+
+def _patch_layers(stated: Sequence[str]) -> tuple[str, ...]:
+    """The patch layers this server accepts, or a refusal naming the set."""
+    unknown = sorted(name for name in stated if not is_patch_layer_name(name))
+    if unknown:
+        raise api.ConfigError(
+            f"{', '.join(unknown)}: not a patch layer this server knows.",
+            hint=(
+                f"server.allowed_patch_layers takes {', '.join(PATCH_LAYERS)}, or a "
+                "third-party layer name carrying the x- prefix reserved for it"
+            ),
+        )
+    return tuple(dict.fromkeys(stated))
+
+
+def _repositories(settings: api.Settings) -> tuple[str, ...]:
+    """The allowlist, checked to be repositories and nothing more.
+
+    A tag moves and a digest would have to be relisted on every release,
+    so neither is a thing an allowlist can be written in; and Docker's
+    shorthand for its own registry is spelled out rather than accepted
+    quietly, so that the list an operator reads back is the list this
+    server compares.
+    """
+    name = "server.allowed_container_repositories"
+    stated = tuple(dict.fromkeys(settings.value(name)))
+    if not stated:
+        raise api.ConfigError(
+            f"{name} is empty, and this server would then run no build environment at all.",
+            hint=(
+                "name at least one repository, or remove the key to serve MCUHome's own "
+                "build environment"
+            ),
+        )
+    for entry in stated:
         repository = repository_of(entry)
         if entry.startswith(repository) and entry != repository:
-            raise SystemExit(
-                f"--allow-environment takes a repository, not {entry!r}: no tag and no "
-                "digest. A tag moves and a digest would have to be relisted on every "
-                f"release — write {repository!r} instead."
+            raise api.ConfigError(
+                f"{name} takes a repository, not {entry!r}: no tag and no digest.",
+                hint=(
+                    "a tag moves and a digest would have to be relisted on every "
+                    f"release — write {repository!r} instead"
+                ),
             )
         if repository != entry:
-            # Docker's own shorthand for its own registry. Spelled out
-            # here rather than accepted quietly, so that the list an
-            # operator reads back is the list this server compares.
-            raise SystemExit(
-                f"--allow-environment wants the registry named too: write {repository!r} "
-                f"rather than {entry!r}."
+            raise api.ConfigError(
+                f"{name} wants the registry named too: write {repository!r} rather than {entry!r}.",
+                hint="the list an operator reads back is the list this server compares",
             )
-    allowed_environments = tuple(dict.fromkeys(environments)) or (ENVIRONMENT_IMAGE_REPOSITORY,)
+    return stated
 
-    auto_pull = args.auto_pull
-    if auto_pull is None:
-        auto_pull = _env_flag(env, "AUTO_PULL")
-    if auto_pull is None:
-        auto_pull = True
 
-    limits: dict[str, int] = {}
-    for attribute in _LIMIT_ATTRIBUTES:
-        value = getattr(args, attribute, None)
-        if value is None:
-            value = _env_int(env, attribute.upper())
-        if value is None:
+def _registries(settings: api.Settings) -> tuple[api.RegistrySettings, ...]:
+    """The configured registries, with MCUHome's own anchored as it ships.
+
+    The map is read exactly as a project's is. What this server adds is
+    the one answer a project gets from its own ``secrets/trust-anchor/``
+    and a server has nowhere to get: the trust anchor for MCUHome's
+    package registry, taken from the copy the workbench ships. An
+    operator who states an anchor, mirrors or ``untrusted`` for that
+    domain has said what they want and keeps it.
+    """
+    configured = tuple(settings.value("registry") or ())
+    official = api.OFFICIAL_BASE_DOMAIN
+    for entry in configured:
+        if entry.base_domain != official:
             continue
-        if value <= 0:
-            raise SystemExit(f"--{attribute.replace('_', '-')} must be a positive number.")
-        limits[attribute] = value
-
-    container_memory = _text_option(
-        args.container_memory, env, "CONTAINER_MEMORY", DEFAULT_CONTAINER_MEMORY
-    )
-    container_cpus = _text_option(args.container_cpus, env, "CONTAINER_CPUS", None)
-    _check_container_budget(container_cpus, container_memory)
-
-    config = Config(
-        host=args.host or env.get(ENV_PREFIX + "HOST") or DEFAULT_HOST,
-        port=args.port or _env_int(env, "PORT") or DEFAULT_PORT,
-        pair_file=pair_file,
-        allowed_origins=tuple(dict.fromkeys(origins)),
-        log_level=args.log_level or env.get(ENV_PREFIX + "LOG_LEVEL") or "INFO",
-        allowed_patch_layers=tuple(dict.fromkeys(patch_layers)),
-        allowed_environments=allowed_environments,
-        auto_pull=auto_pull,
-        context_root=context_root,
-        docker=args.docker or env.get(ENV_PREFIX + "DOCKER") or DEFAULT_DOCKER,
-        # Order-preserving de-duplication: the search order is fixed
-        # and a directory listed twice must not move the one behind
-        # it.
-        sdk_sources=tuple(dict.fromkeys(sdk_sources)),
-        ccache_dir=path_option(args.ccache_dir, "CCACHE_DIR"),
-        container_memory=container_memory,
-        container_cpus=container_cpus,
-        **limits,
+        if entry.anchor is not None or entry.untrusted:
+            return configured
+        return tuple(
+            replace(one, anchor=_bundled_anchor(official)) if one is entry else one
+            for one in configured
+        )
+    return (
+        *configured,
+        api.RegistrySettings(base_domain=official, anchor=_bundled_anchor(official)),
     )
 
-    token, generated = resolve_token(args.token, args.token_file, env)
-    return replace(config, token=token, token_generated=generated)
+
+def _bundled_anchor(base_domain: str) -> Path:
+    return api.BUNDLED_ANCHOR_DIR / f"{base_domain}.json"
+
+
+def _check_budget(build: api.BuildOptions) -> None:
+    """Refuse a CPU or memory figure that cannot be read, at startup.
+
+    Both stay strings and numbers in the configuration — the CPU figure
+    because fractions are allowed, the memory figure because it carries
+    a unit — and both are turned into a budget only when a step is
+    started. Read only there, a typo passes startup and surfaces as an
+    internal error on the first build, to whichever client happened to
+    send it. So the same reading happens here, where it costs nothing
+    and the operator who wrote the value is still watching.
+
+    ``nan`` and ``inf`` are the two figures the declaration's own
+    "greater than zero" does not catch: they parse as floats and would
+    reach a container as a budget nobody can act on.
+    """
+    if build.cpus is not None and not math.isfinite(build.cpus):
+        raise api.ConfigError(
+            f"build.cpus must be a number of cores, not {build.cpus!r}.",
+            hint="fractions are allowed — 2, 1.5",
+        )
+    build.limits()

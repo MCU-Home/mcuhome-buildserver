@@ -52,8 +52,8 @@ from typing import Any
 from aiohttp import WSCloseCode, WSMsgType, web
 
 from mcuhome.buildserver import errors, protocol, sessions
-from mcuhome.buildserver.config import DEFAULT_MAX_INFLIGHT_COMMANDS
 from mcuhome.buildserver.ingress import Upload
+from mcuhome.buildserver.options import DEFAULT_MAX_INFLIGHT_COMMANDS
 from mcuhome.buildserver.protocol import MAX_FRAME_BYTES, Command, ProtocolError
 from mcuhome.buildserver.security import STATE_KEY, check_origin
 

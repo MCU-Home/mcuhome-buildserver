@@ -78,15 +78,13 @@ from mcuhome.workbench import api as workbench
 from mcuhome.workbench import (
     buildenvsession,
     containerbuild,
-    packagefetch,
     packageregistry,
-    resolve_pins,
 )
 from mcuhome.workbench import resolve_image as image_lookup
-from mcuhome.workbench.buildenvsession import LocalOutcome
+from mcuhome.workbench.buildenvsession import StepResult
 from mcuhome.workbench.buildprocess import current_user
 from mcuhome.workbench.contextdir import read_generator_chain
-from mcuhome.workbench.resolve_image import ImageMatch
+from mcuhome.workbench.resolve_image import ContainerImageMatch
 
 from mcuhome.buildserver import (
     artifacts,
@@ -200,7 +198,7 @@ class EnvironmentProfile:
     host, which is worth a line in the log and nothing else.
     """
 
-    match: ImageMatch
+    match: ContainerImageMatch
     fetched: bool = False
 
     @property
@@ -326,7 +324,7 @@ class InvocationRecord:
     #: Filled when the invocation ends. Until then the artifact list is
     #: empty, which is the truthful answer to ``get-artifact``: nothing
     #: has been declared, so nothing has been verified.
-    outcome: LocalOutcome | None = None
+    outcome: StepResult | None = None
     artifacts: tuple[Any, ...] = ()
     log_seq: int = 0
     #: The counter of the events **this server** writes for this
@@ -387,10 +385,11 @@ class SessionBackend:
         images: Any = None,
     ) -> None:
         self.config = config
-        self.docker = container.Docker(config.docker) if docker is None else docker
+        program = config.build.container_program
+        self.docker = container.Docker(program) if docker is None else docker
         #: The container profile's runtime seam, shared by every session
         #: of this process: it holds no state beyond the program name.
-        self.runtime = containerbuild.Runtime(config.docker) if runtime is None else runtime
+        self.runtime = workbench.ContainerRuntime(program) if runtime is None else runtime
         #: The package registry a session's SDK and package index come
         #: from, and the OCI registry an image's labels are read from.
         #: Both are seams a test replaces; left ``None`` they are the
@@ -501,7 +500,7 @@ class SessionBackend:
         if pin.repository:
             environments.check_allowed(
                 pin.repository,
-                allowed=self.config.allowed_environments,
+                allowed=self.config.allowed_container_repositories,
                 what="the image this build was pinned to",
             )
         await asyncio.to_thread(self._require_runtime)
@@ -522,12 +521,12 @@ class SessionBackend:
                 image_lookup.image_for_packages,
                 wanted,
                 registry=self._images,
-                repositories=tuple(self.config.allowed_environments),
+                repositories=tuple(self.config.allowed_container_repositories),
                 pin=pin,
             )
         except workbench.MCUHomeError as refusal:
             raise _no_image_for_a_package_set(
-                pins, refusal, allowed=self.config.allowed_environments
+                pins, refusal, allowed=self.config.allowed_container_repositories
             ) from refusal
         profile = EnvironmentProfile(match=match)
         self._check_declaration(profile, context)
@@ -553,14 +552,14 @@ class SessionBackend:
         a network.
         """
         wanted: dict[str, PackageMember] = {}
-        for package, source in (
-            (environment.workspace, resolve_pins.BUILD_WORKSPACE_SOURCE),
-            (environment.tools, resolve_pins.BUILD_TOOLS_SOURCE),
+        for package, source, sources in (
+            (environment.workspace, workbench.KIND_WORKSPACE, self.config.build.workspace_sources),
+            (environment.tools, workbench.KIND_TOOLS, self.config.build.tools_sources),
         ):
-            found = resolve_pins.concrete_package(
+            found = workbench.resolve_package(
                 package,
                 source=source,
-                sources=tuple(self.config.sdk_sources),
+                sources=tuple(sources),
                 registry=self._package_registry(),
             )
             wanted[found.name] = PackageMember(
@@ -641,30 +640,27 @@ class SessionBackend:
     def _package_registry(self) -> Any:
         """The registry a session's packages come from — one for this process.
 
-        MCUHome's own, checked against the trust anchor this workbench
-        ships, and nothing else. There is deliberately no flag and no
-        configuration file for it: a build server is an operator's
-        machine and not a project, it has no ``secrets/trust-anchor/`` to
-        read, and an anchor an operator could point somewhere else would
-        be a trust decision made in a place nobody looks. Local package
-        directories stay what they are — the operator's own mirror,
-        searched first.
+        Configured the way a project configures one: the
+        ``registry.<base-domain>`` map of the same resolution says which
+        mirrors to ask, which trust anchor backs a domain and whether an
+        unsigned source is accepted. What a project answers out of its
+        own ``secrets/trust-anchor/`` this server answers out of the
+        directory its configuration file lies in, and MCUHome's own
+        registry keeps the anchor the workbench ships unless an operator
+        stated one. Local package directories stay what they are — the
+        operator's own mirror, searched first.
 
         Deferred, like every other caller's
-        (:func:`~mcuhome.workbench.packageregistry.registry_factory`): a
+        (:func:`~mcuhome.workbench.api.open_package_registry`): a
         session whose packages are all in the operator's directories
         never opens a socket.
         """
         if self._registry is not None:
             return self._registry
-        domain = packageregistry.OFFICIAL_BASE_DOMAIN
-        anchor = packageregistry.BUNDLED_ANCHOR_DIR / f"{domain}.json"
-        self._registry = packageregistry.registry_factory(
-            domain,
-            # Never read: the anchor below replaces the project's own
-            # file entirely, and this server has no project.
-            project_root=self.config.context_root,
-            settings=(packageregistry.RegistrySettings(base_domain=domain, anchor=anchor),),
+        self._registry = workbench.open_package_registry(
+            workbench.OFFICIAL_BASE_DOMAIN,
+            project_root=self.config.project_root,
+            settings=self.config.registries,
             # Under the context root and **outside every session**: the
             # documents a registry serves are verified once and are the
             # *server's*, not any one session's — a cache thrown away
@@ -793,10 +789,10 @@ class SessionBackend:
         the hash the context pins either way — a package that hashes to
         something else is not the pinned SDK, wherever it was found.
         """
-        sdk = packagefetch.acquire_sdk(
+        sdk = workbench.fetch_sdk_package(
             version=pins.sdk.version,
             sha256=pins.sdk.sha256,
-            sources=tuple(self.config.sdk_sources),
+            sources=tuple(self.config.build.sdk_sources),
             into=paths.sdk,
             registry=self._package_registry(),
         )
@@ -812,14 +808,14 @@ class SessionBackend:
                 profile.runnable,
                 runtime=self.runtime,
                 user=current_user(),
-                limits=containerbuild.ResourceLimits.of(
-                    limits, pids=self.config.container_pids or containerbuild.DEFAULT_PIDS
+                limits=workbench.ContainerLimits.from_build_limits(
+                    limits, pids=self.config.build.pids
                 ),
                 started=started,
             ),
             context_id=context_id,
             session_id=session_id,
-            tiers=buildenvsession.cache_tiers(shared_ccache_dir=self.config.ccache_dir),
+            tiers=workbench.resolve_cache_tiers(shared=self.config.build.cache_shared),
             limits=limits,
             deadline_seconds=self.config.build_deadline_seconds,
             cancel_grace_seconds=self.config.cancel_grace_seconds,
@@ -858,7 +854,7 @@ class SessionBackend:
         self._records[(session.id, record.id)] = record
         return record
 
-    async def _supervise(self, runtime: SessionRuntime, record: InvocationRecord) -> LocalOutcome:
+    async def _supervise(self, runtime: SessionRuntime, record: InvocationRecord) -> StepResult:
         """Run the step through the workbench, relaying its log as it goes.
 
         The ladder is the builder session's — the stop sentinel first,
@@ -882,7 +878,7 @@ class SessionBackend:
 
         return await asyncio.to_thread(record.step.run, on_line=on_line)
 
-    async def _collect(self, record: InvocationRecord, outcome: LocalOutcome) -> LocalOutcome:
+    async def _collect(self, record: InvocationRecord, outcome: StepResult) -> StepResult:
         """What the workbench judged, plus this server's own egress note.
 
         Nothing is judged twice. The result document, the exit code and
@@ -1045,12 +1041,11 @@ class SessionBackend:
         session.invocations[record.id] = _RUNNING
         self._records[(session.id, record.id)] = record
         self.attach(session.id, connection)
-        outcome = LocalOutcome(
+        outcome = StepResult(
             action=ACTION_VERIFY,
             context_id=context_id,
             exit_code=0,
             status=STATUS_SUCCESS,
-            successful=True,
         )
         record.outcome = outcome
         session.invocations[record.id] = _FINISHED
@@ -1066,7 +1061,7 @@ class SessionBackend:
         return record
 
     def _answer_verify(
-        self, record: InvocationRecord, outcome: LocalOutcome, context_id: str
+        self, record: InvocationRecord, outcome: StepResult, context_id: str
     ) -> None:
         """The two frames a verify produces, once its own answer has gone out."""
         self._emit(record, "invocation.started", action=ACTION_VERIFY, context=context_id)
@@ -1081,7 +1076,7 @@ class SessionBackend:
         going, keeps writing into a record a reattaching client can still
         read.
         """
-        outcome: LocalOutcome | None = None
+        outcome: StepResult | None = None
         try:
             outcome = await self._supervise(runtime, record)
         except Exception:
@@ -1089,7 +1084,7 @@ class SessionBackend:
         finally:
             runtime.busy = False
         if outcome is None:
-            outcome = LocalOutcome(
+            outcome = StepResult(
                 action=record.action,
                 context_id=record.context_id,
                 exit_code=None,
@@ -1110,7 +1105,7 @@ class SessionBackend:
         session.touch()
         self._emit_verdict(record, outcome)
 
-    def _emit_verdict(self, record: InvocationRecord, outcome: LocalOutcome) -> None:
+    def _emit_verdict(self, record: InvocationRecord, outcome: StepResult) -> None:
         """The one frame a client is waiting for, live and on disk.
 
         It is written into the events file as well as sent, because that
@@ -1127,7 +1122,7 @@ class SessionBackend:
             **self._verdict(outcome, record),
         )
 
-    def _verdict(self, outcome: LocalOutcome, record: InvocationRecord) -> dict[str, Any]:
+    def _verdict(self, outcome: StepResult, record: InvocationRecord) -> dict[str, Any]:
         """The payload of the ``invocation.verdict`` frame.
 
         It carries the status and the artifact list, plus the two things
@@ -1164,7 +1159,7 @@ class SessionBackend:
         return payload
 
     def _envelope(
-        self, outcome: LocalOutcome, record: InvocationRecord, *, status: str
+        self, outcome: StepResult, record: InvocationRecord, *, status: str
     ) -> dict[str, Any]:
         """One failed invocation as the session protocol's error envelope.
 
@@ -1597,7 +1592,7 @@ def _no_image_for_a_package_set(
     )
 
 
-def _message_of(outcome: LocalOutcome) -> str:
+def _message_of(outcome: StepResult) -> str:
     """The environment's own message (§6.2), bounded and stripped.
 
     Free text written by the environment for a human, so it is the one
@@ -1646,7 +1641,7 @@ def _already_replayed(
     return found <= seq
 
 
-def _wire_status(outcome: LocalOutcome, record: InvocationRecord) -> str:
+def _wire_status(outcome: StepResult, record: InvocationRecord) -> str:
     """The status a client is told, which is the pessimistic one.
 
     ``cancelled`` first, because it is the only one this server knows
@@ -1656,9 +1651,9 @@ def _wire_status(outcome: LocalOutcome, record: InvocationRecord) -> str:
     verdict decides — success only when every condition held, and the
     document's own status where it says something other than success.
     """
-    if record.cancelled and not outcome.successful:
+    if record.cancelled and not outcome.ok:
         return STATUS_CANCELLED
-    if outcome.successful:
+    if outcome.ok:
         return STATUS_SUCCESS
     if outcome.status and outcome.status != STATUS_SUCCESS:
         return outcome.status
@@ -1712,32 +1707,17 @@ def session_limits(config: Config) -> BuildLimits:
     it, and §11 tells the environment plainly that whatever budget was
     set may be enforced hard.
 
-    The defaults are this server's own: all of the host's CPUs, and the
-    memory ceiling ``--container-memory`` states. An operator moves
-    either with the flags that already exist; ``--container-memory ""``
-    is the operator saying the host is not to be bounded by memory, and
-    it is honoured as stated rather than replaced by a measurement.
+    The two keys are the ones a workstation states for the same thing,
+    ``build.cpus`` and ``build.memory``, and this program states ``8g``
+    for the second in the program layer: a workstation with no ceiling
+    builds with whatever is free, while a build server whose linker took
+    the host down would take every other session with it. Unset, each is
+    the machine as it is — all of its CPUs, the memory actually
+    available.
 
     Both figures were already read once, at startup
     (:func:`~mcuhome.buildserver.config.load_config`), so a running
-    server cannot reach the refusals below with a configuration that
-    came from a command line or an environment. They stay because a
-    ``Config`` can also be built in code, and a figure that cannot be
-    read must not turn into a container without a limit.
+    server cannot reach a refusal here with a configuration that came
+    from a file, a variable or a flag.
     """
-    machine = buildenvsession.host_limits()
-    cpus = machine.cpus
-    if config.container_cpus:
-        try:
-            cpus = float(config.container_cpus)
-        except ValueError as broken:
-            raise BuildError(
-                f'"{config.container_cpus}" is not a number of CPUs.',
-                hint="--container-cpus takes a number of cores, fractions allowed — 2, 1.5",
-            ) from broken
-    return BuildLimits(
-        cpus=cpus if cpus > 0 else None,
-        memory_bytes=buildenvsession.memory_bytes(
-            config.container_memory, option="--container-memory"
-        ),
-    )
+    return config.build.limits()

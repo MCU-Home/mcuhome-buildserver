@@ -16,15 +16,18 @@ by answering an empty ``containers`` list.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sys
 from collections.abc import Sequence
 
 from aiohttp import web
+from mcuhome.model.errors import MCUHomeError
+from mcuhome.workbench import api
 
 from mcuhome.buildserver import __version__
 from mcuhome.buildserver.app import ServerState, create_app
-from mcuhome.buildserver.config import Config, load_config
+from mcuhome.buildserver.config import Config, config_document, load_config
 from mcuhome.buildserver.contextstore import UnsafeContextRoot
 from mcuhome.buildserver.security import publish_pairing_token
 
@@ -43,9 +46,10 @@ def _announce(config: Config) -> None:
         logger.warning(
             "No bearer token was configured, so one was generated for this run:\n\n"
             "    %s\n\n"
-            "Set MCUHOME_BUILDSERVER_TOKEN (or --token-file) to keep one across "
-            "restarts. A build server on a network must also be behind TLS: a bearer "
-            "token on a plaintext connection is a token you have given away.",
+            "Point server.token_file at a file holding one to keep it across restarts, "
+            "or pipe it in with --server-token -. A build server on a network must also "
+            "be behind TLS: a bearer token on a plaintext connection is a token you have "
+            "given away.",
             config.token,
         )
 
@@ -88,7 +92,29 @@ def run(config: Config) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    return run(load_config(argv))
+    """Resolve the configuration, then either print it or serve."""
+    try:
+        config = load_config(argv, on_warning=_report)
+    except MCUHomeError as refusal:
+        # An operator's own configuration, refused in words: the message
+        # says what is wrong and the hint says what to write instead.
+        # Nothing was bound and nothing started, so this is exit 2.
+        print(refusal.message, file=sys.stderr)
+        if refusal.hint:
+            print(refusal.hint, file=sys.stderr)
+        return 2
+    if config.print_config:
+        json.dump(config_document(config), sys.stdout, indent=2)
+        print()
+        return 0
+    return run(config)
+
+
+def _report(finding: api.Diagnostic) -> None:
+    """What the configuration layer found on the way, said once."""
+    print(finding.message, file=sys.stderr)
+    if finding.hint:
+        print(finding.hint, file=sys.stderr)
 
 
 if __name__ == "__main__":  # pragma: no cover

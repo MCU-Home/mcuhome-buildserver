@@ -273,8 +273,8 @@ def build_parser() -> argparse.ArgumentParser:
         dest="server_config",
         help=(
             f"this server's own configuration file, an {api.PROJECT_CONFIG_FILE} read "
-            "where a project's file is read: above the environment and below the "
-            "flags, and after the system and user files"
+            "where a project's file is read: after the system and user files, and "
+            "below the environment and the flags"
         ),
     )
     parser.add_argument(

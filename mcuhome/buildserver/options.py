@@ -553,12 +553,11 @@ def refuse_retired_spellings(tokens: Sequence[str], env: Mapping[str, str]) -> N
 
     Both halves are checked before anything is parsed, so a retired flag
     is answered with the name it has today rather than with
-    ``unrecognized arguments``. Only what stands before a ``--``
-    separator is examined: after it, a token is a value and a value that
-    looks like a flag is still a value.
+    ``unrecognized arguments``. A flag written with its value attached
+    (``--docker=podman``) is the same spelling and is refused the same
+    way.
     """
-    examined = list(tokens[: tokens.index("--")]) if "--" in tokens else list(tokens)
-    written = {token.partition("=")[0] for token in examined if token.startswith("--")}
+    written = {token.partition("=")[0] for token in tokens if token.startswith("--")}
     for spelling in RETIRED_FLAGS:
         if spelling in written:
             raise api.ConfigError(
